@@ -189,6 +189,8 @@ tokens. The tokens are the serial loop's, up to CPU rounding.
 - **Cost:** a second verify window on each card, 160 MiB less expert cache per card, plus two copies of the first card's
   recurrent state (about 3 MiB per GDN layer it runs).
 - **Config:** `"args": [ ..., "--pipeline-windows", "2" ]` with `"layer_split": "20"`.
+- **Remote stage:** a main process with a layer split on another PC (`--remote-stage`) takes it on one card:
+  [REMOTE_STAGE.md](REMOTE_STAGE.md#overlapping-the-decode-windows---pipeline-windows-2).
 
 `--remote-expert-opt` does something only with a helper cache; on a plain layer split it is inert.
 The `STRATA_PIPELINE_*` tuning and test variables are read only with `STRATA_PIPELINE_DEBUG=1`.
