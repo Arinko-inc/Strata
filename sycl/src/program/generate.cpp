@@ -2108,12 +2108,18 @@ int main(int argc, char **argv) try {
     int64_t own_lo = 0, own_hi = -1;
     if (!o.remote_stage.empty() || stage_worker) {
         const char* why = nullptr;
+        std::string stage_begin_why;   // (a reason built at run time)
         if (!o.remote_stage.empty())
             why = "--remote-stage (the main process) is not in the SYCL build: run the main process on the CUDA/HIP build, "
                   "this build runs a --stage-worker";
         else if (!o.serve) why = "it needs --serve";
         else if (o.stage_begin < 2 || !o.layer_split.empty() || !o.split_device.empty())
             why = "--stage-worker needs --stage-begin K (K >= 2, the main process's --layer-split K) and no --layer-split";
+        // (the layer count is the canonical geometry's: the model file overrides only the MoE shape.  Checked here,
+        // before the PCIe probe touches the GPU; a K past the last layer would carve the session out of range)
+        else if (o.stage_begin >= strata::core::ModelGeometry{}.n_layers)
+            why = stage_begin_why.assign("--stage-begin K must be below the layer count (" +
+                                         std::to_string(strata::core::ModelGeometry{}.n_layers) + ")").c_str();
         else if (o.stage_end >= 0 || !o.stage_next.empty())
             why = "a relay worker (--stage-end, --stage-next) is not in the SYCL build: this worker runs the last layers";
         else if (o.batch > 0 || o.pipeline_windows > 0 || o.peer_device >= 0)
@@ -2710,6 +2716,13 @@ int main(int argc, char **argv) try {
                              o.native_preset.c_str(), e.what());
                 return 1;
             }
+        }
+        // remote-stage worker: the layers it holds start below the model's last layer (the argument check above
+        // compared with the canonical count; this is the model's, before any session or cache is sized from own_lo)
+        if (stage_worker && own_lo >= g.n_layers) {
+            std::fprintf(stderr, "strata generate: remote stage: --stage-begin K must be below the layer count (%lld)\n",
+                         (long long) g.n_layers);
+            return 2;
         }
         using RST = strata::kernels::RopeScalingType;
         if (!o.rope_scaling.empty()) {
