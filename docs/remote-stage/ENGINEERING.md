@@ -31,21 +31,26 @@ the head and the drafter on the worker would have saved that return trip and mov
 
 One TCP connection per main process. Every message is a 40-byte header (`magic` "STRM", `type`, three int64 fields
 `a b c`, payload `bytes`) and a payload. Protocol version 5 (4 before images: the Positions message and the hello's
-`vision`; 3 before the hello carried the tail-skip rank).
+`vision`; 3 before the hello carried the tail-skip rank). The rows are fp32, or bf16 where the hello's `row_format`
+says so (`STRATA_STAGE_ROWS_BF16`: bit 0 the prompt chunks', bit 1 the windows'); the link rounds them to the nearest
+bf16 (ties to even) a 64K-float piece at a time as it sends, and widens them as it receives, so the buffers on both
+sides stay fp32 and no caller changed. `row_format` took the last 4 bytes of the hello's `build` (52 bytes now), which
+a protocol-5 peer from before it leaves zero (its build id is at most 33 characters): such a peer reads as fp32 rows,
+so the protocol number stayed 5 and a link without the variable sends the same bytes as before.
 
 | message | header fields | payload | reply |
 |---|---|---|---|
 | Hello | | `StageHello` (below) | HelloOk with the worker's hello, or Error |
-| Run (a verify window) | a = T, b = first position | int32 tokens[T], fp32 rows[T x 12,804] | RunOk: a = the worker's time (us), rows[T x 12,804] |
+| Run (a verify window) | a = T, b = first position | int32 tokens[T], fp32 (or bf16) rows[T x 12,804] | RunOk: a = the worker's time (us), rows[T x 12,804] |
 | Commit | a = accepted count | none | none (an error comes back on the next reply) |
-| Prefill (a prompt chunk) | a = T, b = first position, c = flags (bit 0: the prompt is one chunk) and `skip` << 8 | int64 tokens[T], fp32 rows[T x 10,240] | PrefillOk: a = the worker's time (us), rows[(T - skip) x 10,240] |
+| Prefill (a prompt chunk) | a = T, b = first position, c = flags (bit 0: the prompt is one chunk) and `skip` << 8 | int64 tokens[T], fp32 (or bf16) rows[T x 10,240] | PrefillOk: a = the worker's time (us), rows[(T - skip) x 10,240] |
 | Reset (a fresh prompt) | | none | ResetOk |
 | Positions (`--vision`: the next request's) | a = cells; b = 1: plain positions (no table) | int32 (t, h, w)[cells] | none (an error comes back on the next reply, a Reset's included) |
 | Error | | the message | |
 
 **The hello** carries what both sides must agree on, and each side checks the other's: the protocol, `n_embd`, `hc`,
-`n_layers`, `n_expert`, the first remote layer (K), the floats per window row, the K/V element type, and a
-fingerprint of the pack (FNV-1a over the pack's `index.txt` and `native_experts.txt`). The worker also refuses a main
+`n_layers`, `n_expert`, the first remote layer (K), the floats per window row, the K/V element type, the rows'
+format (`row_format`), and a fingerprint of the pack (FNV-1a over the pack's `index.txt` and `native_experts.txt`). The worker also refuses a main
 process whose prompt chunk, context or window is larger than its own, and a wrong `STRATA_STAGE_TOKEN` (the token is
 the hello's last field; the worker's own hello carries none). The main process's `STRATA_ROUTE_TAIL_SKIP` rank rides
 along and the worker takes it (a relay passes it on), so every layer skips as in one process. So does whether the
@@ -121,7 +126,8 @@ connection`), and the next request failed after 66-68 s (two runs), when the ser
 `cannot connect to HOST:PORT: Connection refused`, since nothing started a worker again then (its agent does now:
 "Recovery" above; run on GPUs after a `kill -9`, not after a stall report).
 
-**Bytes, Qwen3.8-Flash-Next** (n_embd 2560, 4 hyper-connection streams, everything fp32):
+**Bytes, Qwen3.8-Flash-Next** (n_embd 2560, 4 hyper-connection streams, everything fp32; with
+`STRATA_STAGE_ROWS_BF16=1` every row is half of what follows: 25,608 B a window row, 20,480 B a prompt row):
 
 - a window row is `hc * n_embd + n_embd + hc` = 12,804 floats = **51,216 B**: the four residual streams, the pending
   write of the last layer and the inject. A window of T tokens sends T rows and T token ids and gets T rows back.

@@ -26,13 +26,22 @@
 //      links; a stop flag ends the wait at once (also before a try that would fail at once), not as a lost link; a
 //      worker that answers is served as without one;
 //   9. StageHandlers::idle (a relay's look at its next worker): not while the served main process sends, about once
-//      a second while it is idle; false ends that connection, and the main process's next message finds it lost.
+//      a second while it is idle; false ends that connection, and the main process's next message finds it lost;
+//  10. STRATA_STAGE_ROWS_BF16 (StageHello::row_format): fp32 -> bf16 rounds to nearest even (ties, infinities, NaNs,
+//      subnormals, every bf16 value back to itself, random values against a reference); a window and prompt chunks
+//      (one spanning several of the link's pieces, two in flight, `skip`) go out and come back as the bf16-rounded
+//      rows, half the bytes on the wire; "chunks" leaves windows fp32; fp32 stays byte-for-byte as before (4 bytes a
+//      float, the rows exact); a worker refuses a main process whose rows travel otherwise, both ways, saying which
+//      side has which; a main process refuses a worker that does not check (one from before row_format) itself; a
+//      hello from before row_format reads as fp32; the variable's values.
 // The handlers run on the worker's serving thread: what they share with the test is behind a mutex or atomic.
 #include "strata/net/stage_link.hpp"
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -142,6 +151,42 @@ void set_takeover(const char* s) {
     setenv("STRATA_REMOTE_TAKEOVER_S", s, 1);
 #endif
 }
+
+// STRATA_STAGE_ROWS_BF16 (nullptr: unset)
+void set_rows_env(const char* s) {
+#if defined(_WIN32)
+    _putenv_s("STRATA_STAGE_ROWS_BF16", s != nullptr ? s : "");
+#else
+    if (s != nullptr) setenv("STRATA_STAGE_ROWS_BF16", s, 1);
+    else unsetenv("STRATA_STAGE_ROWS_BF16");
+#endif
+}
+
+float f32_of(uint32_t u) {
+    float f;
+    std::memcpy(&f, &u, sizeof f);
+    return f;
+}
+uint32_t bits_of(float f) {
+    uint32_t u;
+    std::memcpy(&u, &f, sizeof u);
+    return u;
+}
+// fp32 -> bf16 the long way (finite values whose rounding stays finite): the nearer of the two bf16 values around
+// it, a tie to the one with an even last bit
+uint16_t bf16_reference(float f) {
+    const uint16_t lo = (uint16_t) (bits_of(f) >> 16), hi = (uint16_t) (lo + 1);
+    const double dl = std::fabs((double) stage_f32_from_bf16(lo) - (double) f);
+    const double dh = std::fabs((double) stage_f32_from_bf16(hi) - (double) f);
+    return dl < dh ? lo : dh < dl ? hi : (lo & 1) != 0 ? hi : lo;
+}
+// rows as they come back over a bf16 link
+std::vector<float> bf16_rounded(const float* p, size_t n) {
+    std::vector<float> r(n);
+    for (size_t i = 0; i < n; ++i) r[i] = stage_f32_from_bf16(stage_bf16_from_f32(p[i]));
+    return r;
+}
+bool same_bits(const float* a, const float* b, size_t n) { return std::memcmp(a, b, n * sizeof(float)) == 0; }
 
 // a peer that connects to a worker on loopback and sends its hello in parts, when the test says; a thread waits (up
 // to 15 s) for the worker to close it.  The sockets are started: a StageClient connected before.
@@ -811,6 +856,214 @@ int main() {
     check(greet(a, wk9.where, with_token(hello_of(), "tok")) && a.reset(err), "... and connected again, A is served");
     a.close();
     wk9.stop();
+
+    // 10. STRATA_STAGE_ROWS_BF16: the rows as bf16 on the wire, fp32 at both ends
+    {
+        check(stage_bf16_from_f32(1.0f) == 0x3f80 && stage_f32_from_bf16(0x3f80) == 1.0f &&
+                  stage_bf16_from_f32(-0.0f) == 0x8000 && stage_bf16_from_f32(0.0f) == 0,
+              "bf16: 1, 0 and -0 are exact");
+        check(stage_bf16_from_f32(f32_of(0x3f808000u)) == 0x3f80 && stage_bf16_from_f32(f32_of(0x3f818000u)) == 0x3f82 &&
+                  stage_bf16_from_f32(f32_of(0xbf818000u)) == 0xbf82,
+              "bf16: a tie rounds to the even neighbour (down, up, and by magnitude when negative)");
+        check(stage_bf16_from_f32(f32_of(0x3f808001u)) == 0x3f81 && stage_bf16_from_f32(f32_of(0x3f807fffu)) == 0x3f80,
+              "bf16: off a tie, to the nearer one");
+        check(stage_bf16_from_f32(f32_of(0x00008000u)) == 0x0000 && stage_bf16_from_f32(f32_of(0x00018000u)) == 0x0002 &&
+                  stage_bf16_from_f32(f32_of(0x00018001u)) == 0x0002,
+              "bf16: subnormals round the same way");
+        check(stage_bf16_from_f32(INFINITY) == 0x7f80 && stage_bf16_from_f32(-INFINITY) == 0xff80 &&
+                  stage_bf16_from_f32(f32_of(0x7f7fffffu)) == 0x7f80 && stage_bf16_from_f32(f32_of(0x7f7f7fffu)) == 0x7f7f,
+              "bf16: infinities stay, the largest floats round to one, the largest bf16 stays");
+        check(std::isnan(stage_f32_from_bf16(stage_bf16_from_f32(f32_of(0x7f800001u)))) &&
+                  std::isnan(stage_f32_from_bf16(stage_bf16_from_f32(f32_of(0xffc00000u)))) &&
+                  std::isnan(stage_f32_from_bf16(stage_bf16_from_f32(f32_of(0x7fffffffu)))),
+              "bf16: a NaN stays a NaN (also one whose payload is in the low bits only)");
+        bool every = true;
+        for (uint32_t b = 0; b < 65536; ++b) {
+            const float f = stage_f32_from_bf16((uint16_t) b);
+            every = every && (std::isnan(f) ? std::isnan(stage_f32_from_bf16(stage_bf16_from_f32(f)))
+                                            : stage_bf16_from_f32(f) == (uint16_t) b);
+        }
+        check(every, "bf16: every bf16 value comes back as itself (NaNs as NaNs)");
+        std::mt19937 rng(1748);
+        std::normal_distribution<float> normal(0.0f, 1.0f);
+        std::uniform_int_distribution<int> scale(-30, 30);
+        bool like_ref = true, within = true;
+        for (int i = 0; i < 200000; ++i) {
+            const float f = std::ldexp(normal(rng), scale(rng));
+            const uint16_t b = stage_bf16_from_f32(f);
+            like_ref = like_ref && b == bf16_reference(f);
+            within = within && std::fabs(stage_f32_from_bf16(b) - f) <= std::fabs(f) * (1.0f / 256.0f);
+        }
+        check(like_ref, "bf16: 200,000 random values round as the reference (nearest, ties to even)");
+        check(within, "... each within 2^-8 of its value (half a unit in bf16's 8 significant bits)");
+    }
+    {
+        // a worker whose hello says how its rows travel (worker_rows), with a prompt buffer for a chunk of three of the
+        // link's pieces (64K floats each)
+        constexpr int64_t kBig = 40000;   // rows of kD floats: 160,000 floats a chunk
+        std::vector<float> big_in0((size_t) (kBig * kD)), big_in1(big_in0.size()), big_out0(big_in0.size()),
+            big_out1(big_in0.size());
+        StageBuffers bbuf = buf;
+        bbuf.pf_in[0] = big_in0.data();
+        bbuf.pf_in[1] = big_in1.data();
+        bbuf.pf_out[0] = big_out0.data();
+        bbuf.pf_out[1] = big_out1.data();
+        bbuf.pf_floats = big_in0.size();
+        std::atomic<uint32_t> worker_rows{kStageRowsBf16Chunks | kStageRowsBf16Windows};
+        StageHandlers hb = h;
+        hb.hello = [&](const StageHello&, StageHello& mine, std::string&) {
+            mine = hello_of();
+            mine.row_format = worker_rows.load();
+            return true;
+        };
+        Worker wk10;
+        if (!wk10.start(hb, bbuf)) {
+            std::printf("stage_link_test: no loopback port to listen on\n");
+            return 1;
+        }
+        auto rows_hello = [](uint32_t f) {
+            StageHello x = hello_of();
+            x.row_format = f;
+            return x;
+        };
+        const uint32_t kBoth = kStageRowsBf16Chunks | kStageRowsBf16Windows;
+        // a window of kMaxT rows: values bf16 cannot hold (a tie, a subnormal, large and small), and exact ones
+        float win[kMaxT * kHbf], wback[kMaxT * kHbf];
+        const float wvals[kMaxT * kHbf] = {3.14159265f, -2.71828183f, 1.0f, -0.0f,
+                                           f32_of(0x3f818000u), f32_of(0x3f808001u), 1e-40f, -1e-3f,
+                                           123456.789f, -6.5e-5f, 3.0e38f, 0.1f,
+                                           0.33333334f, -1.5f, 7.0e-30f, 65504.0f};
+        std::memcpy(win, wvals, sizeof win);
+        const int32_t wtok[kMaxT] = {1, 2, 3, 4};
+        // two prompt chunks of kBig rows, normally distributed at mixed scales
+        std::vector<float> ch_a((size_t) (kBig * kD)), ch_b(ch_a.size()), back_a(ch_a.size(), -9.0f),
+            back_b(ch_a.size(), -9.0f);
+        std::mt19937 rng(10);
+        std::normal_distribution<float> normal(0.0f, 1.0f);
+        for (size_t i = 0; i < ch_a.size(); ++i) {
+            ch_a[i] = std::ldexp(normal(rng), (int) (i % 13) - 6);
+            ch_b[i] = normal(rng) * 37.0f;
+        }
+        std::vector<int64_t> ctok((size_t) kBig);
+        for (int64_t i = 0; i < kBig; ++i) ctok[(size_t) i] = i;
+        const int64_t skip = 3;
+        const size_t back_floats = (size_t) ((kBig - skip) * kD);
+
+        StageClient b;
+        check(greet(b, wk10.where, rows_hello(kBoth)) && peer.row_format == kBoth && b.row_format() == kBoth,
+              "STRATA_STAGE_ROWS_BF16=1 on both: served, both hellos say bf16 rows");
+        uint64_t out0 = b.stats().bytes_out, in0 = b.stats().bytes_in;
+        err.clear();
+        bool ok = b.run((int) kMaxT, wtok, 0, win, (size_t) (kMaxT * kHbf), wback, (size_t) (kMaxT * kHbf), err);
+        const std::vector<float> wround = bf16_rounded(win, (size_t) (kMaxT * kHbf));
+        check(ok && same_bits(wback, wround.data(), wround.size()) && !same_bits(wback, win, wround.size()),
+              "a window comes back as its bf16-rounded rows (fp32 at both ends)");
+        check(b.stats().bytes_out - out0 == sizeof(StageHeader) + kMaxT * 4 + kMaxT * kHbf * 2 &&
+                  b.stats().bytes_in - in0 == sizeof(StageHeader) + kMaxT * kHbf * 2,
+              "... 2 bytes a float on the wire, each way");
+        out0 = b.stats().bytes_out;
+        in0 = b.stats().bytes_in;
+        ok = b.prefill_send(ctok.data(), kBig, 0, 0, ch_a.data(), kD, skip, err) &&
+             b.prefill_send(ctok.data(), kBig, kBig, 0, ch_b.data(), kD, 0, err) &&
+             b.prefill_recv(back_a.data(), kD, kBig, skip, err) && b.prefill_recv(back_b.data(), kD, kBig, 0, err);
+        const std::vector<float> ra = bf16_rounded(ch_a.data(), ch_a.size()), rb = bf16_rounded(ch_b.data(), ch_b.size());
+        bool untouched = true;
+        for (size_t i = 0; i < (size_t) (skip * kD); ++i) untouched = untouched && back_a[i] == -9.0f;
+        check(ok && same_bits(back_a.data() + skip * kD, ra.data() + skip * kD, back_floats) && untouched &&
+                  same_bits(back_b.data(), rb.data(), rb.size()),
+              "two prompt chunks in flight (three pieces each): their bf16-rounded rows, from `skip` on");
+        check(b.stats().bytes_out - out0 == 2 * (sizeof(StageHeader) + kBig * 8 + kBig * kD * 2) &&
+                  b.stats().bytes_in - in0 == 2 * sizeof(StageHeader) + (back_floats + kBig * kD) * 2,
+              "... 2 bytes a float on the wire, each way");
+        err.clear();
+        check(b.reset(err) && b.run(1, wtok, 0, win, kHbf, wback, kHbf, err) && same_bits(wback, wround.data(), kHbf),
+              "... and the link is in step after them");
+        b.close();
+
+        worker_rows = kStageRowsBf16Chunks;
+        check(greet(b, wk10.where, rows_hello(kStageRowsBf16Chunks)) && b.row_format() == kStageRowsBf16Chunks,
+              "STRATA_STAGE_ROWS_BF16=chunks on both: served");
+        out0 = b.stats().bytes_out;
+        err.clear();
+        std::fill(back_a.begin(), back_a.end(), -9.0f);
+        ok = b.run((int) kMaxT, wtok, 0, win, (size_t) (kMaxT * kHbf), wback, (size_t) (kMaxT * kHbf), err);
+        check(ok && same_bits(wback, win, (size_t) (kMaxT * kHbf)) &&
+                  b.stats().bytes_out - out0 == sizeof(StageHeader) + kMaxT * 4 + kMaxT * kHbf * 4,
+              "... a window travels as fp32 (exact, 4 bytes a float)");
+        ok = b.prefill_send(ctok.data(), kBig, 0, 0, ch_a.data(), kD, 0, err) &&
+             b.prefill_recv(back_a.data(), kD, kBig, 0, err);
+        check(ok && same_bits(back_a.data(), ra.data(), ra.size()), "... a prompt chunk as bf16");
+        b.close();
+
+        worker_rows = 0;
+        check(greet(b, wk10.where, rows_hello(0)) && b.row_format() == 0, "unset on both: served, fp32 rows");
+        out0 = b.stats().bytes_out;
+        in0 = b.stats().bytes_in;
+        err.clear();
+        std::fill(back_a.begin(), back_a.end(), -9.0f);
+        ok = b.run((int) kMaxT, wtok, 0, win, (size_t) (kMaxT * kHbf), wback, (size_t) (kMaxT * kHbf), err) &&
+             same_bits(wback, win, (size_t) (kMaxT * kHbf)) &&
+             b.prefill_send(ctok.data(), kBig, 0, 0, ch_a.data(), kD, skip, err) &&
+             b.prefill_recv(back_a.data(), kD, kBig, skip, err) &&
+             same_bits(back_a.data() + skip * kD, ch_a.data() + skip * kD, back_floats);
+        check(ok && b.stats().bytes_out - out0 ==
+                        sizeof(StageHeader) * 2 + kMaxT * 4 + kMaxT * kHbf * 4 + kBig * 8 + kBig * kD * 4 &&
+                  b.stats().bytes_in - in0 == sizeof(StageHeader) * 2 + kMaxT * kHbf * 4 + back_floats * 4,
+              "... the rows exact, 4 bytes a float, as before row_format");
+        b.close();
+
+        worker_rows = kBoth;
+        check(!greet(b, wk10.where, rows_hello(0)) && contains(err, "the worker refused:") && contains(err, "differ") &&
+                  contains(err, "main fp32, worker bf16") && contains(err, "STRATA_STAGE_ROWS_BF16") &&
+                  !stage_link_lost(err),
+              "a main with fp32 rows is refused by a worker with bf16, saying which has which (not a lost link)");
+        std::printf("    (%s)\n", err.c_str());
+        worker_rows = 0;
+        check(!greet(b, wk10.where, rows_hello(kBoth)) && contains(err, "differ") &&
+                  contains(err, "main bf16, worker fp32"),
+              "... and one with bf16 by a worker with fp32");
+        worker_rows = kStageRowsBf16Chunks;
+        check(!greet(b, wk10.where, rows_hello(kBoth)) && contains(err, "differ") &&
+                  contains(err, "main bf16, worker bf16 prompt chunks, fp32 windows"),
+              "... and one with every row bf16 by a worker with bf16 chunks only");
+        b.close();
+        wk10.stop();
+        // a worker from before row_format answers any hello (hello_of(): fp32): the main process refuses it itself
+        Chatty older;
+        check(older.start("") && !greet(b, older.where, rows_hello(kBoth)) && !contains(err, "the worker refused") &&
+                  contains(err, "differ") && contains(err, "main bf16, worker fp32") && !b.connected(),
+              "a main with bf16 refuses a worker that does not check (fp32 rows) itself");
+        b.close();
+        older.stop();
+        // protocol 5's hello before row_format: a 56-byte build id ("strata remote-stage worker" and the like) whose
+        // last 4 bytes, now row_format, it left zero
+        StageHello before;
+        {
+            char* field = reinterpret_cast<char*>(&before) + offsetof(StageHello, build);   // (build and row_format)
+            const char* id = "strata remote-stage worker (sycl)";   // the longest the engine wrote: 33 characters
+            std::memset(field, 0, 56);
+            std::memcpy(field, id, std::strlen(id));
+        }
+        check(before.row_format == 0 && offsetof(StageHello, row_format) == offsetof(StageHello, build) + 52,
+              "a hello from before row_format (its build id in 56 bytes) reads as fp32 rows");
+        // the variable
+        set_rows_env(nullptr);
+        const uint32_t unset = stage_row_format_env();
+        set_rows_env("0");
+        const uint32_t zero = stage_row_format_env();
+        set_rows_env("1");
+        const uint32_t one = stage_row_format_env();
+        set_rows_env("chunks");
+        const uint32_t chunks = stage_row_format_env();
+        set_rows_env("yes");
+        const uint32_t other = stage_row_format_env();
+        set_rows_env(nullptr);
+        check(unset == 0 && zero == 0 && one == kBoth && chunks == kStageRowsBf16Chunks && other == 0,
+              "STRATA_STAGE_ROWS_BF16: unset and 0 fp32, 1 every row bf16, chunks the chunks, else fp32 (warned)");
+        check(stage_row_format_name(0) == "fp32" && stage_row_format_name(kBoth) == "bf16" &&
+                  stage_row_format_name(8) == "unknown (8)",
+              "... and their names in the logs");
+    }
 
     if (g_fail == 0) std::printf("stage_link_test: all passed\n");
     else std::printf("stage_link_test: %d FAILED\n", g_fail);

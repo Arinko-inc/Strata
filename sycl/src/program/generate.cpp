@@ -8834,6 +8834,9 @@ int main(int argc, char **argv) try {
             me.handoff_floats = HBF;
             me.tail_skip = 0;   // no STRATA_ROUTE_TAIL_SKIP in the SYCL build (the hello takes the main process's)
             me.vision = 0;
+            // how the rows travel (STRATA_STAGE_ROWS_BF16; fp32 by default): the same on every process, the hello
+            // checks.  The link converts them (src/net/stage_link.cpp): the buffers here stay fp32
+            me.row_format = strata::net::stage_row_format_env();
             std::snprintf(me.build, sizeof me.build, "strata remote-stage worker (sycl)");
             // the model pack's fingerprint: its tensor index and expert table (the same model on both PCs)
             for (const char* f : {"/index.txt", "/native_experts.txt"}) {

@@ -210,7 +210,8 @@ strata serve: remote stage 192.0.2.11:7841: layers 26-47 there (prompt chunk 588
 ```
 
 **What must agree** (each side checks the other's hello and says which number differs): the model pack, the K/V
-placement mode (all in VRAM or streamed), and K (`--layer-split K` on the main PC, `--stage-begin K` on the worker).
+placement mode (all in VRAM or streamed), K (`--layer-split K` on the main PC, `--stage-begin K` on the worker), and
+how the hand-off rows travel (`STRATA_STAGE_ROWS_BF16`, below).
 Use the same `--kv` too; the hello's `kv_type` currently carries the placement mode, not the element type.
 The worker's `--prefill`, `--max-context` and `--spec` must be at least the main process's. Each PC chooses its own
 `--expert-cache`, `--vram-reserve-mib` and CPU threads. `--kv-resident` may differ only if the placement mode agrees.
@@ -307,7 +308,8 @@ Keep K/V entirely in VRAM on both processes for this example (omit `--kv-residen
 Start the server as usual. The main process keeps the head, MTP drafter, PLE and sampling on the 4070.
 
 **The hello is the same as for CUDA/HIP workers.** It compares the protocol, model geometry, floats per hand-off
-row, pack fingerprint (`index.txt` and `native_experts.txt`, not the weights), K and K/V placement mode.
+row, pack fingerprint (`index.txt` and `native_experts.txt`, not the weights), K, K/V placement mode and the rows'
+format (`STRATA_STAGE_ROWS_BF16`: the link converts the rows, so a SYCL worker takes bf16 rows as a CUDA one does).
 Use the same model, `--kv` and `STRATA_STAGE_TOKEN` on both processes. The worker's `--prefill`, `--max-context`
 and `--spec` must be at least the main process's. A main process with `--vision` is refused in the hello too.
 
@@ -424,6 +426,7 @@ main process without it.
 | `--stream-experts` | SYCL worker | required: read its layers' experts from the GGUF into VRAM, without a full host arena. Not with `--mmap-experts` or `--expert-cache-per-layer` |
 | `--stage-bind ADDR` | worker | the address to listen on (default: every interface, IPv4 and IPv6) |
 | `STRATA_STAGE_TOKEN` | every PC | the shared secret in the hello (up to 63 characters). A worker without one warns and accepts anyone |
+| `STRATA_STAGE_ROWS_BF16` | every PC | `1`: the rows handed between stages (prompt chunks and verify windows) travel as bf16 instead of fp32, half the bytes; `chunks`: only the prompt chunks' rows (windows stay fp32). The link rounds each float to the nearest bf16 (ties to even) as it sends and widens it back as it receives, on the CPU, so every stage still computes in fp32 and only the hand-off loses precision. Set it alike on the main process, every relay and the last worker: the hello refuses a mismatch and says which side has which. Unset or `0`: fp32, the same bytes as before. <!-- measured: fill in --> |
 | `STRATA_REMOTE_TIMING=1` | any | per-stage timing lines: each prompt chunk, and every 64 windows (see below) |
 | `STRATA_ADAPT_OVERLAP=1` | CUDA/HIP | let the adaptive tier's copies land while the next window runs (opt-in on every PC since 0.1.43.1). On a worker it was not measured faster ([ENGINEERING.md](remote-stage/ENGINEERING.md#after-the-rebase-onto-0143-2026-10-12)). Adaptive swaps are off on a SYCL worker |
 | `STRATA_REMOTE_TIMEOUT_S` | any | seconds a send or receive may block before the link counts as dead (default 300). After the hello, a worker waits for the next message without a limit |
@@ -680,6 +683,7 @@ python3 tools/stage_tune.py apply cluster.json OUTDIR    # start the workers as 
 | a worker restarted right after a stop fails (little VRAM free) | the previous worker is still unpinning (more than 30 s with ~30 GB of experts); wait until its process is gone |
 | `remote stage: the worker refused: wrong token (STRATA_STAGE_TOKEN)` | the same `STRATA_STAGE_TOKEN` on every PC |
 | `the main process reads images (--vision): start this worker with --vision too` | add `--vision` to every worker's command, a relay's next worker's too ([Images](#images---vision)) |
+| `remote stage: the two sides differ in how the hand-off rows travel (main bf16, worker fp32)` (or the other way, after `the worker refused:`) | the same `STRATA_STAGE_ROWS_BF16` on every PC, relays included ("main" is the side that connects: the main process, or a relay towards its next worker) |
 | `remote stage: the two sides differ (protocol ..., first remote layer ..., K/V type ..., model pack ...)` | the same build of the engine on every PC, the same pack, the same `--kv`, and `--stage-begin` = the previous stage's K |
 | `the main process reads prompts in chunks of N tokens, this worker's chunk is M` | the worker's `--prefill` must be at least the main process's chunk |
 | `this worker lends the prompt path buffers for M tokens, the main process sends chunks of N` at a long prompt | the worker's cache can lend the buffers neither for the main process's chunk nor for its own `--prefill` (0.1.43.1 halves such a loan); start the main process with `--prefill M`. When only the main process's chunk cannot be lent whole (a smaller chunk can need more slots; a multi-GPU worker reads short requests in its `STRATA_SPLIT_SMALL_OWN` chunks), the worker says at the hello `its prompts lend for this worker's own chunk (M)` and needs nothing |

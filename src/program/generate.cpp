@@ -9622,6 +9622,8 @@ int main(int argc, char** argv) {
             me.handoff_floats = HBF;
             me.tail_skip = (int32_t) strata::core::tail_skip_rank();   // a worker's: informational
             me.vision = o.vision ? 1 : 0;   // images: the worker's layers need the position table (StageMsg::Positions)
+            // how the rows travel (STRATA_STAGE_ROWS_BF16; fp32 by default): the same on every process, the hello checks
+            me.row_format = strata::net::stage_row_format_env();
             std::snprintf(me.build, sizeof me.build, "strata remote-stage %s", stage_worker ? "worker" : "main");
             // the model pack's fingerprint: its tensor index and expert table (the same model on both PCs)
             for (const char* f : {"/index.txt", "/native_experts.txt"}) {
@@ -9645,9 +9647,11 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata serve: %s\n", err.c_str());
                     return 1;
                 }
-                std::fprintf(stderr, "strata serve: remote stage %s: layers %d-%d there (prompt chunk %lld, context %lld)\n",
+                std::fprintf(stderr, "strata serve: remote stage %s: layers %d-%d there (prompt chunk %lld, context %lld%s%s)\n",
                              o.remote_stage.c_str(), remote_peer.layer_begin, remote_peer.n_layers - 1,
-                             (long long) remote_peer.chunk, (long long) remote_peer.max_context);
+                             (long long) remote_peer.chunk, (long long) remote_peer.max_context,
+                             me.row_format != 0 ? ", hand-off rows " : "",
+                             me.row_format != 0 ? strata::net::stage_row_format_name(me.row_format).c_str() : "");
             } else {
                 // remote-stage worker: serve the main process instead of stdin.  A prompt starts with a reset; windows,
                 // commits and chunks arrive in order, each whole, and run here one at a time.
@@ -9913,8 +9917,10 @@ int main(int argc, char** argv) {
                             return false;
                         std::this_thread::sleep_for(std::chrono::seconds(2));
                     }
-                    std::fprintf(stderr, "strata serve: relay: layers %d-%d on %s\n", peer_next.layer_begin,
-                                 peer_next.n_layers - 1, o.stage_next.c_str());
+                    std::fprintf(stderr, "strata serve: relay: layers %d-%d on %s%s%s\n", peer_next.layer_begin,
+                                 peer_next.n_layers - 1, o.stage_next.c_str(),
+                                 me.row_format != 0 ? ", hand-off rows " : "",
+                                 me.row_format != 0 ? strata::net::stage_row_format_name(me.row_format).c_str() : "");
                     return true;
                 };
                 if (stage_relay && !connect_next(err)) {

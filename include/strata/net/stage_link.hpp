@@ -14,13 +14,15 @@
 // another thread.  Images (--vision on both sides): a request with a picture rotates its tokens by M-RoPE positions
 // that are not the cell index, so the main process sends its position table before the request (and a reset to the
 // identity before the next text request); the worker's layers read their own copy.  POSIX sockets on Linux, Winsock on
-// Windows.
+// Windows.  Rows travel as fp32; with STRATA_STAGE_ROWS_BF16 on every process (the hello's row_format) they travel as
+// bf16 instead - the link rounds them on the way out and widens them on the way in, so both ends still hand it fp32.
 #pragma once
 
 #include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <deque>
 #include <functional>
 #include <future>
@@ -36,12 +38,13 @@ inline constexpr uint32_t kStageProtocol = 5;
 enum class StageMsg : uint32_t {
     Hello = 1,
     HelloOk = 2,
-    Run = 3,        // a = T, b = pos0; payload: int32 tokens[T], float rows[T * handoff_floats]
-    RunOk = 4,      // a = the worker's time (us); payload: float rows[T * handoff_floats]
+    // (rows: fp32, or bf16 where StageHello::row_format says so - kStageRowsBf16Windows, kStageRowsBf16Chunks)
+    Run = 3,        // a = T, b = pos0; payload: int32 tokens[T], rows[T * handoff_floats]
+    RunOk = 4,      // a = the worker's time (us); payload: rows[T * handoff_floats]
     Commit = 5,     // a = n_keep; no reply (an error comes back on the next reply)
     Prefill = 6,    // a = T, b = pos0, c = flags (bit 0: the prompt is one chunk) | skip << 8; payload: int64 tokens[T],
-                    // float rows[T * D]
-    PrefillOk = 7,  // a = the worker's time (us); payload: float rows[(T - skip) * D], the chunk's rows from row `skip`
+                    // rows[T * D]
+    PrefillOk = 7,  // a = the worker's time (us); payload: rows[(T - skip) * D], the chunk's rows from row `skip`
                     // (the main process needs no earlier ones: the drafter's window does not reach them)
     Reset = 8,      // a fresh prompt from position 0
     ResetOk = 9,
@@ -71,12 +74,43 @@ struct StageHello {
     uint64_t pack_hash = 0;       ///< the model pack's fingerprint (both sides must load the same model)
     int32_t tail_skip = 0;        ///< the main process's STRATA_ROUTE_TAIL_SKIP rank (0: off); a worker uses it
     int32_t vision = 0;           ///< started with --vision (a main process with it needs a worker with it)
-    char build[56] = {};          ///< engine build id (informational)
+    char build[52] = {};          ///< engine build id (informational)
+    /// how the rows travel (kStageRows*; 0: all fp32), STRATA_STAGE_ROWS_BF16.  Both sides must agree.  It sits in
+    /// what were the last 4 bytes of `build` in protocol 5, which a peer from before it leaves zero (its build id is
+    /// shorter), so such a peer reads as fp32 rows: the protocol number stays, and the default stays byte-identical.
+    uint32_t row_format = 0;
     char token[64] = {};          ///< the shared secret (STRATA_STAGE_TOKEN); the worker refuses a wrong one
 };
 #pragma pack(pop)
 // one size across protocols: an older peer's hello is read whole and refused for its protocol, not as malformed
 static_assert(sizeof(StageHello) == 192, "the hello's size");
+static_assert(offsetof(StageHello, row_format) == 124 && offsetof(StageHello, token) == 128, "the hello's layout");
+
+/// StageHello::row_format bits: these rows travel as bf16 (round to nearest even), the rest as fp32.
+inline constexpr uint32_t kStageRowsBf16Chunks = 1u;    ///< a prompt chunk's rows (Prefill, PrefillOk)
+inline constexpr uint32_t kStageRowsBf16Windows = 2u;   ///< a verify window's rows (Run, RunOk)
+
+/// This process's row format from STRATA_STAGE_ROWS_BF16: unset, empty or "0": fp32 (0); "1": every row bf16;
+/// "chunks": prompt chunks bf16, windows fp32.  Anything else: fp32, with a warning on stderr.
+uint32_t stage_row_format_env();
+/// "fp32", "bf16", "bf16 prompt chunks, fp32 windows", ... (the logs and the hello's refusal)
+std::string stage_row_format_name(uint32_t row_format);
+
+/// fp32 -> bf16, rounding to nearest even; a NaN stays a NaN (quiet), an infinity stays one, and a finite value past
+/// bf16's largest becomes an infinity.
+inline uint16_t stage_bf16_from_f32(float f) {
+    uint32_t u;
+    std::memcpy(&u, &f, sizeof u);
+    if ((u & 0x7fffffffu) > 0x7f800000u) return (uint16_t) ((u >> 16) | 0x40u);
+    return (uint16_t) ((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
+}
+/// bf16 -> fp32 (exact)
+inline float stage_f32_from_bf16(uint16_t b) {
+    const uint32_t u = (uint32_t) b << 16;
+    float f;
+    std::memcpy(&f, &u, sizeof f);
+    return f;
+}
 
 /// Seconds a send or receive on a link may block before the link counts as dead (STRATA_REMOTE_TIMEOUT_S, default 300).
 int io_timeout_s();
@@ -142,14 +176,18 @@ public:
 
     const StageStats& stats() const { return stats_; }
     std::string peer_name() const { return peer_; }
+    /// the row format both hellos agreed on (StageHello::row_format) - how this connection's rows travel
+    uint32_t row_format() const { return rows_; }
 
 private:
-    bool read_reply_(StageMsg want, void* reply, size_t reply_bytes, int64_t& worker_us, std::string& err);
+    /// `rows_out`: `floats` floats of rows, as `bf16` says they travel (none: nullptr, 0)
+    bool read_reply_(StageMsg want, float* rows_out, size_t floats, bool bf16, int64_t& worker_us, std::string& err);
     /// a failed link: shut down (both directions fail from now on) - the descriptor is closed only by close(), so
     /// the other thread never reads or writes a number the process may have reused
     void break_();
     std::intptr_t fd_ = -1;   ///< the socket (a Winsock SOCKET fits; -1: none)
     bool broken_ = false;
+    uint32_t rows_ = 0;   ///< the agreed row format (connect)
     std::string peer_;
     std::mutex send_mu_, recv_mu_, q_mu_;
     std::deque<std::chrono::steady_clock::time_point> sent_at_;   ///< outstanding chunks' send start (timing)
