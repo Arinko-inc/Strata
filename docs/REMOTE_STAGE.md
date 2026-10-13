@@ -315,7 +315,84 @@ The SYCL tree has no `STRATA_ROUTE_TAIL_SKIP` implementation. Every expert of th
 decode, so there is no missed expert to skip. The worker accepts the main process's rank (0-9) and echoes it in
 its hello; a nonzero rank also prints why it does not apply here.
 
-<!-- 2026-10-13: fill in trainsv measurements after validation. -->
+### Loopback, one PC (measured 2026-10-13)
+
+Engine 0.1.43.1 on trainsv: Ryzen 9 5900X, 32 GB RAM, RTX 4070 12 GB in a PCIe 4.0 x4 slot as
+the main process, Arc Pro B70 32 GB in an x16 slot as the worker. Ubuntu 24.04, kernel 7.0.0-38,
+oneAPI 2026.1.1, CUDA 12.8. The processes talk over `127.0.0.1:7841`.
+
+Settings: `--prefill 4096 --spec 4 --spec-min-p 0.5 --mtp mtp/rt --max-context 32768 --kv int8`
+(no `--mtp` on the worker), greedy, `STRATA_ROUTE_TAIL_SKIP=0` on CUDA. Decode uses five prompts
+with 256 new tokens each: six runs per prompt, discard the first, then take the median of five.
+The ranges below are approximate ranges across those five medians.
+
+**Qwen3.8-Flash-Next IQ2_XS, K=12.** The worker holds all 18,432 experts of layers 12-47 in VRAM
+(25.02 GiB, 2,335 MiB left). The main process pins its 12 layers' experts in 8.0 GiB of RAM and
+has 6,144 cache slots (8.0 GiB of VRAM). All 24,576 experts fit across the two cards.
+
+| configuration | decode (tok/s) | 4K prompt (tok/s) |
+|---|---:|---:|
+| RTX 4070 main + B70 worker, K=12 | 73-109 | 1,291 |
+| B70 alone, `--stream-experts --vram-reserve-mib 1024` | 44-74 | 1,204 |
+| RTX 4070 alone, `--mmap-experts` | 26-32 | 339 |
+
+The B70 alone keeps 7,296 experts in a pinned host mirror (9.84 GiB), read over PCIe. The 4070
+alone is a reference for this x4 slot and `--mmap-experts`: trainsv cannot pin the model's 33 GiB
+of experts in its 32 GB of RAM. The worker takes about 27.5 ms per window for its 36 layers
+(27.4-27.8 ms in the timing logs, `STRATA_REMOTE_TIMING=1`).
+
+**Teacher-forced logprobs.** `STRATA_LOGPOS` records the top 20 on raw texts; the compared run uses
+`STRATA_LOGPOS_IDS` to record the same token IDs. KL includes those 20 tokens and the remaining
+probability mass as one group. The B70-alone run is the reference for all three rows below.
+
+| comparison | texts / positions | mean KL | argmax agreement |
+|---|---|---:|---:|
+| split vs B70 alone, window reading | 12 / 25,256 | 0.135 | 83.6% |
+| B70 alone vs 4070 alone, backend noise floor | 11 / 14,096 | 0.152 | 82.3% |
+| split vs B70 alone, prompt chunks then windows | tails of 2 long texts / 9,269 | 0.091 | 85.1% |
+
+Window reading uses `--adapt-every 100000 --short-read 1000000`. The 4070-alone run's twelfth
+text hit the server watchdog, so the noise-floor row covers fewer texts and positions. For the
+last row, `STRATA_LOGPOS_SPLIT_AT=6144` reads the first 6,144 tokens as prompt chunks and the rest
+as windows; the table measures only those later positions. These are distribution comparisons,
+not identical outputs.
+
+**OrcaRouter IQ3_XXS, K=23.** At 1.038 GiB of experts a layer, the B70 worker fits 25 layers
+(23-47): 12,800 experts, 25.94 GiB. Asking it to hold 28 layers (K=20) leaves it 3.2 GiB short,
+and the worker stops at start. With the 4070 main process on `--mmap-experts`, decode is about
+36-51 tok/s. The main process, reading experts through the x4 slot, is the slow stage. OrcaRouter
+on the B70 alone was not measured here: its 26.5 GiB host mirror does not fit alongside the rest
+of the process in trainsv's RAM.
+
+### Two PCs over 2.5 GbE (measured 2026-10-13)
+
+Engine 0.1.43.1, OrcaRouter IQ3_XXS, K=23. The main PC is llmsv02: Ryzen 9 7945HX, 60 GB RAM,
+RTX 5070 Ti 16 GB, CUDA 13.3. The worker is the trainsv B70 above, holding the last 25 layers.
+Both PCs used `net.ipv4.tcp_slow_start_after_idle=0` for the measurement; the setting was restored
+afterward. The main process pins its 23 layers' experts in 24 GiB of RAM and has 5,342 cache slots
+(10.83 GiB of VRAM, `--vram-reserve-mib 1117`).
+
+The split and the 5070 Ti alone use the same settings: `--max-context 32768 --prefill 4096 --kv int8`,
+no `--kv-resident`, `STRATA_ROUTE_TAIL_SKIP=0`, and the draft and greedy settings above. Decode
+uses the same five-prompt, 256-token, median-of-five method. This is a same-day comparison, not
+llmsv02's usual 256K setup with `--kv-resident 32768`.
+
+| configuration | decode (tok/s, approximate range) | 4K prompt (tok/s) |
+|---|---:|---:|
+| RTX 5070 Ti main + B70 worker, K=23 | 78-108 | 1,145 |
+| RTX 5070 Ti alone | 81-104 | 2,244 |
+
+The split's decode range is close to the single card's, but the 4K prompt reads at about half
+the speed. A 4,096-token chunk takes about 2.9 s: worker 1.5 s, link and queue 1.3 s (rounded
+timings). A window's round trip is 17.2 ms: worker 16.1 ms plus link 1.1 ms
+(`STRATA_REMOTE_TIMING=1`).
+
+Teacher-forced top-20 logprobs on five raw texts (1,363 positions), with the 5070 Ti alone as
+the reference, give mean KL 0.0147 (about 0.015) and 94.5% argmax agreement for the split.
+
+Source for both setups: `strata-mesh/bench/2026-10-13-stage-a-m-loop/README.md`.
+**Not measured:** a HIP main process, a relay through a SYCL worker, images, or bf16 hand-off rows.
+The SYCL worker currently refuses relays and images; these measurements use fp32 rows.
 
 ## Images (`--vision`)
 
@@ -650,15 +727,16 @@ python3 tools/stage_tune.py apply cluster.json OUTDIR    # start the workers as 
 | Model family | Qwen3.8-Flash-Next only (48 layers, 512 experts top-10, 4 hyper-connection streams, n_embd 2560). The hello checks the geometry |
 | RVN IQ3_S, native pack read from its GGUF | **measured** (two and three PCs) |
 | Huihui UD-Q4_K_XL (Unsloth UD layout), native pack read from its GGUF | **measured** (one, two and three PCs) |
-| Other quantizations and models of the family (the official IQ3_S, IQ3_XXS, IQ2_XS, Coder, Swift 1.5, UD-IQ4_XS) | not tested. The hand-off is fp32 rows whatever the quantization, the arena range is cut by layer from the pack's expert table and the shipper works by tensor name |
+| Qwen3.8-Flash-Next IQ2_XS; OrcaRouter IQ3_XXS | **measured** with a B70 SYCL worker and a CUDA main process (2026-10-13): IQ2_XS on loopback, OrcaRouter on loopback and 2.5 GbE. See [the measured setups](#loopback-one-pc-measured-2026-10-13) |
+| Other quantizations and models of the family (the official IQ3_S, IQ3_XXS, Coder, Swift 1.5, UD-IQ4_XS) | not tested. The hand-off is fp32 rows whatever the quantization, the arena range is cut by layer from the pack's expert table and the shipper works by tensor name |
 | Images (`--vision` on the main PC and every worker) | **measured** on two PCs (RVN IQ3_S, the encoder on the main PC's CPU); through a relay worker not run |
 | A pack with `experts.bin`, or `--shared-expert-arena` | refused at start (the layer range needs the GGUF loader) |
 | Linux, NVIDIA (CUDA 13.0) | measured: Ubuntu 24.04 in an LXC container (main), a Linux host with kernel 6.14 (worker) |
 | Windows 11 native, NVIDIA (MSVC 2022, CUDA 13.0) | measured as a worker (and its node agent); as the main PC not tested |
 | WSL2 (Windows 11, mirrored networking) | measured as a worker |
 | AMD (HIP) | builds (ROCm 7.0, gfx1100, in a container); not run: no AMD card was available |
-| Intel (SYCL) | worker only, with a CUDA main process; measurements in progress on trainsv (Arc Pro B70 worker, RTX 4070 main on the same Linux PC). See [Intel Arc as a worker](#intel-arc-as-a-worker-sycl-build). HIP main not tested |
-| Links | measured on 1 GbE and on 10 GbE (limited to ~400 MB/s by its slot) |
+| Intel (SYCL) | **measured** as a worker on 2026-10-13, engine 0.1.43.1: trainsv B70 + RTX 4070 on loopback (IQ2_XS, K=12, about 73-109 tok/s decode); trainsv B70 + llmsv02 RTX 5070 Ti over 2.5 GbE (OrcaRouter IQ3_XXS, K=23, about 78-108 tok/s). See [Intel Arc as a worker](#intel-arc-as-a-worker-sycl-build) for hardware, settings and single-card comparisons. HIP main not tested |
+| Links | measured on loopback and 2.5 GbE ([SYCL worker, 2026-10-13](#loopback-one-pc-measured-2026-10-13)), 1 GbE and 10 GbE (limited to ~400 MB/s by its slot) |
 
 ## Troubleshooting
 
