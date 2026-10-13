@@ -146,8 +146,9 @@ with an in-process layer split; not measured.
   parts, include `crt` and `nvvm` (CUDA 13 ships them separately, and nvcc fails without them). Put `cudart64_13.dll`,
   `cublas64_13.dll` and `cublasLt64_13.dll` (in CUDA 13's `bin\x64`) next to `strata.exe`.
 - **An NVIDIA card the engine supports** (RTX 20 or newer) for the CUDA builds; each PC's build covers its own card.
-  An Intel Arc can be a worker with the [SYCL build](#intel-arc-as-a-worker-sycl-build). HIP also builds, but has not
-  been run here (see [What it works with](#what-it-works-with)).
+  An Intel Arc can be a worker with the [SYCL build](#intel-arc-as-a-worker-sycl-build). An AMD card can be a worker
+  or a relay with the HIP build (measured on an RX 7900 XT, [below](#four-gpus-three-backends-cuda-main-hip-relay-cuda-relay-sycl-last-25-gbe-2026-10-13));
+  a HIP main process has not been run (see [What it works with](#what-it-works-with)).
 - **The same model on every PC:** the same pack directory (both sides compare a fingerprint of its `index.txt` and
   `native_experts.txt` and refuse a mismatch), the GGUF shards (a worker reads every shard's header and its own
   layers' tensors; `tools/stage_ship.py` sends just that), and the expert profile. The fingerprint covers the pack's
@@ -393,8 +394,54 @@ Teacher-forced top-20 logprobs on five raw texts (1,363 positions), with the 507
 the reference, give mean KL 0.0147 (about 0.015) and 94.5% argmax agreement for the split.
 
 Source for both setups: `strata-mesh/bench/2026-10-13-stage-a-m-loop/README.md`.
-**Not measured:** a HIP main process, a relay through a SYCL worker, images, or bf16 hand-off rows.
-The SYCL worker currently refuses relays and images; these measurements use fp32 rows.
+**Not measured:** a HIP main process, a relay through a SYCL worker, images.
+The SYCL worker currently refuses relays and images; the measurements above use fp32 rows (bf16 rows: the next section).
+
+## Four GPUs, three backends (CUDA main, HIP relay, CUDA relay, SYCL last), 2.5 GbE (2026-10-13)
+
+The same branch, engine 0.1.43.1, with a model none of the four cards holds alone: OrcaRouter
+Qwen3.8-Flash-Next-Uncensored **Q4_K_S** (68.3 GiB of routed experts: 1.465 GiB a layer for layers 0-5, Q4_K
+gate/up and Q5_1 down; 1.416 GiB for layers 6-47, Q5_0 down; the native pack from `tools/iq_pack.py --compat-bf16`,
+`--ple-io mmap`). `--max-context 32768 --kv int8 --spec 4`, MTP on the main process, greedy;
+`net.ipv4.tcp_slow_start_after_idle=0` on every PC.
+
+- **main** llmsv02: Ryzen 9 7945HX, 60 GB, RTX 5070 Ti 16 GB (CUDA 13.3): layers 0-10, `--mmap-experts`, 4,019 cache
+  slots (11.33 GiB, 7.8 layers' worth; the rest on the CPU and over PCIe).
+- **relay** llmsv: Ryzen 7 9800X3D, 30 GB, RX 7900 XT 20 GB (HIP gfx1100; ROCm 7.10.0a20251120 from AMD's TheRock
+  wheels on Ubuntu 24.04, kernel 6.8 - the system ROCm 6.4.4 does not build this tree, its hipBLAS is too old; the
+  engine was built on a PC without an AMD card and shipped with the two runtime library directories): layers 11-22,
+  `--mmap-experts` from an NFS mount of the main PC's model directory, 6,144 slots, all twelve layers in VRAM, 3-4 GB of RAM.
+- **relay** trainsv: Ryzen 9 5900X, 32 GB, RTX 4070 12 GB (CUDA, PCIe 4.0 x4): layers 23-29, 3,542 slots (42 experts short).
+- **last worker** trainsv: Arc Pro B70 32 GB (SYCL, x16): layers 30-47, 9,216 slots (25.49 GiB), all in VRAM.
+
+Decode: five prompts × 256 tokens, median of five runs after a warm-up; prompt: a fresh 1,024- and 4,096-token prompt.
+
+| configuration | decode tok/s | 1K prompt tok/s | 4K prompt tok/s |
+|---|---:|---:|---:|
+| three stages (main 0-17, HIP relay 18-29, B70 30-47), fp32 rows, `--prefill 4096` | 37-61 | 286 | 525 |
+| four stages as above, fp32, `--prefill 4096` | 50-72 | 333 | 559 |
+| four stages, fp32, `--prefill 2048` | 50-73 | 350 | 675 |
+| four stages, fp32, `--prefill 1024` | 52-79 | 357 | 642 |
+| four stages, **bf16 rows** (`STRATA_STAGE_ROWS_BF16=1`), `--prefill 2048` | 58-81 | 393 | 770 |
+
+The 5070 Ti alone cannot hold the experts (68 GiB in 60 GB of RAM): with `--mmap-experts` it reads a 411-token
+prompt in 55 s.
+
+- The main process is the slow stage when it holds more layers than its VRAM caches: with 18 layers it spends about
+  90 ms a window on CPU/PCIe experts, against 14 ms for the HIP relay's twelve layers, 20.6 ms for the B70's
+  eighteen, and 1.5 ms of link a hop. Moving layers off the main process (three to four stages) was worth more than
+  the extra hop.
+- Smaller prompt chunks overlap the stages' compute and transfer on this link: 4096 to 2048 is +21% on the 4K
+  prompt; 1024 gains nothing more. A chunk's `link and queue` figure includes the wait behind the previous chunk, so
+  the per-chunk round trips do not add up; compare the prompt's total time.
+- bf16 rows halve what a 4,096-token chunk carries (160 MiB of fp32 rows: 4 streams × 2,560 × 4 bytes a token; six
+  crossings of the link in four stages): +14% over fp32 at the same chunk size. The teacher-forced distribution is
+  unchanged: against the 5070 Ti alone (five raw texts, 1,363 positions) mean KL 0.0170 with bf16 rows and 0.0179
+  with fp32, argmax agreement 91.6% and 91.3%, perplexity 9.459 and 9.412 (the reference 9.467).
+- The HIP worker alone, IQ2_XS (main 0-29 on the 5070 Ti, worker 30-47 on the 7900 XT, 9,216 slots all in VRAM):
+  decode 84-107 tok/s, 4K prompt 868 tok/s, mean KL 0.0077 against the 5070 Ti alone (argmax 95.3%).
+
+Source: `strata-mesh/bench/2026-10-13-stage-b-q4ks/README.md`.
 
 ## Images (`--vision`)
 
@@ -426,7 +473,7 @@ main process without it.
 | `--stream-experts` | SYCL worker | required: read its layers' experts from the GGUF into VRAM, without a full host arena. Not with `--mmap-experts` or `--expert-cache-per-layer` |
 | `--stage-bind ADDR` | worker | the address to listen on (default: every interface, IPv4 and IPv6) |
 | `STRATA_STAGE_TOKEN` | every PC | the shared secret in the hello (up to 63 characters). A worker without one warns and accepts anyone |
-| `STRATA_STAGE_ROWS_BF16` | every PC | `1`: the rows handed between stages (prompt chunks and verify windows) travel as bf16 instead of fp32, half the bytes; `chunks`: only the prompt chunks' rows (windows stay fp32). The link rounds each float to the nearest bf16 (ties to even) as it sends and widens it back as it receives, on the CPU, so every stage still computes in fp32 and only the hand-off loses precision. Set it alike on the main process, every relay and the last worker: the hello refuses a mismatch and says which side has which. Unset or `0`: fp32, the same bytes as before. <!-- measured: fill in --> |
+| `STRATA_STAGE_ROWS_BF16` | every PC | `1`: the rows handed between stages (prompt chunks and verify windows) travel as bf16 instead of fp32, half the bytes; `chunks`: only the prompt chunks' rows (windows stay fp32). The link rounds each float to the nearest bf16 (ties to even) as it sends and widens it back as it receives, on the CPU, so every stage still computes in fp32 and only the hand-off loses precision. Set it alike on the main process, every relay and the last worker: the hello refuses a mismatch and says which side has which. Unset or `0`: fp32, the same bytes as before. Measured 2026-10-13 on a four-stage chain over 2.5 GbE (OrcaRouter Q4_K_S, `--prefill 2048`): the 4K prompt 675 to 770 tok/s, decode 50-73 to 58-81 tok/s, mean KL against one GPU 0.0179 (fp32) and 0.0170 (bf16). |
 | `STRATA_REMOTE_TIMING=1` | any | per-stage timing lines: each prompt chunk, and every 64 windows (see below) |
 | `STRATA_ADAPT_OVERLAP=1` | CUDA/HIP | let the adaptive tier's copies land while the next window runs (opt-in on every PC since 0.1.43.1). On a worker it was not measured faster ([ENGINEERING.md](remote-stage/ENGINEERING.md#after-the-rebase-onto-0143-2026-10-12)). Adaptive swaps are off on a SYCL worker |
 | `STRATA_REMOTE_TIMEOUT_S` | any | seconds a send or receive may block before the link counts as dead (default 300). After the hello, a worker waits for the next message without a limit |
@@ -666,7 +713,7 @@ python3 tools/stage_tune.py apply cluster.json OUTDIR    # start the workers as 
 | Linux, NVIDIA (CUDA 13.0) | measured: Ubuntu 24.04 in an LXC container (main), a Linux host with kernel 6.14 (worker) |
 | Windows 11 native, NVIDIA (MSVC 2022, CUDA 13.0) | measured as a worker (and its node agent); as the main PC not tested |
 | WSL2 (Windows 11, mirrored networking) | measured as a worker |
-| AMD (HIP) | builds (ROCm 7.0, gfx1100, in a container); not run: no AMD card was available |
+| AMD (HIP) | **measured** as a worker and as a relay on 2026-10-13 (RX 7900 XT, gfx1100, ROCm 7.10.0a20251120 TheRock wheels, Ubuntu 24.04 kernel 6.8): IQ2_XS worker 84-107 tok/s decode; OrcaRouter Q4_K_S relay in a four-stage chain. A HIP main process not run. See [four GPUs, three backends](#four-gpus-three-backends-cuda-main-hip-relay-cuda-relay-sycl-last-25-gbe-2026-10-13) |
 | Intel (SYCL) | **measured** as a worker on 2026-10-13, engine 0.1.43.1: trainsv B70 + RTX 4070 on loopback (IQ2_XS, K=12, about 73-109 tok/s decode); trainsv B70 + llmsv02 RTX 5070 Ti over 2.5 GbE (OrcaRouter IQ3_XXS, K=23, about 78-108 tok/s). See [Intel Arc as a worker](#intel-arc-as-a-worker-sycl-build) for hardware, settings and single-card comparisons. HIP main not tested |
 | Links | measured on loopback and 2.5 GbE ([SYCL worker, 2026-10-13](#loopback-one-pc-measured-2026-10-13)), 1 GbE and 10 GbE (limited to ~400 MB/s by its slot) |
 
