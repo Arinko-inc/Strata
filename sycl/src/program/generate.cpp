@@ -71,6 +71,8 @@ namespace strata::prefill { void set_nonresident_share(double share); }   // SYC
 #include "strata/kernels/qsa.hpp"
 #include "strata/core/native_head.hpp"
 #include "strata/core/verify.hpp"
+#include "strata/net/stage_link.hpp"     // remote stage (PR #1748): the SYCL worker's link
+#include "strata/core/logpos_ids.hpp"    // STRATA_LOGPOS_SPLIT_AT (measurement, off by default)
 #include "strata/core/mtp.hpp"
 #include "strata/prefill/prefill.hpp"
 #include "strata/core/native_dense.hpp"
@@ -668,6 +670,18 @@ struct Options {
     /// the later stages' devices "D1,D2,.." (default: the next visible GPUs; "0" with one K: both stages on this
     /// GPU, sharing everything - the bit-exact A/B of the hand-off)
     std::string split_device;
+    /// remote stage (PR #1748; strata-mesh stage A ports its WORKER to the SYCL build).  The main process
+    /// (--remote-stage HOST:PORT) is the CUDA/HIP build's; here it is refused.
+    std::string remote_stage;
+    /// remote stage, the worker: listen on this port and run layers [stage_begin, n_layers) without the head
+    int stage_worker = 0;
+    int64_t stage_begin = -1;
+    /// the worker's listening address (--stage-bind ADDR; empty: every interface).  STRATA_STAGE_TOKEN (both sides)
+    /// is the shared secret the worker requires in the main process's hello
+    std::string stage_bind;
+    /// a relay worker (--stage-end K2 --stage-next HOST:PORT): not in the SYCL build (refused)
+    int64_t stage_end = -1;
+    std::string stage_next;
     /// --split-skip-if-fits (opt-in; the server passes it for a config's "split_skip_if_fits"): with
     /// --layer-split auto, run on CUDA0 alone when it holds every profiled expert pair plus the whole session (KV),
     /// the drafter and the reserve - a split then only adds hand-offs (two RDNA4 cards: 1,384 vs 1,794 tok/s at 4K)
@@ -1944,6 +1958,12 @@ int main(int argc, char **argv) try {
         else if (a == "--spec-split") o.spec_split = true;
         else if (a == "--layer-split") o.layer_split = next("--layer-split");
         else if (a == "--split-device") o.split_device = next("--split-device");
+        else if (a == "--remote-stage") o.remote_stage = next("--remote-stage");
+        else if (a == "--stage-worker") o.stage_worker = std::atoi(next("--stage-worker"));
+        else if (a == "--stage-begin") o.stage_begin = std::atoll(next("--stage-begin"));
+        else if (a == "--stage-bind") o.stage_bind = next("--stage-bind");
+        else if (a == "--stage-end") o.stage_end = std::atoll(next("--stage-end"));
+        else if (a == "--stage-next") o.stage_next = next("--stage-next");
         else if (a == "--split-skip-if-fits") o.split_skip_if_fits = true;
         else if (a == "--pcie-mode") o.pcie_mode = next("--pcie-mode");
         else if (a == "--serve") o.serve = true;
@@ -2183,6 +2203,48 @@ int main(int argc, char **argv) try {
         }
     }
     bool multi_gpu = !split_devs.empty() && !split_same;   // cleared by --split-skip-if-fits before any stage loads
+    // remote stage (PR #1748), the SYCL worker (strata-mesh stage A): which layers this process holds (the expert
+    // source and cache, the dense weights, the session); [own_lo, own_hi), own_hi -1 = to the last layer.  The main
+    // process and a relay worker are the CUDA/HIP build's.
+    const bool stage_worker = o.stage_worker > 0;
+    [[maybe_unused]] int64_t own_lo = 0, own_hi = -1;
+    if (!o.remote_stage.empty() || stage_worker) {
+        const char* why = nullptr;
+        if (!o.remote_stage.empty())
+            why = "--remote-stage (the main process) is not in the SYCL build: run the main process on the CUDA/HIP build, "
+                  "this build runs a --stage-worker";
+        else if (!o.serve) why = "it needs --serve";
+        else if (o.stage_begin < 2 || !o.layer_split.empty() || !o.split_device.empty())
+            why = "--stage-worker needs --stage-begin K (K >= 2, the main process's --layer-split K) and no --layer-split";
+        else if (o.stage_end >= 0 || !o.stage_next.empty())
+            why = "a relay worker (--stage-end, --stage-next) is not in the SYCL build: this worker runs the last layers";
+        else if (o.batch > 0 || o.pipeline_windows > 0 || o.peer_device >= 0)
+            why = "it does not support --batch, --pipeline-windows or --peer-device";
+        else if (!o.cvec_files.empty())
+            why = "it does not carry --control-vector (or a speed projection) to the worker's layers";
+        else if (o.expert_cache_remote[0] > 0 || o.expert_cache_remote[1] > 0 || o.expert_cache_remote[2] > 0)
+            why = "it does not support --expert-cache-remote";
+        else if (o.vision)
+            why = "--vision: the SYCL worker takes no image position table (StageMsg::Positions) yet";
+        else if (!o.stream_experts || o.mmap_experts)
+            why = "the SYCL worker reads its layers' experts from the GGUF into VRAM: it needs --stream-experts (and no "
+                  "--mmap-experts)";
+        if (why != nullptr) {
+            std::fprintf(stderr, "strata generate: remote stage: %s\n", why);
+            return 2;
+        }
+        o.prompt_cache = 0;
+        o.conversation_cache_mib = 0;
+        o.prompt_cache_every = 0;
+        o.kv_grow = false;   // the elastic K/V gives this process's cache slots up without the other side knowing
+        own_lo = o.stage_begin;
+        own_hi = -1;
+        std::fprintf(stderr, "strata generate: remote stage: this process holds layers %lld-last (a stage worker, no "
+                             "head)\n", (long long) own_lo);
+        // SKELETON (strata-mesh stage A, IMPL-PLAN-stage-a.md): the worker's body is 担当 A's.  Until then it stops here.
+        std::fprintf(stderr, "strata generate: remote stage: the SYCL stage worker is not implemented in this build yet\n");
+        return 2;
+    }
     bool split_own_auto = false;   // #340: the split keeps own prompt buffers by its rule (not --no-prefill-borrow)
     if (o.mmap_experts && !o.shared_expert_arena.empty()) {
         std::fprintf(stderr, "strata generate: --shared-expert-arena backs the resident arena and cannot be used with --mmap-experts\n");
@@ -10318,7 +10380,10 @@ int main(int argc, char **argv) try {
             static const bool no_short = std::getenv("STRATA_CKPT_REREAD") != nullptr;
             int64_t req_short_read = o.short_read;   // STRATA_PIPELINE_SWITCH may set it per request (short_read=)
             auto windows_ok = [&](int64_t a, int64_t b) -> bool {
-                if (no_short || b - a > req_short_read) return false;
+                // STRATA_LOGPOS_SPLIT_AT=<s> (measurement, off by default): a part from s on goes through the windows,
+                // a part before it batched, whatever their lengths (the cut at s is among the parts' ends below)
+                const int64_t lp_split = strata::core::logpos::split_at();
+                if (lp_split > 0 ? a < lp_split : (no_short || b - a > req_short_read)) return false;
                 if (sp.embd_rows != nullptr)
                     for (int64_t i = a; i < b; ++i)
                         if (sp.embd_rows[i] != nullptr) return false;
@@ -10779,7 +10844,12 @@ int main(int argc, char **argv) try {
             const int64_t message_at = message_checkpoint && !multi_gpu && o.prompt_cache > 0
                 ? strata::program::message_checkpoint_boundary(ids, resume, turn_at, o.turn_token) : -1;
             int64_t at = read_from;
-            for (const int64_t to : {reread_to, root_at, message_at, turn_at, n - 1}) {
+            std::vector<int64_t> cuts = {reread_to, root_at, message_at, turn_at, n - 1};
+            if (const int64_t s = strata::core::logpos::split_at(); s > 0 && s < n - 1) {   // STRATA_LOGPOS_SPLIT_AT
+                cuts.push_back(s);
+                std::sort(cuts.begin(), cuts.end());   // the skipped -1s first, n - 1 still last
+            }
+            for (const int64_t to : cuts) {
                 if (to <= at) continue;
                 err.clear();
                 const bool win = windows_ok(at, to);

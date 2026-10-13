@@ -11,6 +11,7 @@
 #if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
 #include "strata/core/host_graph_launch.hpp"
 #endif
+#include "strata/core/logpos_ids.hpp"   // STRATA_LOGPOS_IDS (measurement, off by default)
 #include "strata/core/remote_expert_opt.hpp"
 #include "strata/core/dma_batch.hpp"
 #include "strata/core/spec_prob.hpp"
@@ -3673,6 +3674,8 @@ bool Verifier::window_logprobs(const int32_t* targets, int T, int64_t pos0, int3
             for (int j = 0; j < topk; ++j)
                 std::fprintf(out, "\t%d:%.6f", order[(size_t) j], (double) row[order[(size_t) j]] - lse);
         }
+        // STRATA_LOGPOS_IDS=<baseline dump> (measurement, off by default): the baseline's top ids at this position
+        if (!strata::core::logpos::write_ids(out, pos0 + t, row, n_vocab_, lse, err)) return false;
         std::fprintf(out, "\n");
     }
     std::fflush(out);
