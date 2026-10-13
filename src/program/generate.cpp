@@ -61,6 +61,7 @@
 #include "strata/core/native_head.hpp"
 #include "strata/core/verify.hpp"
 #include "strata/net/stage_link.hpp"
+#include "strata/core/logpos_ids.hpp"   // STRATA_LOGPOS_SPLIT_AT (measurement, off by default)
 #include "strata/core/mtp.hpp"
 #include "strata/prefill/prefill.hpp"
 #include "strata/core/native_dense.hpp"
@@ -11566,7 +11567,10 @@ int main(int argc, char** argv) {
             static const bool no_short = std::getenv("STRATA_CKPT_REREAD") != nullptr;
             int64_t req_short_read = o.short_read;   // STRATA_PIPELINE_SWITCH may set it per request (short_read=)
             auto windows_ok = [&](int64_t a, int64_t b) -> bool {
-                if (no_short || b - a > req_short_read) return false;
+                // STRATA_LOGPOS_SPLIT_AT=<s> (measurement, off by default): a part from s on goes through the windows,
+                // a part before it batched, whatever their lengths (the cut at s is among the parts' ends below)
+                const int64_t lp_split = strata::core::logpos::split_at();
+                if (lp_split > 0 ? a < lp_split : (no_short || b - a > req_short_read)) return false;
                 if (sp.embd_rows != nullptr)
                     for (int64_t i = a; i < b; ++i)
                         if (sp.embd_rows[i] != nullptr) return false;
@@ -11960,6 +11964,10 @@ int main(int argc, char** argv) {
             std::vector<int64_t> cuts = {reread_to, root_at, message_at, turn_at, n - 1};
             if (pin_at >= 0) {
                 cuts.push_back(pin_at);
+                std::sort(cuts.begin(), cuts.end());   // the skipped -1s first, n - 1 still last
+            }
+            if (const int64_t s = strata::core::logpos::split_at(); s > 0 && s < n - 1) {   // STRATA_LOGPOS_SPLIT_AT
+                cuts.push_back(s);
                 std::sort(cuts.begin(), cuts.end());   // the skipped -1s first, n - 1 still last
             }
             int64_t at = read_from;
