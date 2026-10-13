@@ -13,8 +13,9 @@ that hand-off over TCP:
 - the **main PC** runs layers 0 to K-1, the output head, the draft (MTP) layer, sampling and the API server;
 - a **worker PC** runs layers K to 47 without the head (`strata --serve --stage-worker PORT --stage-begin K`), or a
   middle range that it hands on to the next worker (a relay);
-- each PC keeps an expert cache for **its own layers only**, its own CPU expert pool, its own part of the session
-  (the K/V of its attention layers, the state of its GDN layers), and loads only its own layers' experts into RAM.
+- each PC keeps an expert cache for **its own layers only** and its own part of the session (the K/V of its attention
+  layers, the state of its GDN layers). CUDA/HIP processes load their own layers' experts into RAM for the CPU expert
+  pool; a [SYCL worker](#intel-arc-as-a-worker-sycl-build) reads its experts from the GGUF into VRAM.
 
 What it buys: more VRAM for the expert cache and more RAM for the experts. What it costs: one network round trip per
 verify window per worker, and every prompt chunk's rows over the network. Decode does not run on two PCs at once: a
@@ -145,7 +146,9 @@ with an in-process layer split; not measured.
   through WSL2. A Windows build needs MSVC 2022 and the CUDA 13 toolkit; when installing only some of the toolkit's
   parts, include `crt` and `nvvm` (CUDA 13 ships them separately, and nvcc fails without them). Put `cudart64_13.dll`,
   `cublas64_13.dll` and `cublasLt64_13.dll` (in CUDA 13's `bin\x64`) next to `strata.exe`.
-- **An NVIDIA card the engine supports on every PC** (RTX 20 or newer); each PC's build covers its own card.
+- **An NVIDIA card the engine supports** (RTX 20 or newer) for the CUDA builds; each PC's build covers its own card.
+  An Intel Arc can be a worker with the [SYCL build](#intel-arc-as-a-worker-sycl-build). HIP also builds, but has not
+  been run here (see [What it works with](#what-it-works-with)).
 - **The same model on every PC:** the same pack directory (both sides compare a fingerprint of its `index.txt` and
   `native_experts.txt` and refuse a mismatch), the GGUF shards (a worker reads every shard's header and its own
   layers' tensors; `tools/stage_ship.py` sends just that), and the expert profile. The fingerprint covers the pack's
@@ -153,8 +156,9 @@ with an in-process layer split; not measured.
 - **A native pack that takes its experts from the GGUF** (no `experts.bin`, no `--shared-expert-arena`): only that
   loader can hold a range of layers. Anything else stops at start with "a layer range needs a native pack read from
   its GGUF".
-- **RAM for its own layers' experts** on each PC, pinned: 1.11 GiB a layer for RVN IQ3_S, 1.47-1.90 GiB for
-  UD-Q4_K_XL. On Windows, Task Manager shows this as "shared GPU memory" (below).
+- **RAM for its own layers' experts** on each CUDA/HIP PC, pinned: 1.11 GiB a layer for RVN IQ3_S, 1.47-1.90 GiB for
+  UD-Q4_K_XL. On Windows, Task Manager shows this as "shared GPU memory" (below). A SYCL worker needs VRAM for all
+  of its layers' experts instead.
 - **A network the PCs share**, and the ports open: the worker's (7841 here) and, with the tools, the agent's (7840).
   - Windows: an inbound firewall rule for those TCP ports, limited to the local subnet.
   - WSL2: mirrored networking (`networkingMode=mirrored` in `.wslconfig`), and a Hyper-V firewall rule for the ports
@@ -216,8 +220,9 @@ process, with the head (a worker started with it stops and says so).
 and since 0.1.43 also on RDNA 4 (HIP), but off when 90% or more of the experts are in the GPU cache (60% on a HIP
 layer split, which a remote main counts as; `STRATA_TAIL_SKIP_MAX_CACHED` moves the line; on a remote stage
 the main process counts its own layers' experts, the nearest it can see to the whole split's). So the main process's
-rank goes in the hello and every worker uses it, as the stages of a split in one process share one rank (a worker says
-so in one line when its own differed). The other routing variables that change answers
+rank goes in the hello and CUDA/HIP workers use it, as the stages of a split in one process share one rank (a worker
+says so in one line when its own differed). A SYCL worker accepts and echoes it; all its experts are in VRAM, so
+there are no misses to skip. The other routing variables that change answers
 (`STRATA_ROUTE_PRIOR`, `STRATA_ROUTE_RESIDENT` and their kin) are not sent: set them alike on every PC.
 
 ## More than two PCs (relay workers)
@@ -237,7 +242,85 @@ strata --serve --stage-worker 7841 --stage-begin 24 --stage-end 40 --stage-next 
 Measured with three PCs (the tables above). A relay carries every prompt chunk and every window twice, so give it the
 fastest link: on 1 GbE the relay's link was the limit.
 
+## Intel Arc as a worker (SYCL build)
+
+The engine built from `sycl/` can run the last layers as a worker:
+`--serve --stage-worker PORT --stage-begin K --stream-experts`. The main process uses the CUDA or HIP build with
+`--layer-split K --split-device 0 --remote-stage HOST:PORT`. K must be at least 2 and less than 48; the worker runs
+layers K to 47. SYCL does not run a remote main process, a relay worker or images.
+
+**All of the worker's experts must fit in VRAM.** Use a native pack, `--native SHARD1`, `--expert-profile` and
+`--stream-experts`, without `--mmap-experts`. The worker reads only its layers' experts from the GGUF into VRAM;
+it does not load all layers' experts into RAM. After filling the cache it counts every missing expert in [K, 48).
+If any are missing, it prints the missing count, cache slots and approximate GiB short, then exits with code 2.
+The message ends with `raise --stage-begin, or lower --max-context / --vram-reserve-mib`. The profile must list all
+of the worker's experts too; the same message says when it does not.
+
+The dense weights, session state and K/V cover only the worker's layers. It loads no output head, MTP drafter,
+PLE table or token embedding table. Leave `--mtp` on the main process; on the worker it is ignored with
+`--mtp ignored on a stage worker (the main process drafts)`. Adaptive swaps are turned off on the worker.
+Prompt buffers can borrow cache slots and refill them before a decode window. The host mirror may keep copies
+of those slots' experts, but only for the worker's own layers.
+
+Unsupported options stop at start with exit code 2 and the prefix `strata generate: remote stage:`:
+
+| option | reason printed by the SYCL build |
+|---|---|
+| `--remote-stage` | `--remote-stage (the main process) is not in the SYCL build: run the main process on the CUDA/HIP build, this build runs a --stage-worker` |
+| `--stage-end` / `--stage-next` on a worker | `a relay worker (--stage-end, --stage-next) is not in the SYCL build: this worker runs the last layers` |
+| `--vision` on a worker | `--vision: the SYCL worker takes no image position table (StageMsg::Positions) yet` |
+| No `--stream-experts`, or with `--mmap-experts` | `the SYCL worker reads its layers' experts from the GGUF into VRAM: it needs --stream-experts (and no --mmap-experts)` |
+| `--expert-cache-per-layer` on a worker | `--expert-cache-per-layer gives every layer slots: a SYCL worker's cache holds all of its own layers' experts and no other's` |
+
+**Start the B70 worker first.** This is the trainsv setup: Arc Pro B70 worker, RTX 4070 main process on the same
+Linux PC, IQ2_XS, K=12, over `127.0.0.1:7841`. Change the build and model paths for your PC. In a shell with
+oneAPI installed, source `setvars.sh` before running the SYCL binary. On the xe driver set
+`STRATA_VERIFY_NO_HOST=1`; see [INTEL.md](INTEL.md#the-engine-itself-on-intel-the-sycl-port-sycl) for the SYCL
+build and launch settings. Select the Arc with `ONEAPI_DEVICE_SELECTOR` (`level_zero:0` on trainsv).
+
+```bash
+source /opt/intel/oneapi/setvars.sh
+export ONEAPI_DEVICE_SELECTOR=level_zero:0
+export STRATA_VERIFY_NO_HOST=1 STRATA_VERIFY_DEVICE_PLAN=1 STRATA_STAGER_THREADS=12 ZES_ENABLE_SYSMAN=1
+export STRATA_STAGE_TOKEN="your-stage-secret"
+build-sycl/strata --serve --stage-worker 7841 --stage-begin 12 --stage-bind 127.0.0.1 \
+  --pack /data/Strata-data/packs/iq2_xs \
+  --native /data/Strata-data/models/IQ2_XS/Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf \
+  --ple-gguf /data/Strata-data/models/IQ2_XS/Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00002-of-00002.gguf \
+  --expert-profile /home/arinko/strata-sycl/data/expert-profile.bin --expert-cache auto \
+  --prefill 4096 --spec 4 --max-context 32768 --kv int8 --stream-experts --vram-reserve-mib 1024
+```
+
+`--ple-gguf` supplies the shard the argument checks need; the worker does not read its PLE table.
+Wait for `strata stage worker: listening on 127.0.0.1:7841 (a token is required)`.
+
+**Then start the CUDA main process on the 4070.** Use its usual model config and CUDA executable. Add the split
+to `"args"`, set the chunk, context and window as below, and put the same token in `"env"`:
+
+```json
+"args": [ "...the model's usual args...",
+          "--prefill", "4096", "--spec", "4", "--max-context", "32768", "--kv", "int8",
+          "--layer-split", "12", "--split-device", "0", "--remote-stage", "127.0.0.1:7841" ],
+"env": { "STRATA_STAGE_TOKEN": "your-stage-secret" }
+```
+
+Keep K/V entirely in VRAM on both processes for this example (omit `--kv-resident` from the main config).
+Start the server as usual. The main process keeps the head, MTP drafter, PLE and sampling on the 4070.
+
+**The hello is the same as for CUDA/HIP workers.** It compares the protocol, model geometry, floats per hand-off
+row, pack fingerprint (`index.txt` and `native_experts.txt`, not the weights), K and K/V placement mode.
+Use the same model, `--kv` and `STRATA_STAGE_TOKEN` on both processes. The worker's `--prefill`, `--max-context`
+and `--spec` must be at least the main process's. A main process with `--vision` is refused in the hello too.
+
+The SYCL tree has no `STRATA_ROUTE_TAIL_SKIP` implementation. Every expert of the worker's layers is in VRAM for
+decode, so there is no missed expert to skip. The worker accepts the main process's rank (0-9) and echoes it in
+its hello; a nonzero rank also prints why it does not apply here.
+
+<!-- 2026-10-13: fill in trainsv measurements after validation. -->
+
 ## Images (`--vision`)
+
+This needs CUDA/HIP workers. SYCL workers do not accept `--vision` or an image position table.
 
 Pictures work on a split as on one card ([DETAILS.md](DETAILS.md#images-vision)): the main PC's server config has its
 usual `"vision"` section, and the encoder (`strata-vision` and the mmproj file) runs on the main PC only. **Start
@@ -257,15 +340,16 @@ main process without it.
 
 | flag or variable | where | what it does |
 |---|---|---|
-| `--remote-stage HOST:PORT` | main | the (first) worker's address. Needs `--serve` and `--layer-split K --split-device 0` |
+| `--remote-stage HOST:PORT` | main | the (first) worker's address. Needs `--serve` and `--layer-split K --split-device 0`. CUDA/HIP build only |
 | `--layer-split K --split-device 0` | main | K is the first layer the worker runs (2 or more): this PC runs 0 to K-1 and the head |
-| `--stage-worker PORT` | worker | serve a main process on this TCP port instead of stdin. Needs `--serve`, not with `--layer-split` |
+| `--stage-worker PORT` | worker | serve a main process on this TCP port instead of stdin. Needs `--serve`, not with `--layer-split`. SYCL also needs `--stream-experts` and all its layers' experts in VRAM |
 | `--stage-begin K` | worker | the first layer this worker runs: the main process's K (or the previous relay's `--stage-end`); 2 or more, below the layer count |
-| `--stage-end K2`, `--stage-next HOST:PORT` | relay worker | run layers K to K2-1 and hand the rest to the worker at HOST:PORT. Both or neither |
+| `--stage-end K2`, `--stage-next HOST:PORT` | relay worker | run layers K to K2-1 and hand the rest to the worker at HOST:PORT. Both or neither; refused by a SYCL worker |
+| `--stream-experts` | SYCL worker | required: read its layers' experts from the GGUF into VRAM, without a full host arena. Not with `--mmap-experts` or `--expert-cache-per-layer` |
 | `--stage-bind ADDR` | worker | the address to listen on (default: every interface, IPv4 and IPv6) |
 | `STRATA_STAGE_TOKEN` | every PC | the shared secret in the hello (up to 63 characters). A worker without one warns and accepts anyone |
 | `STRATA_REMOTE_TIMING=1` | any | per-stage timing lines: each prompt chunk, and every 64 windows (see below) |
-| `STRATA_ADAPT_OVERLAP=1` | any | let the adaptive tier's copies land while the next window runs (opt-in on every PC since 0.1.43.1). On a worker it was not measured faster ([ENGINEERING.md](remote-stage/ENGINEERING.md#after-the-rebase-onto-0143-2026-10-12)) |
+| `STRATA_ADAPT_OVERLAP=1` | CUDA/HIP | let the adaptive tier's copies land while the next window runs (opt-in on every PC since 0.1.43.1). On a worker it was not measured faster ([ENGINEERING.md](remote-stage/ENGINEERING.md#after-the-rebase-onto-0143-2026-10-12)). Adaptive swaps are off on a SYCL worker |
 | `STRATA_REMOTE_TIMEOUT_S` | any | seconds a send or receive may block before the link counts as dead (default 300). After the hello, a worker waits for the next message without a limit |
 | `STRATA_REMOTE_CONNECT_S` | main | seconds the main process keeps trying to connect, every 2 s, while the worker's name does not resolve, nothing listens at its address or the network does not reach it: at its start, and when a request finds the link lost (default 180; 0: one try, with the link's own time-outs). That is the whole wait: each try's connect and the worker's reply to its hello (a worker serving another main process answers once the new one takes it over) get what is left of it, at most `STRATA_REMOTE_TIMEOUT_S` a try (a name with several addresses: 10 s at most for each but the last; the name's lookup itself is not cut short). During a request the main process prints `INFO remote_stage_wait=S` every 10 s meanwhile, so the server does not take the wait for a frozen engine, and a STOP (the client went away) ends the wait at once: that request ends, the main engine stays, and the next request tries again. A refusal (token, model, layers, chunk) is not tried again. A worker down for longer is still found: the server's next request starts the main engine again, which tries anew |
 | `STRATA_REMOTE_TAKEOVER_S` | worker | seconds the connection served must have had no message read, being read, or a reply going out before a new main process may take the worker over (default 30; 0: never, a new one waits until the old one closes) |
@@ -578,7 +662,7 @@ python3 tools/stage_tune.py apply cluster.json OUTDIR    # start the workers as 
 | Windows 11 native, NVIDIA (MSVC 2022, CUDA 13.0) | measured as a worker (and its node agent); as the main PC not tested |
 | WSL2 (Windows 11, mirrored networking) | measured as a worker |
 | AMD (HIP) | builds (ROCm 7.0, gfx1100, in a container); not run: no AMD card was available |
-| Intel (SYCL) | the SYCL port builds (oneAPI 2026.1.1, in a container) but has no remote stage: it keeps its own copies of the engine files this feature changes |
+| Intel (SYCL) | worker only, with a CUDA main process; measurements in progress on trainsv (Arc Pro B70 worker, RTX 4070 main on the same Linux PC). See [Intel Arc as a worker](#intel-arc-as-a-worker-sycl-build). HIP main not tested |
 | Apple (Metal, 0.1.44) | refused at start: the Metal backend runs each verify window itself, past the remote stage's hooks. Its build compiles the link's code so the binary links (not built here: no Mac) |
 | Links | measured on 1 GbE and on 10 GbE (limited to ~400 MB/s by its slot) |
 

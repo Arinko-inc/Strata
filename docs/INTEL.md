@@ -28,6 +28,15 @@ docker build --pull -t strata-sycl-dev sycl/tools                 # once, about 
 Python refuses it (`externally-managed-environment`). `./setup.sh --backend sycl` is the one command for the first install and
 every later start. Then `run-<model>.sh` starts the model; the first start of a 30 GB model takes about two minutes.
 
+## Remote stage worker (SYCL)
+
+A SYCL engine can be a remote stage worker for a CUDA or HIP main process; see
+[REMOTE_STAGE.md](REMOTE_STAGE.md#intel-arc-as-a-worker-sycl-build) for the launch commands and requirements.
+It runs the last layers with `--serve --stage-worker PORT --stage-begin K --stream-experts`.
+Every expert of those layers must fit in VRAM. The main process keeps the head and MTP drafter.
+The SYCL build does not support a remote main process (`--remote-stage`), a relay worker
+(`--stage-end` / `--stage-next`) or images (`--vision`) on a worker.
+
 ## Setup
 
 `sycl/setup_intel.py` imports upstream's `setup.py` and replaces the Intel steps. The model choice, download, pack, tokenizer,
