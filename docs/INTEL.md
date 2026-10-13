@@ -31,6 +31,15 @@ on the text"). The SYCL numbers are greedy runs of the engine (as in "How to run
 tokens) on engine 0.1.31-sycl (2026-10-01; 0.1.32-0.1.38-sycl reproduce them exactly);
 "Decode round 2" below lists what each change bought.
 
+## Remote stage worker (SYCL)
+
+A SYCL engine can be a remote stage worker for a CUDA or HIP main process; see
+[REMOTE_STAGE.md](REMOTE_STAGE.md#intel-arc-as-a-worker-sycl-build) for the launch commands and requirements.
+It runs the last layers with `--serve --stage-worker PORT --stage-begin K --stream-experts`.
+Every expert of those layers must fit in VRAM. The main process keeps the head and MTP drafter.
+The SYCL build does not support a remote main process (`--remote-stage`), a relay worker
+(`--stage-end` / `--stage-next`) or images (`--vision`) on a worker.
+
 ## Setup
 
 On Ubuntu 24.04 or newer, from nothing. The Intel GPU driver (the `xe` or `i915` kernel driver and the compute runtime;
