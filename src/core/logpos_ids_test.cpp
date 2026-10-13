@@ -2,9 +2,10 @@
 // Cases: ~/strata-mesh/IMPL-PLAN-stage-a.md, "STRATA_LOGPOS_IDS" (5.3).
 #include "strata/core/logpos_ids.hpp"
 
-#include <cmath>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <string>
 #include <vector>
 
@@ -24,11 +25,20 @@ static std::string row(int pos, const std::string& tail) {
     return std::to_string(pos) + "\t7\t-1.000000000\t7\t-0.500000000\t1\tnan\tnan" + tail + "\n";
 }
 
+// a path in the temp directory that no other run or call uses (time + counter; no POSIX-only calls)
+static std::string temp_path() {
+    static int seq = 0;
+    const auto t = std::chrono::steady_clock::now().time_since_epoch().count();
+    return (std::filesystem::temp_directory_path() /
+            ("strata_logpos_ids_test_" + std::to_string((long long) t) + "_" + std::to_string(seq++)))
+        .string();
+}
+
 static std::string write_file(const std::string& text) {
-    char name[] = "/tmp/logpos_ids_test_XXXXXX";
-    const int fd = mkstemp(name);
-    CHECK(fd >= 0);
-    std::FILE* f = fdopen(fd, "w");
+    const std::string name = temp_path();
+    std::FILE* f = std::fopen(name.c_str(), "wb");
+    CHECK(f != nullptr);
+    if (f == nullptr) return name;
     std::fputs(text.c_str(), f);
     std::fclose(f);
     return name;
@@ -36,7 +46,10 @@ static std::string write_file(const std::string& text) {
 
 // write_ids_with into a tmpfile, read it back
 static std::string written(lp::BaselineIds& b, int64_t pos, const std::vector<float>& logits, double lse) {
-    std::FILE* f = std::tmpfile();
+    const std::string name = temp_path();
+    std::FILE* f = std::fopen(name.c_str(), "w+b");
+    CHECK(f != nullptr);
+    if (f == nullptr) return "";
     CHECK(lp::write_ids_with(b, f, pos, logits.data(), (int64_t) logits.size(), lse));
     std::fflush(f);
     std::rewind(f);
@@ -45,6 +58,7 @@ static std::string written(lp::BaselineIds& b, int64_t pos, const std::vector<fl
     size_t n;
     while ((n = std::fread(buf, 1, sizeof buf, f)) > 0) s.append(buf, n);
     std::fclose(f);
+    std::remove(name.c_str());
     return s;
 }
 
@@ -142,11 +156,16 @@ int main() {
 
     // 7, 8: the environment variables are not set here
     if (std::getenv("STRATA_LOGPOS_IDS") == nullptr && std::getenv("STRATA_LOGPOS_SPLIT_AT") == nullptr) {
-        std::FILE* f = std::tmpfile();
+        const std::string name = temp_path();
+        std::FILE* f = std::fopen(name.c_str(), "w+b");
+        CHECK(f != nullptr);
         err.clear();
-        CHECK(lp::write_ids(f, 0, nullptr, 0, 0.0, err));
-        CHECK(std::ftell(f) == 0);
-        std::fclose(f);
+        if (f != nullptr) {
+            CHECK(lp::write_ids(f, 0, nullptr, 0, 0.0, err));
+            CHECK(std::ftell(f) == 0);
+            std::fclose(f);
+            std::remove(name.c_str());
+        }
         CHECK(lp::split_at() == -1);
     } else {
         std::printf("logpos_ids_test: STRATA_LOGPOS_IDS / STRATA_LOGPOS_SPLIT_AT is set; cases 7 and 8 skipped\n");
