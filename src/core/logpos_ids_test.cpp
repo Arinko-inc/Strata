@@ -152,6 +152,36 @@ int main() {
         CHECK(got == "\t|\t5:-1.500000\t3:-5.250000\t99:nan\t-4:nan");
         std::remove(p.c_str());
     }
+    // 9: the shape of a real dump - several texts, every one starting at pos 0 (the baseline is a whole kl-set run)
+    // Case 2 covers the same walk, but only on a 2-text baseline written by hand.  The failure seen on the machines
+    // (a run whose texts 2.. got a bare "|") was not this walk: that run's baseline held only the first text (the
+    // dump it was given was a partial one: "1 texts, 288 rows"), so the rows of the later texts had nothing to match.
+    // Both are pinned here: a 5-text baseline fills every text, a 1-text baseline fills only the first.
+    {
+        std::string text5, text1;
+        const int lens[5] = {6, 4, 7, 5, 3};
+        for (int t = 0; t < 5; ++t)
+            for (int p = 0; p < lens[t]; ++p) {
+                const std::string r = row(p, "\t" + std::to_string(100 * t + p) + ":-1\t" + std::to_string(t) + ":-2");
+                text5 += r;
+                if (t == 0) text1 += r;
+            }
+        const std::string p5 = write_file(text5), p1 = write_file(text1);
+        lp::BaselineIds full, part;
+        CHECK(full.load(p5, err) && full.texts() == 5 && full.rows() == 25);
+        CHECK(part.load(p1, err) && part.texts() == 1 && part.rows() == 6);
+        const std::vector<float> logits(1000, 0.0f);
+        for (int t = 0; t < 5; ++t)
+            for (int p = 0; p < lens[t]; ++p) {
+                const std::string a = written(full, p, logits, 0.0);
+                const std::string want = "\t|\t" + std::to_string(100 * t + p) + ":0.000000\t" + std::to_string(t) + ":0.000000";
+                CHECK(a == want);
+                const std::string b = written(part, p, logits, 0.0);
+                CHECK(b == (t == 0 ? want : std::string("\t|")));
+            }
+        std::remove(p5.c_str());
+        std::remove(p1.c_str());
+    }
     std::remove(base.c_str());
 
     // 7, 8: the environment variables are not set here
