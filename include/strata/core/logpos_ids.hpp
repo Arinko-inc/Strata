@@ -109,6 +109,8 @@ public:
 
     size_t texts() const { return texts_.size(); }
     size_t rows() const { return rows_; }
+    /// The number of texts `next_row` has counted so far (the text of the last call is `texts_seen() - 1`).
+    int64_t texts_seen() const { return cur_ + 1; }
 
 private:
     static bool parse_int(const std::string& s, int64_t& out) {
@@ -163,6 +165,7 @@ inline bool write_ids(std::FILE* out, int64_t pos, const float* row, int64_t n_v
     struct State {
         bool enabled = false;
         bool ok = true;
+        bool warned = false;   // the baseline ran out of texts (warned once)
         std::string error;
         BaselineIds ids;
         State() {
@@ -186,6 +189,15 @@ inline bool write_ids(std::FILE* out, int64_t pos, const float* row, int64_t n_v
     if (!write_ids_with(st.ids, out, pos, row, n_vocab, lse)) {
         err = "STRATA_LOGPOS_IDS: writing the ids failed";
         return false;
+    }
+    // This run reads more texts than the baseline holds: their rows get a bare "|".  Say so once (stderr only), since
+    // a baseline taken from a run that was not finished looks the same as a good one in the output.
+    if (!st.warned && (size_t) st.ids.texts_seen() > st.ids.texts()) {
+        st.warned = true;
+        std::fprintf(stderr,
+                     "strata: STRATA_LOGPOS_IDS: this run reached text %lld but the baseline has only %zu texts: "
+                     "its rows (and the rest) get no ids\n",
+                     (long long) st.ids.texts_seen(), st.ids.texts());
     }
     return true;
 }
