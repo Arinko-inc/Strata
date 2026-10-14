@@ -447,6 +447,35 @@ prompt in 55 s.
 
 Source: `strata-mesh/bench/2026-10-13-stage-b-q4ks/README.md`.
 
+**The same chain on protocol 7 (2026-10-14).** This branch (the SYCL worker carried onto `remote-stage-rowfmt`),
+at the settings the chain is served with: `--max-context 262144 --kv-resident 32768 --prefill 2048`, the same
+layers, `STRATA_REMOTE_ROWS=bf16` on the main process. Decode as above; the prompt rows are fresh 1,024- and
+4,096-token prompts.
+
+| build and flags | decode tok/s | 1K prompt tok/s | 4K prompt tok/s |
+|---|---:|---:|---:|
+| 439655c8 (protocol 5 with this branch's earlier bf16 opt-in) | 58.9-78.8 | 437 | 849 |
+| this branch, `STRATA_REMOTE_ROWS=bf16` | 59.4-80.4 | 439 | 850 |
+| this branch, bf16, `--pipeline-windows 2` | 53.6-74.1 | 441 | 851 |
+
+- The row format's change costs nothing here, and the distribution is unchanged: mean KL 0.0169 against the 5070 Ti
+  alone (the same five texts), argmax 93.0%.
+- `--pipeline-windows 2` is slower on this chain: it keeps 376 MiB of the 5070 Ti out of the expert cache, the main
+  process's share of a window grows from 6.7 to 7.7 ms (median over the run), and a window's round trip through the
+  three other stages (about 33 ms) is what the overlap cannot hide. Two PCs with a larger share on the main process
+  are where it helps.
+- **Checkpoints through a SYCL last stage** (`--prompt-cache 6` on the main process): two chats of four turns on one
+  shared system prompt of 30,783 tokens, each turn sent with the earlier answers, the whole replay sent twice. The
+  time to the first token was 27.4-30.5 s for every request without checkpoints and 0.25-2.6 s with them (the first
+  request 28-30 s); 15 restores on both sides, 0 errors. At exact flags (`--pcie-frac 0 --adapt-every 0
+  --adapt-swaps 0` on the CUDA/HIP stages, `STRATA_IQ_MT_MIN=1 STRATA_PREFILL_CPU_SHARE=0` on all, `--mtp-max-t 1
+  --suffix-draft 0` on the main process) the second pass gave 8 of 8 answers byte-identical to the first; at the
+  served flags 0 of 8 are, with or without checkpoints (the adaptive tier moves near-tie tokens).
+- A relay started before its next stage listens exits with `cannot connect ... Connection refused`; under systemd
+  with `Restart=always` it comes back once the next stage is up. Stopping a middle stage makes the main process's
+  requests fail at once (503 from `serve/server.py`); once the stage is back, the next request connects again and
+  the main process starts its checkpoints afresh.
+
 ## Images (`--vision`)
 
 This needs CUDA/HIP workers. SYCL workers do not accept `--vision` or an image position table.
