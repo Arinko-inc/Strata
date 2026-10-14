@@ -257,8 +257,8 @@ The message ends with `raise --stage-begin, or lower --max-context / --vram-rese
 of the worker's experts too; the same message says when it does not.
 
 The dense weights, session state and K/V cover only the worker's layers. It loads no output head, MTP drafter,
-PLE table or token embedding table. Leave `--mtp` on the main process; on the worker it is ignored with
-`--mtp ignored on a stage worker (the main process drafts)`. Adaptive swaps are turned off on the worker.
+PLE table or token embedding table. Leave `--mtp` on the main process; a SYCL worker started with it stops, as a
+CUDA/HIP worker does. Adaptive swaps are turned off on the worker.
 Prompt buffers can borrow cache slots and refill them before a decode window. The host mirror may keep copies
 of those slots' experts, but only for the worker's own layers.
 
@@ -271,6 +271,8 @@ Unsupported options stop at start with exit code 2 and the prefix `strata genera
 | `--vision` on a worker | `--vision: the SYCL worker takes no image position table (StageMsg::Positions) yet` |
 | No `--stream-experts`, or with `--mmap-experts` | `the SYCL worker reads its layers' experts from the GGUF into VRAM: it needs --stream-experts (and no --mmap-experts)` |
 | `--expert-cache-per-layer` on a worker | `--expert-cache-per-layer gives every layer slots: a SYCL worker's cache holds all of its own layers' experts and no other's` |
+| `--mtp` on a worker | `a --stage-worker does not take --mtp (the draft layer runs in the main process, with the head)` |
+| `--pipeline-windows` on a worker | `--pipeline-windows is the main process's (--remote-stage), not a worker's` |
 
 **Start the B70 worker first.** This is the trainsv setup: Arc Pro B70 worker, RTX 4070 main process on the same
 Linux PC, IQ2_XS, K=12, over `127.0.0.1:7841`. Change the build and model paths for your PC. In a shell with
@@ -311,6 +313,10 @@ Start the server as usual. The main process keeps the head, MTP drafter, PLE and
 row, pack fingerprint (`index.txt` and `native_experts.txt`, not the weights), K and K/V placement mode.
 Use the same model, `--kv` and `STRATA_STAGE_TOKEN` on both processes. The worker's `--prefill`, `--max-context`
 and `--spec` must be at least the main process's. A main process with `--vision` is refused in the hello too.
+Like a CUDA/HIP last worker, a SYCL worker lists every row format (`STRATA_REMOTE_ROWS` on the main process picks
+bf16), keeps its layers' part of the conversation checkpoints of a main process with `--prompt-cache`
+([remote-stage/CHECKPOINTS.md](remote-stage/CHECKPOINTS.md)) and serves a main process with `--pipeline-windows 2`
+unchanged (it only ever gets verified windows).
 
 The SYCL tree has no `STRATA_ROUTE_TAIL_SKIP` implementation. Every expert of the worker's layers is in VRAM for
 decode, so there is no missed expert to skip. The worker accepts the main process's rank (0-9) and echoes it in
