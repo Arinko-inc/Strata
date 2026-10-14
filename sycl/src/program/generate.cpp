@@ -69,6 +69,7 @@ namespace strata::prefill { void set_nonresident_share(double share); }   // SYC
 #include "strata/core/native_head.hpp"
 #include "strata/core/verify.hpp"
 #include "strata/net/stage_link.hpp"     // remote stage (PR #1748): the SYCL worker's link
+#include "strata/net/stage_ckpt_store.hpp"   // its part of the main process's conversation checkpoints
 #include "strata/core/logpos_ids.hpp"    // STRATA_LOGPOS_SPLIT_AT (measurement, off by default)
 #include "strata/core/mtp.hpp"
 #include "strata/prefill/prefill.hpp"
@@ -2122,8 +2123,12 @@ int main(int argc, char **argv) try {
                                          std::to_string(strata::core::ModelGeometry{}.n_layers) + ")").c_str();
         else if (o.stage_end >= 0 || !o.stage_next.empty())
             why = "a relay worker (--stage-end, --stage-next) is not in the SYCL build: this worker runs the last layers";
-        else if (o.batch > 0 || o.pipeline_windows > 0 || o.peer_device >= 0)
-            why = "it does not support --batch, --pipeline-windows or --peer-device";
+        else if (!o.mtp.empty())
+            why = "a --stage-worker does not take --mtp (the draft layer runs in the main process, with the head)";
+        else if (o.pipeline_windows > 0)   // the main process's flag: the worker runs no speculative window
+            why = "--pipeline-windows is the main process's (--remote-stage), not a worker's";
+        else if (o.batch > 0 || o.peer_device >= 0)
+            why = "it does not support --batch or --peer-device";
         else if (!o.cvec_files.empty())
             why = "it does not carry --control-vector (or a speed projection) to the worker's layers";
         else if (o.expert_cache_remote[0] > 0 || o.expert_cache_remote[1] > 0 || o.expert_cache_remote[2] > 0)
@@ -2154,12 +2159,6 @@ int main(int argc, char **argv) try {
             std::fprintf(stderr, "strata generate: remote stage: adaptive swaps off on a stage worker (its layers' "
                                  "experts are all in VRAM)\n");
             o.adapt_every = 0;
-        }
-        // the main process drafts (its head and its drafter): a worker loads no MTP drafter
-        if (!o.mtp.empty()) {
-            std::fprintf(stderr, "strata generate: remote stage: --mtp ignored on a stage worker (the main process "
-                                 "drafts)\n");
-            o.mtp.clear();
         }
     }
     bool split_own_auto = false;   // #340: the split keeps own prompt buffers by its rule (not --no-prefill-borrow)
@@ -8834,6 +8833,8 @@ int main(int argc, char **argv) try {
             me.handoff_floats = HBF;
             me.tail_skip = 0;   // no STRATA_ROUTE_TAIL_SKIP in the SYCL build (the hello takes the main process's)
             me.vision = 0;
+            // conversation checkpoints (docs/remote-stage/CHECKPOINTS.md): a worker's own hello carries its limit
+            me.ckpt_max = strata::net::kStageCkptMax;
             std::snprintf(me.build, sizeof me.build, "strata remote-stage worker (sycl)");
             // the model pack's fingerprint: its tensor index and expert table (the same model on both PCs)
             for (const char* f : {"/index.txt", "/native_experts.txt"}) {
@@ -8902,6 +8903,9 @@ int main(int argc, char **argv) try {
                 }
                 return want >= tokens;
             };
+            if (std::getenv("STRATA_REMOTE_ROWS") != nullptr)
+                std::fprintf(stderr, "strata serve: STRATA_REMOTE_ROWS is the main process's choice; a worker takes "
+                                     "the row format its main process asks for (it ignores its own)\n");
             hs.hello = [&](const strata::net::StageHello& theirs, strata::net::StageHello& mine, std::string& e) {
                 mine = me;   // (the worker's own hello carries no token)
                 // another protocol: the link refuses it for its number (its fields may sit elsewhere)
@@ -8927,6 +8931,15 @@ int main(int argc, char **argv) try {
                         std::to_string(theirs.max_t) + ") is larger than this worker's (" +
                         std::to_string(o.max_context) + ", " + std::to_string(me.max_t) + ")";
                     return false;
+                }
+                // its conversation checkpoints: this worker's part of each (its layers' running state) must fit in
+                // half of the RAM available
+                {
+                    const ConvStateSizes cz = conv_state_sizes(g, ss);
+                    const uint64_t qsa = (uint64_t) std::max<int64_t>(ss.qsa_alloc, 0);
+                    const uint64_t part = cz.gdn + (ss.ple_hist ? cz.ple : 0) + qsa * (cz.tail + cz.dead + cz.block_pos);
+                    if (!strata::net::stage_ckpt_ram_ok(theirs.ckpt_max, part, strata::core::available_host_bytes(), e))
+                        return false;
                 }
                 mine.chunk = theirs.chunk;   // informational
                 lend_chunk = theirs.chunk;
@@ -9016,6 +9029,9 @@ int main(int argc, char **argv) try {
                 const WkBusy busy("stage worker prompt chunk");
                 pf_cur_out = rows_out;
                 pf_cur_p0 = p0;
+                // a prompt that continues the live session comes straight after windows: their commit lands first (as
+                // a reset and a checkpoint restore do).  hs.commit already waits for it, so this returns at once.
+                if (!ver.wait_commit(e)) return false;
                 // the prompt path's buffers out of this worker's cache, for the main process's chunk size or this
                 // worker's own (lend_chunk, the hello's choice; a loan that covers it stays for the rest of the prompt)
                 if (!lend(std::max<int64_t>(T, lend_chunk), e)) return false;
@@ -9030,7 +9046,20 @@ int main(int argc, char **argv) try {
                 sp.set_single_chunk((flags & 1) != 0);
                 return sp.run(tokens, T, p0, e);   // (STRATA_REMOTE_TIMING=1: the link reports each chunk's time)
             };
-            hs.reset = [&](std::string& e) -> bool {
+            // conversation checkpoints (docs/remote-stage/CHECKPOINTS.md): this worker's layers' part of each, under
+            // the main process's id; the main process decides what stays (`keep`), this store never evicts.  The SYCL
+            // worker is always the last stage (no relay), so it never forwards a save or a restore.
+            strata::net::StageCkptStore ckpt_store;
+            auto device_sync = [](const char* what, std::string& e) -> bool {
+                try {
+                    dpct::get_current_device().queues_wait_and_throw();
+                    return true;
+                } catch (const sycl::exception& x) {
+                    e = std::string("stage worker: ") + what + ": " + x.what();
+                    return false;
+                }
+            };
+            hs.reset = [&](const std::vector<int64_t>& keep, std::string& e) -> bool {
                 const WkBusy busy("stage worker reset");
                 if (!ver.wait_commit(e) || !refill(e)) return false;
                 strata::core::session_zero(ss, g, nullptr, main_cs);
@@ -9040,10 +9069,56 @@ int main(int argc, char **argv) try {
                     e = std::string("stage worker: zeroing the session: ") + x.what();
                     return false;
                 }
+                ckpt_store.prune(keep);
+                return true;
+            };
+            hs.ckpt_save = [&](int64_t id, int64_t L, const std::vector<int64_t>& keep, std::string& e) -> int {
+                const WkBusy busy("stage worker checkpoint save");
+                auto not_stored = [&](const char* why) -> int {
+                    std::fprintf(stderr, "strata stage worker: checkpoint %lld not stored (%s)\n", (long long) id, why);
+                    return 0;
+                };
+                if (!ver.wait_commit(e)) return -1;
+                if (!ckpt_store.admits(id, keep)) return not_stored("64 kept at most");
+                try {
+                    strata::net::StageCkptStore::Part part;
+                    part.L = L;
+                    if (!device_sync("before a checkpoint", e)) return -1;
+                    if (!strata::core::conversation_checkpoint_save(part.state, ss, g, (size_t) L, e)) return -1;
+                    ckpt_store.put(id, std::move(part), keep);
+                } catch (const std::bad_alloc&) {   // host RAM: not stored, the store as it was
+                    return not_stored("allocation failed");
+                }
+                return 1;
+            };
+            hs.ckpt_restore = [&](int64_t id, int64_t L, const std::vector<int64_t>& keep, std::string& e) -> bool {
+                const WkBusy busy("stage worker checkpoint restore");
+                if (!ver.wait_commit(e) || !refill(e)) return false;
+                // STRATA_REMOTE_CKPT_DROP=1 (testing): the store is emptied first, so the main process's fallback (the
+                // prompt from token 0) runs
+                static const bool drop = [] {
+                    const char* v = std::getenv("STRATA_REMOTE_CKPT_DROP");
+                    return v && v[0] == '1';
+                }();
+                if (drop) ckpt_store.clear();
+                const strata::net::StageCkptStore::Part* part = ckpt_store.find(id);
+                if (part == nullptr) {
+                    e = strata::net::kStageCkptMissing + std::to_string(id);
+                    return false;
+                }
+                if (part->L != L) {
+                    e = "checkpoint " + std::to_string(id) + " was saved at " + std::to_string(part->L) + ", not at " +
+                        std::to_string(L);
+                    return false;
+                }
+                if (!device_sync("before a checkpoint restore", e)) return false;
+                if (!strata::core::conversation_checkpoint_restore(part->state, ss, g, (size_t) L, e)) return false;
+                ckpt_store.prune(keep);
                 return true;
             };
             hs.disconnected = [&] {
                 std::string e;
+                ckpt_store.clear();   // a new main process is a new id space
                 (void) ver.wait_commit(e);
             };
             strata::net::StageBuffers bufs;
