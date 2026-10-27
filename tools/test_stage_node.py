@@ -151,10 +151,20 @@ class StoreTest(unittest.TestCase):
         self.assertIn("damaged", r["error"])
         self.assertEqual(self.st.ranges("models/m/r.gguf")["ranges"], [[2000, 500]])
 
-    def test_started_anew_meanwhile_is_not_recorded(self):
-        # a put of one source still writing when a ship of another source starts the file anew: its bytes are not
-        # recorded in the new source's sidecar
+    def test_another_source_waits_for_a_put_in_flight(self):
+        # a put of one source still writing when a ship of another source arrives at the same bytes: the new source
+        # starts the file anew only once that put is over, so the old put's bytes never land on what the new source
+        # recorded (before, the old put wrote over them after the new source had recorded them as its own)
         st = self.st
+        rel = "models/m/n.gguf"
+        out = {}
+        done = threading.Event()
+
+        def newer():
+            out["new"] = st.put(rel, 0, 4000, io.BytesIO(b"n" * 10), 10, None, "fp-new")
+            done.set()
+
+        t = threading.Thread(target=newer)
 
         class Late(io.BytesIO):
             def __init__(self, data):
@@ -162,16 +172,23 @@ class StoreTest(unittest.TestCase):
                 self.once = True
 
             def read(self, size=-1):
-                if self.once:
+                if self.once:   # the old put has its file open and is about to write: the other ship arrives now
                     self.once = False
-                    assert st.put("models/m/n.gguf", 0, 4000, io.BytesIO(b"n" * 10), 10, None, "fp-new")["ok"]
+                    t.start()
+                    done.wait(0.5)   # (it waits for this put now; before the fix it finished meanwhile)
                 return super().read(size)
 
-        self.put("models/m/n.gguf", 0, 4000, b"o" * 10, "fp-old")
-        r = st.put("models/m/n.gguf", 1000, 4000, Late(b"o" * 100), 100, None, "fp-old")
-        self.assertIn("started anew", r["error"])
-        rg = st.ranges("models/m/n.gguf")
+        self.put(rel, 0, 4000, b"o" * 10, "fp-old")
+        out["old"] = st.put(rel, 0, 4000, Late(b"o" * 100), 100, None, "fp-old")
+        t.join(10)
+        self.assertFalse(t.is_alive())
+        self.assertTrue(out["new"]["ok"], out["new"])
+        rg = st.ranges(rel)
         self.assertEqual((rg["ranges"], rg["fp"]), ([[0, 10]], "fp-new"))
+        data = (self.d / rel).read_bytes()
+        for off, n in rg["ranges"]:   # every recorded byte is the recorded source's
+            self.assertEqual(data[off:off + n], b"n" * n)
+        self.assertEqual(data[10:100], b"\0" * 90)   # the old put's bytes went with its source
 
     def test_cut_range(self):
         rs = [[0, 10], [20, 10], [40, 10]]

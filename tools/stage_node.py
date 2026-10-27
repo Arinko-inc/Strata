@@ -614,6 +614,10 @@ class Store:
         self.drop = bool(cfg.get("drop_cache", True))
         self.allow_bin = bool(cfg.get("allow_put_bin", False))
         self.lock = threading.Lock()
+        # the /puts writing each file now (path -> count): a ship of another source starts the file anew only when none
+        # is, so no write of the old source lands after the new one's bytes are recorded (`gone` is told when one ends)
+        self.writing: dict[Path, int] = {}
+        self.gone = threading.Condition(self.lock)
 
     def path(self, rel: str) -> Path:
         if self.root is None:
@@ -652,35 +656,55 @@ class Store:
             return {"ok": False, "error": "this node does not take executables (node.json allow_put_bin)"}
         with self.lock:
             p.parent.mkdir(parents=True, exist_ok=True)
-            d = self.read_side(p) if p.exists() else {"fp": None, "ranges": []}
-            # (a sidecar without a fingerprint, from before they existed: kept, and it takes this one)
-            if not p.exists() or p.stat().st_size != total or (fp and d["fp"] is not None and d["fp"] != fp):
+            while True:
+                d = self.read_side(p) if p.exists() else {"fp": None, "ranges": []}
+                # (a sidecar without a fingerprint, from before they existed: kept, and it takes this one)
+                anew = not p.exists() or p.stat().st_size != total or (fp and d["fp"] is not None and d["fp"] != fp)
+                if not anew or not self.writing.get(p):
+                    break
+                # a different source while /puts of the file's present one still write: wait for them to end (their
+                # ranges are recorded, then voided below), then look again
+                self.gone.wait()
+            if anew:
                 # a new file, or a different source (size or fingerprint): what was written of it is void
                 new_sparse(p, total)
                 self.side(p).write_text(json.dumps({"fp": fp, "ranges": []}))
+            self.writing[p] = self.writing.get(p, 0) + 1
         # the body streamed to disk 4 MiB at a time, hashed on the way; a handle of this request's own, so /puts at
         # other offsets of the file (the shipper's pieces in flight) write at once without a lock (Windows has no
         # pwrite: an own handle has its own position); the sidecar's read-merge-write is under the lock
         h = hashlib.sha256()
-        with open(p, "r+b") as f:
-            f.seek(offset)
-            left = n
-            while left > 0:
-                chunk = body.read(min(left, 4 << 20))
-                if not chunk:
-                    break
-                f.write(chunk)
-                h.update(chunk)
-                left -= len(chunk)
-            if self.drop:   # written through: not left in the page cache
-                f.flush()
-                os.fsync(f.fileno())
+
+        def written() -> None:   # (under the lock) this put no longer writes the file
+            self.writing[p] -= 1
+            if not self.writing[p]:
+                del self.writing[p]
+                self.gone.notify_all()
+        try:
+            with open(p, "r+b") as f:
+                f.seek(offset)
+                left = n
+                while left > 0:
+                    chunk = body.read(min(left, 4 << 20))
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    h.update(chunk)
+                    left -= len(chunk)
+                if self.drop:   # written through: not left in the page cache
+                    f.flush()
+                    os.fsync(f.fileno())
+        except BaseException:
+            with self.lock:
+                written()
+            raise
         if self.drop:
             drop_cache(p, offset, n)
         bad = (f"the body ended {left} bytes short" if left else
                "sha256 differs: the piece arrived damaged (not recorded)" if want is not None and h.hexdigest() != want
                else None)
-        with self.lock:
+        with self.lock:   # this put's range recorded (or not) before a waiting ship of another source voids the file
+            written()
             d = self.read_side(p)
             if bad:   # these bytes are on disk now: a range an earlier put recorded there is no longer sure
                 self.side(p).write_text(json.dumps({"fp": d["fp"], "ranges": cut_range(d["ranges"], offset, n - left)}))
