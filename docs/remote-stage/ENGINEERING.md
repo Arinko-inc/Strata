@@ -717,7 +717,9 @@ worker (a80b2bd1..11d0c642) picked on top. The textual conflicts, and what each 
 - **The checkpoint copies** (`conversation_state.cpp`): `STRATA_CKPT_ASYNC` and `STRATA_CKPT_VRAM_SLOTS` (#3779,
   opt-in) put the save's GDN bytes in a background copy or a VRAM slot. The worker's save and restore at an explicit
   length go through the same path: `checkpoint_save` takes the length, and both restores take the GDN bytes from
-  `checkpoint_gdn_source` (the slot, else the host copy once the background copy has landed).
+  `checkpoint_gdn_source` (the slot, else the host copy once the background copy has landed). The worker's save
+  waits for its own background copy before it returns: its store drops parts (a reset's or a restore's keep, a main
+  process that went away) without waiting for one (found in review: a copy into freed memory).
 - `MULTI_GPU.md` (rewritten upstream): the remote stage's paragraph is a section before "Limits" and a line in
   "Pipeline windows"; the SYCL worker's native embedding takes the geometry's `n_vocab` as upstream's SYCL tree does.
 

@@ -419,11 +419,15 @@ bool conversation_checkpoint_save(ConversationCheckpoint& c, const SessionState&
     return checkpoint_save(c, ss, g, c.ids.size(), error, staged);
 }
 
-// (the explicit length is a remote stage worker's: not on Metal, which has no remote stage)
+// (the explicit length is a remote stage worker's: not on Metal, which has no remote stage).  Synchronous, as before
+// STRATA_CKPT_ASYNC: the worker moves the part into its store, which drops parts (a reset's or a restore's keep, a
+// main process that went away) without waiting for a copy in flight into their bytes
 bool conversation_checkpoint_save(ConversationCheckpoint& c, const SessionState& ss, const ModelGeometry& g,
                                   size_t tokens, std::string& error) {
     bool staged = false;
-    return checkpoint_save(c, ss, g, tokens, error, staged);
+    const bool ok = checkpoint_save(c, ss, g, tokens, error, staged);
+    if (staged) conversation_checkpoint_join(c.gdn.data());
+    return ok;
 }
 
 namespace {
