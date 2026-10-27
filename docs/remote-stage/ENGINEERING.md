@@ -698,6 +698,53 @@ Read in the code, no change needed:
 
 None of this has run on a GPU since the rebase: the builds and the CPU tests are listed in the pull request.
 
+### After the rebase onto 0.2.7 (2026-10-28)
+
+Upstream main 5e8a4cca (0.2.7, engine 0.1.52; 553 commits after 8183c6b6, the base of the 0.2.0-beta rebase above).
+The branch was rebuilt from lask3802's own 0.2.0-beta rebase of #1748 and #1887 (`remote-stage-ckpt`, dd8f1129)
+rebased onto 5e8a4cca, then the row formats (`remote-stage-rowfmt`'s six commits, 1e1b5059..618d8f99) and the SYCL
+worker (a80b2bd1..11d0c642) picked on top. The textual conflicts, and what each side kept:
+- **The prompt path** (`prefill.cpp`): upstream's layer-major walk (#3976) and this branch's `remote_tail` were added
+  at the same place; both kept.
+- **`generate.cpp`**: upstream's KVA cell floor of the draft layer next to the remote stage's
+  `set_remote_rows_from`, both kept; #3350 (a checkpoint whose copy runs out of memory is skipped) next to the remote
+  stage's own error text: an empty `ckpt_why` still skips the checkpoint, a remote stage's error still ends the
+  request with the link's text (the server's 503).
+- **`Verifier::pl_launch`** (`verify.cpp`): `STRATA_SELECT_LONG` added a second set of window graphs
+  (`exec_[sl][T]`); the remote stage launches the graph later, from `pl_graph_launch`, so the window's variant is kept
+  in `fl_sl_` beside `fl_T_`. `<immintrin.h>` gave way to upstream's `cpu_relax.hpp`; `<sched.h>` stays for the job
+  thread's affinity.
+- **The checkpoint copies** (`conversation_state.cpp`): `STRATA_CKPT_ASYNC` and `STRATA_CKPT_VRAM_SLOTS` (#3779,
+  opt-in) put the save's GDN bytes in a background copy or a VRAM slot. The worker's save and restore at an explicit
+  length go through the same path: `checkpoint_save` takes the length, and both restores take the GDN bytes from
+  `checkpoint_gdn_source` (the slot, else the host copy once the background copy has landed).
+- `MULTI_GPU.md` (rewritten upstream): the remote stage's paragraph is a section before "Limits" and a line in
+  "Pipeline windows"; the SYCL worker's native embedding takes the geometry's `n_vocab` as upstream's SYCL tree does.
+
+Follow-ups (one commit), each turned off for a remote stage only:
+- **Layer-major prefill** (#3976, on by default for a CUDA layer split): the walk runs a super-chunk layer by layer and
+  has no hand-off to a worker. A remote main has one local stage, so the default rule leaves it off; an explicit
+  `STRATA_PREFILL_LAYER_MAJOR=1` is declined in `lm_prepare` ("a remote stage (its chunks go over the link)") and the
+  prompt reads chunk-major. A worker's prompt starts from the main process's rows (`hand_in`), which the walk declines.
+- **The asynchronous adaptive tier chosen by measurement** (`adapt_async_default.hpp`: CUDA, one GPU, the expert
+  arena, nothing explicit): a remote main and a worker look like one-GPU processes to that rule, but `--adapt-async 1`
+  is turned off on both (above), so the engine does not choose it there either.
+
+Read in the code, no change needed:
+- The Qwen disk store of conversations and of a shared system prompt (0.2.4.2) is DeepSeek's (`STRATA_DS4_SLOT_KEEP`,
+  `src/dsv41`); the Qwen conversation checkpoints stay in RAM, so the remote stage's checkpoints keep their own path.
+- #3493 sizes the conversation cache from the free RAM when `--conversation-cache-mib` is not given; the remote stage
+  sets it to 0 before that rule runs, so parking stays off on both PCs.
+- The PLE residency policy (`STRATA_PLE_AUTO_RAM`) yields to an explicit `--ple-io`; a worker holds no PLE layer.
+- The server reads the run config (`exe`, `args`, `env`, `lib_dirs`) as before: the same config gives the same
+  engine command line and environment on 0.1.43.1 and on this branch.
+
+Builds and CPU tests (no GPU runs): CUDA 13 sm_120, HIP (ROCm 7, gfx1100) and SYCL (oneAPI 2026.1, bmg-g31) build;
+`stage_link_test`, `stage_ckpt_store_test`, `logpos_ids_test`, `conversation_validation_test`, `serve.test_server`
+(one failure, `GpuChoice.test_hip_ordinal`, which fails on upstream main on Linux too) and `tools.test_stage_node`.
+Upstream's suite (`STRATA_BUILD_TESTS=ON`, CUDA, run with the GPU hidden) fails the same 80 tests on this branch and on
+5e8a4cca (the GPU parity tests and two that need a pack in `pack/full`); the branch's three tests pass.
+
 ### The recovery's open points (2026-10-13)
 
 Faults injected on A + B (RTX 3080 main, RTX 2080 Ti worker, 10 GbE, RVN IQ3_S, K=26) with the branch on 0.1.43

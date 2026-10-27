@@ -31,7 +31,8 @@ backend: neither PC of a remote stage runs it unless `STRATA_ADAPT_OVERLAP=1` is
 rebase are in ENGINEERING.md: [0.1.42](remote-stage/ENGINEERING.md#after-the-rebase-onto-0142-2026-10-11),
 [0.1.43](remote-stage/ENGINEERING.md#after-the-rebase-onto-0143-2026-10-12),
 [0.1.43.1](remote-stage/ENGINEERING.md#after-the-rebase-onto-01431-2026-10-13),
-[0.2.0-beta](remote-stage/ENGINEERING.md#after-the-rebase-onto-020-beta-2026-10-20).
+[0.2.0-beta](remote-stage/ENGINEERING.md#after-the-rebase-onto-020-beta-2026-10-20),
+[0.2.7](remote-stage/ENGINEERING.md#after-the-rebase-onto-027-2026-10-28).
 
 | | PC A (main) | PC B | PC C |
 |---|---|---|---|
@@ -707,7 +708,10 @@ python3 tools/stage_tune.py apply cluster.json OUTDIR    # start the workers as 
   parking (`--conversation-cache-mib`) and mid-prompt checkpoints (each PC holds only its layers' state, so every
   prompt is read from token 0), `--kv-grow`, pin by need (`STRATA_PIN_BY_NEED=1`: the prefix pinning stays), and
   `--adapt-async 1` on a worker (it runs the blocking adaptive tier between its windows) and in the expert arena's
-  mode on the main PC (0.1.44's copy-in tier: off until it is measured with a remote stage). With `--prompt-cache N`
+  mode on the main PC (0.1.44's copy-in tier: off until it is measured with a remote stage), the asynchronous tier the
+  engine chooses by measurement (0.2.7) on either PC, and layer-major prefill (0.2.7, #3976: a remote main has one local
+  stage, so it is off by default, and `STRATA_PREFILL_LAYER_MAJOR=1` is declined; the walk has no hand-off to a
+  worker). With `--prompt-cache N`
   given on the main process, conversation checkpoints at the prompt's turn boundaries come back: the worker keeps its
   layers' part of each ([remote-stage/CHECKPOINTS.md](remote-stage/CHECKPOINTS.md): later turns of a 16K-token chat
   get their first token in 0.32-0.44 s instead of 14.2-15.1 s on an RTX 3080 + RTX 2080 Ti, engine 0.1.43).
