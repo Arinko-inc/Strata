@@ -9098,7 +9098,9 @@ int main(int argc, char** argv) {
     // Where the asynchronous tier could run on its own (CUDA, one GPU, the expert arena, no batch slots), the engine measures
     // and chooses during the session: see include/strata/core/adapt_async_default.hpp.  --adapt-async 0 or
     // STRATA_ADAPT_ASYNC=0 keep the blocking tier; --adapt-async 1 keeps its old meaning.
-    if (o.adapt_async_given < 0) {
+    // remote-stage: not on a main process or a worker (--adapt-async 1 is turned off on both below: a worker runs the
+    // blocking tier between its windows, and a remote main's asynchronous tier has not been measured)
+    if (o.adapt_async_given < 0 && !remote_main && !stage_worker) {
         strata::core::AdaptAsyncAuto aa;
         aa.flag = o.adapt_async_given;
         aa.env = strata::core::adapt_async_env();

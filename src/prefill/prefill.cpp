@@ -6038,6 +6038,9 @@ int64_t Prefill::lm_prepare(int64_t n, std::string& why, int64_t cap) {
     // no layer-major form
     const bool split = stage_lb_ != 0 || stage_le_ != g.n_layers || next_ != nullptr;
     if (hand_in_ != nullptr) { why = "a layer split's chunk hand-off is in use"; return 0; }
+    // remote-stage (--remote-stage's main process): each chunk's rows go to the worker after this stage's layers and its
+    // final rows come back chunk by chunk (run_impl); the walk has no such hand-off, so the prompt reads chunk-major
+    if (remote_send || remote_recv) { why = "a remote stage (its chunks go over the link)"; return 0; }
     if (m.pp || helper_ != nullptr || core::peer_portable()) { why = "a peer GPU"; return 0; }
     // the PLE block (layer 1) reads the token history: on a split it runs in a first stage that holds layers 0 and 1
     // (a later stage never reaches it)
