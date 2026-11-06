@@ -13590,12 +13590,50 @@ int main(int argc, char** argv) {
                 int64_t wk_next_tag = 0;   // a relay: its own tags to the next worker (this connection's)
                 double wk_slot_own_ms = 0, wk_slot_next_ms = 0;
                 int64_t wk_slot_windows = 0, wk_slot_rows = 0;
+                // stage 2 (strata-mesh IMPL-PLAN-remote-batch-stage2.md 2.3.3): a relay answers a kStageSlotKeepAll
+                // window late - hs.slot_run sends it on and commits this worker's rows, hs.slot_run_reply (on
+                // serve_stage's replying thread, one at a time, in the order the windows came) reads the next
+                // worker's rows.  STRATA_RELAY_SLOT_OVERLAP=0: stage 1's way (the reply read before the next window).
+                const bool wk_overlap = [] {
+                    const char* v = std::getenv("STRATA_RELAY_SLOT_OVERLAP");
+                    return !(v && v[0] == '0');
+                }();
+                // a window sent on whose reply is not read yet: its tag on the next link, its rows, when it went out
+                // and when hs.slot_run returned; `err`: a failure after the send (the reply is read and dropped,
+                // then that window's reply is this error - Codex 1 [P2])
+                struct WkLate {
+                    int64_t tag = 0;
+                    int S = 0;
+                    Clock::time_point sent{}, back{};
+                    double own_ms = 0;   // this worker's share: its checks, layers, send and commit
+                    bool early = false;  // it started before the reply before it was read
+                    std::string err;
+                };
+                std::mutex wk_late_mu;
+                std::deque<WkLate> wk_late_q;
+                // STRATA_REMOTE_TIMING=1: the deferred windows' own line every 64 (on the replying thread)
+                double wk_late_own_ms = 0, wk_late_next_ms = 0, wk_late_wait_ms = 0;
+                int64_t wk_late_n = 0, wk_late_rows = 0, wk_late_early = 0, wk_late_total = 0;
+                // test hook (STRATA_TEST_SLOT_ERROR_AT=N): this worker's Nth kStageSlotKeepAll window fails before
+                // anything goes on (the main process's end on a worker's error, IMPL-PLAN-remote-batch-stage2.md 4.3)
+                static const int64_t wk_err_at = [] {
+                    const char* v = std::getenv("STRATA_TEST_SLOT_ERROR_AT");
+                    return v ? (int64_t) std::atoll(v) : 0;
+                }();
+                int64_t wk_keep_all_runs = 0;
                 auto wk_slots_forget = [&] {
                     std::fill(wk_slot_live.begin(), wk_slot_live.end(), 0);
                     std::fill(wk_slot_len.begin(), wk_slot_len.end(), 0);
                     wk_slot_wait = false;
                     wk_wait_S = 0;
                     wk_next_tag = 0;
+                    // (serve_stage calls hello and disconnected after the replies are out: nothing waits here)
+                    std::lock_guard<std::mutex> lk(wk_late_mu);
+                    if (!wk_late_q.empty()) {
+                        std::fprintf(stderr, "strata stage worker: %zu deferred batch window replies were not read "
+                                             "(dropped with the link's slots)\n", wk_late_q.size());
+                        wk_late_q.clear();
+                    }
                 };
                 // a slot number this link may use (and, `live`, one this main process saved into); else the error
                 // (the wording is the SYCL worker's)
@@ -13689,6 +13727,15 @@ int main(int argc, char** argv) {
                                          "(the windows hold up to %d rows)\n", o.batch, bslot_ss.empty() ? (size_t) 0 :
                                          bslot_ss[0].size(), (long long) own_lo,
                                  (long long) (stage_relay ? own_hi : g.n_layers) - 1, ver.max_t());
+                    if (stage_relay)
+                        std::fprintf(stderr, "strata serve: stage worker: relay: %s\n", wk_overlap
+                                     ? "a window that keeps all its rows is answered late: the next window runs while "
+                                       "the next worker runs this one (STRATA_RELAY_SLOT_OVERLAP=0: one by one)"
+                                     : "STRATA_RELAY_SLOT_OVERLAP=0: the batch windows run one by one (each waits for "
+                                       "the next worker's rows)");
+                    if (wk_err_at > 0)
+                        std::fprintf(stderr, "strata serve: stage worker: STRATA_TEST_SLOT_ERROR_AT=%lld: that "
+                                             "window fails (a test)\n", (long long) wk_err_at);
                     // B-3: the main process's hello.  A relay links its next worker again now (the original handler
                     // has closed that link), so the slots it answers are those of the next worker running now; it
                     // tells the main process the fewer of its own and the next worker's.
@@ -13709,6 +13756,9 @@ int main(int argc, char** argv) {
                             cap = std::min(cap, std::max<int32_t>(next_batch_slots, 0));
                         }
                         mine.batch_slots = cap;
+                        // stage 2: this relay answers the windows that keep all their rows late (information: the
+                        // main process does not depend on it)
+                        if (stage_relay && wk_overlap) mine.batch_flags |= strata::net::kStageBatchOverlap;
                         // (a take-over's candidate is answered here too; its connection is served next, after the
                         // served one's `disconnected`, and its hello runs again then)
                         wk_slots_forget();
@@ -13748,6 +13798,20 @@ int main(int argc, char** argv) {
                                       int64_t flags, std::string& e) -> bool {
                         const WkBusy busy("stage worker batch window");
                         const auto t0 = Clock::now();
+                        if (wk_err_at > 0 && (flags & strata::net::kStageSlotKeepAll) != 0 &&
+                            ++wk_keep_all_runs == wk_err_at) {
+                            e = "stage worker: STRATA_TEST_SLOT_ERROR_AT=" + std::to_string((long long) wk_err_at) +
+                                ": this window fails (test)";
+                            std::fprintf(stderr, "strata %s\n", e.c_str());
+                            return false;
+                        }
+                        // (stage 2's count: whether the reply before this window is still being read as it starts)
+                        bool late_early = false;
+                        if (stage_relay && wk_overlap && hs.slot_run_reply != nullptr &&
+                            (flags & strata::net::kStageSlotKeepAll) != 0) {
+                            std::lock_guard<std::mutex> lk(wk_late_mu);
+                            late_early = !wk_late_q.empty();
+                        }
                         if (wk_slot_wait) {
                             e = "stage worker: bad slot window: it came before the last window's SlotCommit";
                             return false;
@@ -13803,6 +13867,8 @@ int main(int argc, char** argv) {
                         }
                         const auto t1 = Clock::now();
                         const bool keep_all = (flags & strata::net::kStageSlotKeepAll) != 0;
+                        // stage 2: a relay answers this window late (hs.slot_run_reply reads the next worker's rows)
+                        const bool late = stage_relay && keep_all && wk_overlap && hs.slot_run_reply != nullptr;
                         // a relay: the next worker runs the rest of the window (after this worker's layers) and its
                         // rows are the reply; meanwhile this worker keeps its rows when the window keeps them all
                         const int64_t tag = ++wk_next_tag;
@@ -13813,10 +13879,49 @@ int main(int argc, char** argv) {
                                 return false;
                             }
                         }
+                        if (late) {
+                            // the window is on its way: from here a failure is kept with it (its reply is read on the
+                            // replying thread, in order, and dropped), and this returns true (2.3.1's contract)
+                            WkLate w;
+                            w.tag = tag;
+                            w.S = S;
+                            w.sent = t1;
+                            std::string ce;
+                            if (!ver.commit_slots(ce) || !ver.wait_commit(ce)) {
+                                w.err = ce;
+                            } else {
+                                for (int t = 0; t < S; ++t) ++wk_slot_len[(size_t) rows[t]];
+                                if (!wk_after_commit(ce)) w.err = ce;
+                            }
+                            w.back = Clock::now();
+                            w.own_ms = std::chrono::duration<double, std::milli>(w.back - t0).count();
+                            if (!w.err.empty())
+                                std::fprintf(stderr, "strata stage worker: batch window %lld failed after it went to "
+                                                     "the next worker: %s (its reply is read and dropped)\n",
+                                             (long long) tag, w.err.c_str());
+                            w.early = late_early;
+                            std::lock_guard<std::mutex> lk(wk_late_mu);
+                            wk_late_q.push_back(std::move(w));
+                            return true;
+                        }
                         if (keep_all) {
-                            if (!ver.commit_slots(e) || !ver.wait_commit(e)) return false;
+                            // (a failure after the send: no replying thread runs now, so the next worker's reply is
+                            // read and dropped here - the link stays in step for the next window)
+                            const auto drain = [&](std::string& fe) {
+                                if (!stage_relay) return;
+                                std::string de;
+                                if (!next_link.slot_run_recv(tag, S, wk_out, (size_t) S * HBF, de))
+                                    fe += " (and its reply from the next worker: " + de + ")";
+                            };
+                            if (!ver.commit_slots(e) || !ver.wait_commit(e)) {
+                                drain(e);
+                                return false;
+                            }
                             for (int t = 0; t < S; ++t) ++wk_slot_len[(size_t) rows[t]];
-                            if (!wk_after_commit(e)) return false;
+                            if (!wk_after_commit(e)) {
+                                drain(e);
+                                return false;
+                            }
                         } else {
                             wk_slot_wait = true;
                             wk_wait_S = S;
@@ -13848,6 +13953,67 @@ int main(int argc, char** argv) {
                         }
                         return true;
                     };
+                    // stage 2 (2.3.3): the next worker's rows of the oldest late window, on serve_stage's replying
+                    // thread (one at a time, in the order the windows came).  The only reader of the next worker's
+                    // late replies: a window that failed after its send is read here too and dropped.  No progress
+                    // marks here (NextWorkerWait / WkBusy are the serving thread's).
+                    if (stage_relay && wk_overlap)
+                        hs.slot_run_reply = [&](int S, float* rows_out, std::string& e) -> bool {
+                            WkLate w;
+                            {
+                                std::lock_guard<std::mutex> lk(wk_late_mu);
+                                if (wk_late_q.empty()) {
+                                    e = "stage worker: a late batch window reply with no window waiting for it";
+                                    return false;
+                                }
+                                w = wk_late_q.front();   // (it stays queued while it is read: `early` counts it)
+                            }
+                            const auto r0 = Clock::now();
+                            std::string re;
+                            // (w.S rows always: even a wrong S reads this window's reply whole, the link in step)
+                            const bool got = next_link.slot_run_recv(w.tag, w.S, rows_out, (size_t) w.S * HBF, re);
+                            const auto r1 = Clock::now();
+                            {
+                                std::lock_guard<std::mutex> lk(wk_late_mu);
+                                if (!wk_late_q.empty()) wk_late_q.pop_front();
+                                ++wk_late_total;
+                                if (wk_timing && got && w.err.empty()) {
+                                    wk_late_own_ms += w.own_ms;
+                                    wk_late_next_ms += std::chrono::duration<double, std::milli>(r1 - w.sent).count();
+                                    wk_late_wait_ms += std::chrono::duration<double, std::milli>(r0 - w.back).count();
+                                    wk_late_rows += w.S;
+                                    if (w.early) ++wk_late_early;
+                                    if (++wk_late_n % 64 == 0) {
+                                        std::fprintf(stderr, "strata stage worker: deferred batch windows: own layers "
+                                                             "%.2f ms, next worker %.2f ms (the send to the rows) each "
+                                                             "(64 windows, %.2f rows each); deferred replies %lld, the "
+                                                             "serving thread waited %.2f ms each for the reply before, "
+                                                             "%lld of 64 windows started before the reply before them "
+                                                             "was out\n",
+                                                     wk_late_own_ms / 64, wk_late_next_ms / 64,
+                                                     (double) wk_late_rows / 64, (long long) wk_late_total,
+                                                     wk_late_wait_ms / 64, (long long) wk_late_early);
+                                        wk_late_own_ms = wk_late_next_ms = wk_late_wait_ms = 0;
+                                        wk_late_rows = wk_late_early = 0;
+                                    }
+                                }
+                            }
+                            if (!got) {
+                                e = "relay: the next worker: " + re;
+                                if (!w.err.empty()) e = w.err + " (and its reply: " + e + ")";
+                                return false;
+                            }
+                            if (!w.err.empty()) {
+                                e = w.err;
+                                return false;
+                            }
+                            if (w.S != S) {
+                                e = "stage worker: a late batch window reply for " + std::to_string(S) +
+                                    " rows, the window has " + std::to_string(w.S);
+                                return false;
+                            }
+                            return true;
+                        };
                     // B-6: the last window's rows to keep per slot (keep[s], s < m), padded to this worker's capacity
                     hs.slot_commit = [&](const int32_t* keep, int m, std::string& e) -> bool {
                         const WkBusy busy("stage worker batch commit");
