@@ -42,7 +42,8 @@ def reader():
     lines.put(None)
 threading.Thread(target=reader, daemon=True).start()
 print("INFO engine=0.1.39" + (f" batch_slots={fit}" if fit >= 2 else "") +
-      (" slot_cache=1" if "--slotcache" in args else "") + (f" batch_groups={groups}" if groups > 1 else ""), flush=True)
+      (" slot_cache=1" if "--slotcache" in args else "") + (f" batch_groups={groups}" if groups > 1 else "") +
+      (" batch_pad=0" if "--says-no-pad" in args else ""), flush=True)
 if "--fake-stage-plan" in args:
     print("strata serve: layer split: layers 0-11 (CUDA0), 12-23 (CUDA1), 24-35 (CUDA2), "
           "36-47 (CUDA3), one hand-off per window", file=sys.stderr, flush=True)
@@ -669,6 +670,23 @@ class ParallelService(FakeEngineCase):
         self.tearDown(); self.httpd = self.engine = self.tmp = None
         self.start(8, says_groups=4, more=["--batch-groups", "1"])   # the opt-out
         self.assertEqual(self.engine.slot_groups, 1)
+
+    def test_batch_pad_0_keeps_the_slots_as_caches(self):
+        """A remote stage's main process with pipelined groups says INFO batch_pad=0 (its group windows have no pad
+        rows): the server keeps the groups' spreading but not the pad-row slot choice, so a held conversation is
+        picked again (strata-mesh IMPL-PLAN-remote-batch-stage2.md 2.5)."""
+        self.start(4, says_groups=2, more=["--batch-groups", "2"])
+        self.assertEqual((self.engine.slot_groups, self.engine.slot_gs), (2, 2))   # a local split: pad rows
+        self.tearDown(); self.httpd = self.engine = self.tmp = None
+        self.start(4, says_groups=2, more=["--batch-groups", "2", "--says-no-pad"])
+        e = self.engine
+        self.assertEqual((e.slot_groups, e.slot_gs, e.slot_order), (2, 0, [0, 2, 1, 3]))
+        held = list(range(1, 601))
+        e.slot_held[1] = held                                     # slot 1 holds a long conversation
+        self.assertEqual(e.pick_slot(held + [7, 8]), 1)           # its next turn goes back there
+        e.slot_busy[0] = True
+        self.assertEqual(e.pick_slot([9, 9, 9]), 2)               # a new one: the other group first
+        e.slot_busy[0] = False
 
     def test_engine_log_resolves_four_stage_layer_and_device_mapping(self):
         self.start(8, says_groups=4, stage_plan=True)
