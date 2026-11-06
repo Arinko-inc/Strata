@@ -24,6 +24,17 @@ Exact comparisons need the same settings as batch_test.py (this script sets STRA
       --extra "--pcie-frac 0 --adapt-every 1000000 --no-prefill-borrow"
 Without --no-prefill-borrow the slots decoding during C's read see the expert cache without the slots C's prompt
 borrowed (those experts run on the CPU, which rounds differently): A's and B's text may then drift from solo.
+
+Step 3 compares the slot's next turn with step 1's solo A2, which continues from A's live session only when A's last
+verify window accepted no draft past A's last token (the window commits all its accepted drafts, the reply stops at
+--max-new): otherwise the solo session holds tokens A2 does not start with, and A2 is read again from A's turn
+checkpoint - A's whole reply, a part longer than the engine's --short-read (64), through the BATCHED prompt path, whose
+kernels round differently from the windows the slot decoded A's reply in (the GEMM libraries, a B70's int8 prompt
+experts).  Two computations would then be compared (seen on a remote stage: "DIFFERS at 3", the solo A2 read as
+"18 reused + 226 read" with a "chunk T=219 at 18" on the workers).  So unless --extra or the config sets --short-read,
+this script starts the engine with --short-read len(A) + --max-new + len(A2's new turn): that re-read goes through the
+windows too (the prompts that are read batched here - C and D - are far longer, so nothing else changes), and the
+end of the output says how the solo A2 was read.
 """
 import argparse, json, os, re, sys, time
 from pathlib import Path
@@ -93,7 +104,21 @@ def main():
     D = chat(body + "\nWhat are the three most important ideas in the text above?")
     E = chat("Describe the life cycle of a star like the Sun.")
     print(f"prompts: A {len(A)}, B {len(B)}, C {len(C)} tokens", flush=True)
-    eng = Engine(a.exe, cfg, 3, {"STRATA_IQ_MT_MIN": "1"}, a.extra.split())
+    extra = a.extra.split()
+    # step 3's reference: a solo A2 read again from A's turn checkpoint goes through the windows as the slot's did
+    # (see the docstring); the longest such part is below len(A) + max_new + the new turn
+    a2_new = chat("Now do the same in Rust.")
+    a2_max = len(A) + a.max_new + len(a2_new)
+    if "--short-read" not in extra and "--short-read" not in cfg.get("args", []):
+        if a2_max < min(len(C), len(D)) - 64:
+            extra += ["--short-read", str(a2_max)]
+            print(f"--short-read {a2_max}: step 1's solo A2, if it is read again from A's turn checkpoint, goes through "
+                  f"the verify windows as the slot's next turn does (C and D, {len(C)}+ tokens, are still read batched)",
+                  flush=True)
+        else:
+            print(f"note: --max-new {a.max_new} makes A2 as long as C or D: no --short-read is added, so step 3 may "
+                  f"compare a batched re-read of A's reply with the slot's decoded one", flush=True)
+    eng = Engine(a.exe, cfg, 3, {"STRATA_IQ_MT_MIN": "1"}, extra)
     eng.pending = []
     out = eng.lines()
     ids = lambda v: ",".join(map(str, v))
@@ -101,7 +126,7 @@ def main():
 
     # 1. solo
     sA, _ = run(eng, out, f"GEN {M} {ids(A)}")
-    A2 = A + sA + chat("Now do the same in Rust.")
+    A2 = A + sA + a2_new
     sA2, _ = run(eng, out, f"GEN {M} {ids(A2)}")
     # F: A's history as a client sends it back WITHOUT the reply's thinking - it shares A only up to A's last turn
     # boundary (the checkpoint there); solo it continues from that checkpoint of the live chain
@@ -171,7 +196,7 @@ def main():
     # On a pipelined batch (a layer split with more than one group) a read never gives way (generate.cpp: the BYIELD
     # is dropped): D is then admitted whole into slot 2 and E goes into the free slot 1 while D decodes - both must
     # still equal solo, only the give-way itself is not checked (--yield)
-    pipelined = engine_pipelined(eng, a.extra.split())
+    pipelined = engine_pipelined(eng, extra)
     expect_yield = a.yield_mode == "expect" or (a.yield_mode == "auto" and not pipelined)
     eng.send(f"BGEN 2 {M} {ids(D)}")
     eng.send("BYIELD 2")
@@ -327,6 +352,14 @@ def main():
             print("  log:", l.split("strata serve: ")[-1][:160], flush=True)
     for key in ("gave back", "its turn checkpoint", "takes", "the prompt was read in", "gives way"):
         print(f"engine log '{key}': {log.count(key)} lines", flush=True)
+    # how step 1's solo A2 (the first request of len(A2) tokens) was read: from the live session (all of A and its
+    # reply but the last token, or all of it) or again from A's turn checkpoint
+    m = re.search(rf"strata serve: prompt {len(A2)} tokens = (\d+) reused \+ (\d+) read", log)
+    if m:
+        reused = int(m.group(1))
+        src = ("A's live session" if reused >= len(A) + len(sA) - 1 else
+               f"A's turn checkpoint ({len(A2) - reused} tokens read again, A's reply among them)")
+        print(f"step 1's solo A2: {reused} reused + {m.group(2)} read - from {src}", flush=True)
     return 0 if ok else 2
 
 
