@@ -13977,6 +13977,11 @@ int main(int argc, char** argv) {
         };
         auto copy_to_slot = [&](int b, const std::vector<int32_t>& ids, std::string& e) -> bool {
             const int64_t upto = (int64_t) ids.size();
+            if (remote_main && (upto < 1 || upto > o.max_context)) {   // (the worker takes 1 <= L <= the context)
+                remote_slot_lost.clear();
+                e = "a slot copy of " + std::to_string(upto) + " tokens";
+                return false;
+            }
             return with_remote_slot([&, b, upto](std::string& re) { return remote_link.slot_save(b, upto, re); }, e,
                                     [&, b](std::string& le) { return copy_to_slot_here(b, ids, le); });
         };
