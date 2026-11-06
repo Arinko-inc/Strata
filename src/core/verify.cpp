@@ -4653,14 +4653,41 @@ bool Verifier::batch_launch(int base, int S, const int32_t* tokens, const int64_
     return true;
 }
 
+// remote-batch stage 2: batch_launch's copy over any slots (a remote stage's group holds its active slots only: the
+// worker refuses a window over a slot it holds nothing of, so there is no pad row).  Rows [hbase, hbase + S) of the
+// hand-off are the group's own, as batch_launch's [base, base + S).
 bool Verifier::batch_launch_slots(const int* rows, int S, int hbase, const int32_t* tokens, const int64_t* pos,
                                   std::string& err) {
-    (void) rows; (void) S; (void) hbase; (void) tokens; (void) pos;
-    err = "verify: batch_launch_slots is not in this build yet (remote-batch stage 2 skeleton)";
-    return false;
+    const OnDevice on_device(device_);
+    if (b_running_) { err = "verify: batch_launch_slots while this stage is busy"; return false; }
+    if (S < 1 || S > (int) strata::kernels::kVerifyMaxT) { err = "verify: batch rows out of range (init_slots)"; return false; }
+    int rw[strata::kernels::kVerifyMaxT] = {};   // (stage_batch keeps its own copy in last_rows_)
+    for (int t = 0; t < S; ++t) rw[t] = rows[t];
+    if (pre_launch_ && !pre_launch_(cs_, err)) return false;
+    if (!stage_batch(rw, S, hbase, tokens, pos, err)) return false;
+    const auto key = bkey(rw, S, hbase);
+    cudaError_t le = cudaGraphLaunch(exec_bm_[key], cs_);
+    if (le == cudaSuccess && !batch_self_commits(rw, S) && !head_only_stage())   // (else the window has kept its rows
+        le = cudaGraphLaunch(commit_bm_[key], cs_);   // itself, or has none); every row is kept
+    if (le != cudaSuccess) { err = std::string("verify: batch launch: ") + cudaGetErrorString(le); return false; }
+    (void) cudaStreamQuery(cs_);
+    if (ple_stage())   // the host's side of the commit (the hash's last two tokens)
+        for (int t = 0; t < S; ++t) {
+            SessionState& sx = *slots_[(size_t) rw[t]];
+            sx.ple_prev[0] = sx.ple_prev[1];
+            sx.ple_prev[1] = tokens[t];
+        }
+    b_k_ = 0;
+    b_steps_ = le_ - lb_;
+    ring_now();
+    b_running_.store(true, std::memory_order_release);   // last: an external server reads the rest after it
+    return true;
 }
 
+// (the key's doorbell bit is the one the last window ran with: exact on a head-only stage, which holds no expert, so
+// refresh_ar never turns it; on a stage with experts a swap can make the next launch capture the other variant)
 bool Verifier::batch_captured(const int* rows, int S, int hbase) const {
+    if (S < 1 || S > (int) strata::kernels::kVerifyMaxT) return false;
     return exec_bm_.find(bkey(rows, S, hbase)) != exec_bm_.end();
 }
 

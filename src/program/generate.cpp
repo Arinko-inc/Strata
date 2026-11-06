@@ -6216,6 +6216,7 @@ int main(int argc, char** argv) {
     // way to --batch-mtp and --adapt-async 1, which need the serial windows: one group, said once.
     int groups_said = 0;
     auto resolve_groups_auto = [&] {
+        if (remote_main) return;   // (remote-batch stage 2: remote_groups below decides a remote stage's groups)
         const auto r = batch_groups_for(batch_mtp);
         if (!r.from_auto) return;
         o.batch_groups = r.groups;
@@ -6234,16 +6235,29 @@ int main(int argc, char** argv) {
                          r.groups == 1 ? "" : "s", o.batch / r.groups, o.batch / r.groups == 1 ? "" : "s");
     };
     if (o.batch > 0) resolve_groups_auto();
-    // remote-batch, stage 1: a remote stage's main process runs its slots in one group (its windows go through the
-    // worker in turn); the pipelined groups over the link are stage 2 (IMPL-PLAN-remote-batch.md section 3.12)
-    // TODO(remote-batch-2 C3): 2.2.1 - --batch-groups over a remote stage (none: 1 group; auto: 2 if --batch is even;
-    // G >= 2 dividing --batch: G), and the check below skips the "needs a layer split" rule for remote_main
-    if (remote_main && o.batch > 0 && o.batch_groups > 1) {
-        std::fprintf(stderr, "strata generate: --batch-groups %d is one group over a remote stage (the slot groups do "
-                             "not pipeline over the link yet)\n", o.batch_groups);
-        o.batch_groups = 1;
-    }
-    if (o.batch > 0 && o.batch_groups > 1 && (stages.empty() || o.batch % o.batch_groups != 0)) {
+    // remote-batch stage 2 (strata-mesh IMPL-PLAN-remote-batch-stage2.md 2.2.1): a remote stage's main process
+    // pipelines its slot groups over the link only when asked - no --batch-groups: one group (stage 1's serial windows;
+    // the layer split's default `auto` is not a remote stage's); `auto`: 2 when --batch is even; G >= 2 dividing --batch:
+    // G.  Checked again once the slots that fit are known and once the worker's hello is in (it may agree fewer).
+    const int remote_groups_given = o.batch_groups;   // (as given: the checks below change o.batch_groups)
+    auto remote_groups = [&](bool say) {
+        if (!remote_main || o.batch <= 0) return;
+        const int asked = o.batch_groups_auto ? (o.batch % 2 == 0 ? 2 : 1) : o.batch_groups_set ? remote_groups_given : 1;
+        const int was = o.batch_groups;
+        o.batch_groups = asked >= 2 && o.batch % asked == 0 ? asked : 1;
+        if (!say && o.batch_groups == was) return;
+        if (o.batch_groups > 1)
+            std::fprintf(stderr, "strata generate: --batch-groups %s: %d pipelined groups of %d slot%s over the remote stage\n",
+                         o.batch_groups_auto ? "auto" : std::to_string(asked).c_str(), o.batch_groups,
+                         o.batch / o.batch_groups, o.batch / o.batch_groups == 1 ? "" : "s");
+        else if (o.batch_groups_set && (o.batch_groups_auto || asked != 1))
+            std::fprintf(stderr, "strata generate: --batch-groups %s: one group over the remote stage (%s --batch %d)\n",
+                         o.batch_groups_auto ? "auto" : std::to_string(asked).c_str(),
+                         o.batch_groups_auto ? "an odd" : asked < 2 ? "a group count below 2 for" : "it does not divide",
+                         o.batch);
+    };
+    remote_groups(true);
+    if (o.batch > 0 && o.batch_groups > 1 && ((stages.empty() && !remote_main) || o.batch % o.batch_groups != 0)) {
         std::fprintf(stderr, "strata generate: WARNING: --batch-groups %d needs a layer split and to divide --batch %d; "
                              "one group\n", o.batch_groups, o.batch);
         o.batch_groups = 1;
@@ -6300,6 +6314,7 @@ int main(int argc, char** argv) {
             }
             o.batch = fit;
             resolve_groups_auto();   // (the slots that fit may not be the ones asked for)
+            remote_groups(false);    // (remote-batch stage 2: the same, for a remote stage's main process)
             if (o.batch_groups > 1 && o.batch % o.batch_groups != 0) o.batch_groups = 1;
             // the sessions' VRAM is the expert cache's: say what it costs (docs/BATCHING.md has the measured trade)
             std::fprintf(stderr, "strata generate: --batch %d: the slot sessions take %.2f GiB of VRAM on CUDA0 that the "
@@ -9889,6 +9904,14 @@ int main(int argc, char** argv) {
         // last batch window sent (its SlotCommit names it)
         int remote_slots_n = 0;
         int64_t remote_slot_tag = 0;
+        // remote-batch stage 2 (IMPL-PLAN-remote-batch-stage2.md 2.2.2-2.2.3): the slot groups pipelined over the link
+        // (--batch-groups G >= 2, set once the worker's hello is in) - stage 0 (`ver`) here, then the worker, then the
+        // head (`ver_same`); and where a group's rows go: stage 0's out of rb_out0, the worker's back into rb_rx (both
+        // the host side of the hand-offs, rb_hbf floats a row), the group's rows [hbase, hbase + S) of each
+        bool remote_pipe = false;
+        float* rb_out0 = nullptr;
+        float* rb_rx = nullptr;
+        int64_t rb_hbf = 0;
         strata::net::StageClient next_link;     // remote-stage relay worker: the next worker
         strata::net::StageRelay relay(next_link);
         int64_t relay_skip = 0;                 // the chunk's skip from the main process (the reply leaves those rows out)
@@ -10229,6 +10252,9 @@ int main(int argc, char** argv) {
                 ver_same.set_stage(g.n_layers, -1, rx_d, nullptr);
                 const float* out0 = hand_host[0];
                 const int64_t HBF = strata::core::Verifier::handoff_floats(g);
+                rb_out0 = hand_host[0];   // (remote-batch stage 2: the pipelined groups' rows, in the same buffers)
+                rb_rx = rx;
+                rb_hbf = HBF;
                 // STRATA_REMOTE_TIMING=1: this process's own share of a window - from one window's rows coming back
                 // to the next window's send (the head, sampling, the drafter, then this process's layers)
                 struct MainGap {
@@ -13086,9 +13112,36 @@ int main(int argc, char** argv) {
                                               "with --batch N)");
                     o.batch = n >= 2 ? n : 0;
                     remote_slots_n = o.batch;
-                    // TODO(remote-batch-2 C3): 2.2.1 - the groups checked again against the agreed slots and the worker's
-                    // batch_flags; INFO batch_slots=%d batch_groups=%d batch_pad=0
-                    std::printf("INFO batch_slots=%d batch_groups=1\n", o.batch);
+                    // remote-batch stage 2 (IMPL-PLAN-remote-batch-stage2.md 2.2.1): the groups again, over the slots
+                    // agreed; the pipelined windows keep every row on the worker (kStageSlotKeepAll), so a worker
+                    // whose hello does not say it understands that runs one group.  batch_pad=0: no group window here
+                    // carries an idle slot's pad row, so an idle slot keeps its conversation (the server's slot choice)
+                    if (o.batch_groups > 1) {
+                        const char* why = o.batch < 2 ? "fewer than 2 batch slots were agreed"
+                                        : o.batch % o.batch_groups != 0 ? "the groups do not divide the slots agreed"
+                                        : (remote_peer.batch_flags & strata::net::kStageBatchKeepAll) == 0
+                                        ? "the worker does not keep a window's rows itself (kStageBatchKeepAll)" : nullptr;
+                        if (why != nullptr) {
+                            std::fprintf(stderr, "strata serve: remote stage: --batch-groups %d: one group (%s)\n",
+                                         o.batch_groups, why);
+                            o.batch_groups = 1;
+                        } else {
+                            std::fprintf(stderr, "strata serve: remote stage: %d pipelined groups of %d slots: %s\n",
+                                         o.batch_groups, o.batch / o.batch_groups,
+                                         (remote_peer.batch_flags & strata::net::kStageBatchOverlap) != 0
+                                         ? "the relay overlaps the pipelined windows"
+                                         : "the worker runs the windows one by one: the groups overlap this process with "
+                                           "the workers only");
+                            // the pipelined groups' upstream opt-ins that a remote stage does not run (2.2.3)
+                            for (const char* v : {"STRATA_PIPED_MTP", "STRATA_PIPED_CONCURRENT", "STRATA_PIPED_READ_PIECE"})
+                                if (const char* x = std::getenv(v); x != nullptr && x[0] != '\0' && x[0] != '0')
+                                    std::fprintf(stderr, "strata serve: remote stage: %s is off over the link (the "
+                                                         "remote groups read a prompt between serial windows)\n", v);
+                        }
+                    }
+                    if (o.batch < 2) o.batch_groups = 1;
+                    remote_pipe = o.batch > 0 && o.batch_groups > 1;
+                    std::printf("INFO batch_slots=%d batch_groups=%d batch_pad=0\n", o.batch, o.batch_groups);
                 }
             } else {
                 // remote-stage worker: serve the main process instead of stdin.  A prompt starts with a reset; windows,
@@ -14482,6 +14535,12 @@ int main(int argc, char** argv) {
                              n_dropped, n_dropped == 1 ? "" : "s", (int) strata::net::kStageCkptMax);
             };
             remote_relink_slots = [&](std::string& e) -> bool {
+                if (remote_pipe && (remote_peer.batch_flags & strata::net::kStageBatchKeepAll) == 0) {   // (stage 2)
+                    e = "remote stage: the worker's hello was refused: it does not keep a window's rows itself "
+                        "(kStageBatchKeepAll), which the pipelined groups need (start the main process again)";
+                    remote_link.close();
+                    return false;
+                }
                 if (remote_peer.batch_slots < o.batch) {
                     e = "remote stage: the worker's hello was refused: it has " + std::to_string(remote_peer.batch_slots) +
                         " batch slots now, fewer than the " + std::to_string(o.batch) +
@@ -14512,8 +14571,10 @@ int main(int argc, char** argv) {
                 return true;
             };
         }
-        // TODO(remote-batch-2 C3): 2.2.3 - remote_pipe: stage 1 is ver_same (the head)
-        auto stage_verifier = [&](int k) -> strata::core::Verifier& { return k == 0 ? ver : stages[(size_t) k - 1]->ver; };
+        // (remote-batch stage 2, remote_pipe: the pipelined groups' second stage is the head, `ver_same`)
+        auto stage_verifier = [&](int k) -> strata::core::Verifier& {
+            return k == 0 ? ver : remote_pipe ? ver_same : stages[(size_t) k - 1]->ver;
+        };
         // What an idle slot holds (the conversation it decoded last: its sessions, its draft K/V and its checkpoints)
         // goes to the parked conversations before an admission overwrites it.  The main session was parked with that
         // conversation's prompt only (the admission's copy), so the reply the slot decoded lives nowhere else: without
@@ -14791,8 +14852,9 @@ int main(int argc, char** argv) {
             return true;
         };
         // ---- --batch-groups: the slot groups pipelined through the stages (--batch-groups G > 1 with a layer split)
-        // TODO(remote-batch-2 C3): 2.2.3 - remote_pipe: 2 stages (ver, then ver_same); a StageSlotPipe on remote_link
-        const int n_pipe = (int) stages.size() + 1;
+        // (remote-batch stage 2, remote_pipe: two stages here - layers [0, K) on `ver`, then the head on `ver_same` once
+        // the worker's rows are in; the worker's part runs between them, out on the link)
+        const int n_pipe = remote_pipe ? 2 : (int) stages.size() + 1;
         const bool piped = o.batch > 0 && o.batch_groups > 1 && n_pipe > 1;
         strata::core::StageInFlightSampler stage_in_flight(n_pipe, piped && batch_telemetry_enabled);
         const int GS = piped ? o.batch / o.batch_groups : o.batch;
@@ -14831,6 +14893,67 @@ int main(int argc, char** argv) {
         };
         std::vector<PGroup> pg((size_t) (piped ? o.batch_groups : 0));
         std::vector<int> stage_group((size_t) n_pipe, -1);
+        // ---- remote-batch stage 2 (strata-mesh IMPL-PLAN-remote-batch-stage2.md 2.2): with remote_pipe, a group's
+        // stage 0 window done goes out as a SlotRun (kStageSlotKeepAll: the worker keeps every row, no SlotCommit);
+        // its reply comes in on the pipe's own thread (pump never waits on the link: it answers stage 0's doorbells)
+        // into the group's rows of rb_rx, and the group's head runs once they are in.  rp_in[gi]: group gi's rows are
+        // in (rpipe->poll said so; pump reads them only after that)
+        std::unique_ptr<strata::net::StageSlotPipe> rpipe;
+        if (remote_pipe) rpipe = std::make_unique<strata::net::StageSlotPipe>(remote_link);
+        std::vector<char> rp_in(pg.size(), 0);
+        // 2.2.9: a pipelined window failed (a send, a reply, the worker's error, a launch, a poll), so the engine ends -
+        // and another group's stage 0 window may still wait on the GPU for a doorbell pump will not answer any more,
+        // while the verifiers' destructors synchronise their streams.  So the GPU's waits are released first (#267:
+        // every live verifier's spin flags raised past any ring), then the pipe's reader is cut and joined.
+        bool rp_released = false;
+        auto rpipe_release = [&] {
+            if (rp_released) return;
+            rp_released = true;
+            strata::core::release_gpu_waits(stderr);
+            if (rpipe) rpipe->stop();
+        };
+        auto rpipe_fail = [&](const std::string& why) -> bool {
+            const std::string m = why.rfind("remote stage: ", 0) == 0 ? why.substr(14) : why;
+            std::printf("ERR remote stage: %s (stage 0 window in flight: %s)\n", m.c_str(), ver.batch_busy() ? "yes" : "no");
+            std::fflush(stdout);
+            rpipe_release();
+            return false;
+        };
+        // ... and whatever else leaves this scope with a window in flight (an upstream error branch, a failed read)
+        // does the same, before the verifiers (declared further out) are destroyed
+        struct RpipeGuard {
+            std::function<void()> at_end;
+            ~RpipeGuard() { if (at_end) at_end(); }
+        } rpipe_guard;
+        if (remote_pipe)
+            rpipe_guard.at_end = [&] {
+                if (rp_released || !(ver.batch_busy() || ver_same.batch_busy() || (rpipe && rpipe->outstanding() > 0)))
+                    return;
+                std::fprintf(stderr, "strata batch: remote stage: leaving with a pipelined window in flight: its GPU "
+                                     "waits are released\n");
+                rpipe_release();
+            };
+        // STRATA_REMOTE_TIMING=1 (2.2.10): every 64 group windows, where a window's time went (stage 0 here, out on the
+        // link: the send to its rows seen in, the head), how many windows were out at each send, and how much of stage
+        // 0's time another group's window was out on the link (the overlap the groups are for)
+        struct RpTiming {
+            bool on = false;
+            std::vector<Clock::time_point> launch0, sent, head0;
+            double s0_ms = 0, link_ms = 0, head_ms = 0, out_sum = 0, busy_ms = 0, ov_ms = 0;
+            int64_t n = 0, sends = 0;
+            int out_max = 0;
+            Clock::time_point tick{};
+            bool busy = false, ov = false;   // the state at the last pump turn's start (it holds until the next)
+        } rpt;
+        rpt.on = remote_pipe && [] { const char* v = std::getenv("STRATA_REMOTE_TIMING"); return v && v[0] == '1'; }();
+        if (rpt.on) {
+            rpt.launch0.resize(pg.size());
+            rpt.sent.resize(pg.size());
+            rpt.head0.resize(pg.size());
+        }
+        auto rpt_ms = [](Clock::time_point a, Clock::time_point b) {
+            return std::chrono::duration<double, std::milli>(b - a).count();
+        };
         int64_t pipe_tick = 0, rr = 0;
         auto pipe_inflight = [&] { for (const PGroup& x : pg) if (x.inflight) return true; return false; };
         auto group_active = [&](int gi) {
@@ -15025,11 +15148,25 @@ int main(int argc, char** argv) {
             return strata::program::batch_groups::pipe_adapt_due(p);
         };
         // one turn: serve every running stage, hand finished groups on, start what can start
-        // TODO(remote-batch-2 C3): 2.2.3 / 2.2.4 - remote_pipe: stage 0 done -> SlotRun (kStageSlotKeepAll) through the
-        // pipe; stage 1 starts once its rows are in; a group holds its active slots only (batch_launch_slots); the head
-        // of a group not captured yet launches only while stage 0 is idle; BT/BDONE name G.rows[t]
+        // (remote-batch stage 2, remote_pipe: a group's stage 0 window done goes out as a SlotRun through rpipe; its head
+        // starts once the worker's rows are in; a group holds its active slots only (batch_launch_slots, no pad row), so
+        // row t is slot G.rows[t]; a group's head not captured yet launches only while stage 0 is idle - 2.2.3, 2.2.4)
         auto pump = [&](bool may_start) -> bool {
             ++pipe_tick;
+            if (rpt.on) {   // STRATA_REMOTE_TIMING: the turn since the last one, by the state it began in
+                const Clock::time_point now = Clock::now();
+                const double dt = rpt.tick.time_since_epoch().count() != 0 ? rpt_ms(rpt.tick, now) : 0.0;
+                if (rpt.busy && dt < 1000.0) {   // (a longer gap is the slots going idle)
+                    rpt.busy_ms += dt;
+                    if (rpt.ov) rpt.ov_ms += dt;
+                }
+                rpt.tick = now;
+                rpt.busy = stage_group[0] >= 0;
+                rpt.ov = false;
+                for (int h = 0; h < (int) pg.size() && rpt.busy; ++h)
+                    rpt.ov = rpt.ov || (h != stage_group[0] && pg[(size_t) h].inflight && pg[(size_t) h].stage == 1 &&
+                                        !rp_in[(size_t) h]);
+            }
             if (bt_windows == 0 && !pipe_inflight()) {
                 bt_start = Clock::now();
                 bt_wait0 = ver.ms_wait; bt_pool0 = ver.ms_pool;
@@ -15040,24 +15177,48 @@ int main(int argc, char** argv) {
                 if (gi < 0) continue;
                 strata::core::Verifier& vk = stage_verifier(k);
                 const int r = vk.batch_poll(win_pool_fn, win_pool_user, err);
+                if (r < 0 && remote_pipe) return rpipe_fail(err);
                 if (r < 0) { std::printf("ERR %s\n", err.c_str()); return false; }
                 if (r == 0) continue;
                 if (batch_telemetry_enabled) stage_in_flight.complete(k, Clock::now());
                 stage_group[(size_t) k] = -1;
                 PGroup& G = pg[(size_t) gi];
+                if (remote_pipe && k == 0) {
+                    // remote-batch stage 2: stage 0 has written the group's rows [hbase, hbase + S) of its hand-off
+                    // (its stream is done): out to the worker, which keeps every row (no SlotCommit follows); the
+                    // reply lands in the group's rows of rb_rx, where the head reads them.  Nothing else goes on the
+                    // link while a window is out (2.2.8: pipe_drain before any other message)
+                    int32_t s32[strata::kernels::kVerifyMaxT] = {};
+                    for (int t = 0; t < G.S; ++t) s32[t] = (int32_t) G.rows[t];
+                    if (!rpipe->send(gi, G.S, s32, G.tok, G.pos, strata::net::kStageSlotKeepAll, ++remote_slot_tag,
+                                     rb_out0 + (size_t) G.hbase * (size_t) rb_hbf, (size_t) G.S * (size_t) rb_hbf,
+                                     rb_rx + (size_t) G.hbase * (size_t) rb_hbf, (size_t) G.S * (size_t) rb_hbf, err))
+                        return rpipe_fail(err);
+                    rp_in[(size_t) gi] = 0;
+                    if (rpt.on) {
+                        const Clock::time_point now = Clock::now();
+                        rpt.s0_ms += rpt_ms(rpt.launch0[(size_t) gi], now);
+                        rpt.sent[(size_t) gi] = now;
+                        const int out = rpipe->outstanding();
+                        rpt.out_sum += out;
+                        rpt.out_max = std::max(rpt.out_max, out);
+                        ++rpt.sends;
+                    }
+                }
                 if (k + 1 < n_pipe) { G.stage = k + 1; G.since = pipe_tick; continue; }
                 // the last stage: the group's picks
                 const int32_t* outb = vk.batch_out();
                 if (pmtp && !pmtp_verdict(G, vk, outb)) return false;
                 for (int t = 0; t < G.S && !pmtp; ++t) {
-                    BSlot& sl = bs[(size_t) (gi * GS + t)];
+                    const int sb = remote_pipe ? G.rows[t] : gi * GS + t;   // (remote_pipe: active slots only, 2.2.3)
+                    BSlot& sl = bs[(size_t) sb];
                     if (!sl.active) continue;
                     if (vk.nonfinite_in(t)) {   // #879: the slot ends, nothing emitted
                         std::fprintf(stderr, "strata batch: non-finite logits (#879) in slot %d at position %lld: it "
                                              "ends (BDONE nonfinite) and the next request reads its prompt from token 0\n",
-                                     gi * GS + t, (long long) sl.p);
+                                     sb, (long long) sl.p);
                         const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
-                        std::printf("BDONE %d %lld nonfinite %.1f\n", gi * GS + t, (long long) sl.produced, ms);
+                        std::printf("BDONE %d %lld nonfinite %.1f\n", sb, (long long) sl.produced, ms);
                         sl.active = false;
                         sl.cached = false;
                         sl.checks.clear();
@@ -15065,7 +15226,7 @@ int main(int argc, char** argv) {
                         continue;
                     }
                     const int32_t y = outb[t];
-                    std::printf("BT %d %d\n", gi * GS + t, (int) y);
+                    std::printf("BT %d %d\n", sb, (int) y);
                     ++sl.produced;
                     ++bt_rows;
                     ++pipe_rows;
@@ -15075,7 +15236,7 @@ int main(int argc, char** argv) {
                     sl.ids.push_back(sl.x);
                     if (fin != nullptr) {
                         const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
-                        std::printf("BDONE %d %lld %s %.1f\n", gi * GS + t, (long long) sl.produced, fin, ms);
+                        std::printf("BDONE %d %lld %s %.1f\n", sb, (long long) sl.produced, fin, ms);
                         sl.active = false;
                         // a pipelined slot is a cache again (#857: a request left alone in its slot goes back to the solo path with its
                         // drafts): its state is final once its last window has left the last stage.  A later group window whose pad
@@ -15096,6 +15257,20 @@ int main(int argc, char** argv) {
                 ++pa_windows;
                 G.inflight = false;
                 report_batch_window(G.S, G.active, !pipe_inflight() && !batch_on(), G.started);
+                if (rpt.on) {   // STRATA_REMOTE_TIMING (2.2.10)
+                    rpt.head_ms += rpt_ms(rpt.head0[(size_t) gi], Clock::now());
+                    if (++rpt.n % 64 == 0) {
+                        std::fprintf(stderr, "strata remote: 64 pipelined batch windows (%d groups of %d): stage 0 %.2f ms, "
+                                             "out on the link %.2f ms (the send to the rows), head %.2f ms each; windows "
+                                             "out on the link: mean %.2f, max %d; stage 0 ran while another group's "
+                                             "window was out %.0f%% of its time\n", o.batch_groups, GS, rpt.s0_ms / 64,
+                                     rpt.link_ms / 64, rpt.head_ms / 64, rpt.out_sum / (double) std::max<int64_t>(rpt.sends, 1),
+                                     rpt.out_max, 100.0 * rpt.ov_ms / std::max(rpt.busy_ms, 1e-9));
+                        rpt.s0_ms = rpt.link_ms = rpt.head_ms = rpt.out_sum = rpt.busy_ms = rpt.ov_ms = 0;
+                        rpt.sends = 0;
+                        rpt.out_max = 0;
+                    }
+                }
             }
             // start waiting groups on free stages, the longest waiting first; a new step on stage 0 round-robin
             for (int k = n_pipe - 1; k >= 0; --k) {
@@ -15104,8 +15279,26 @@ int main(int argc, char** argv) {
                 if (k > 0) {
                     for (int gi = 0; gi < (int) pg.size(); ++gi)
                         if (pg[(size_t) gi].inflight && pg[(size_t) gi].stage == k &&
-                            (pick < 0 || pg[(size_t) gi].since < pg[(size_t) pick].since))
+                            (pick < 0 || pg[(size_t) gi].since < pg[(size_t) pick].since)) {
+                            if (remote_pipe) {   // remote-batch stage 2: the head waits for the worker's rows
+                                PGroup& W = pg[(size_t) gi];
+                                if (!rp_in[(size_t) gi]) {
+                                    const int pr = rpipe->poll(gi, err);
+                                    if (pr < 0) return rpipe_fail(err);
+                                    if (pr == 0) continue;
+                                    // (the reader thread wrote the rows to mapped memory and the poll saw them in: the
+                                    // head's graph reads them after this, as a doorbell's flag is published)
+                                    std::atomic_thread_fence(std::memory_order_seq_cst);
+                                    rp_in[(size_t) gi] = 1;
+                                    if (rpt.on) rpt.link_ms += rpt_ms(rpt.sent[(size_t) gi], Clock::now());
+                                }
+                                // 2.2.4: a head window not captured yet captures at its launch, and the capture's CUDA
+                                // calls can wait for the device - where stage 0's window (the same GPU) waits for a
+                                // doorbell this thread answers (#31).  So it launches only while stage 0 is idle.
+                                if (stage_group[0] >= 0 && !ver_same.batch_captured(W.rows, W.S, W.hbase)) continue;
+                            }
                             pick = gi;
+                        }
                     if (pick < 0) continue;
                 } else {
                     if (!may_start || pa_due()) continue;   // STRATA_PIPE_ADAPT_EVERY: a round is due, the pipeline empties first
@@ -15151,6 +15344,21 @@ int main(int argc, char** argv) {
                             }
                         }
                         if (G.S == 0) { G.inflight = false; continue; }   // every slot of the group went idle
+                    } else if (remote_pipe) {   // remote-batch stage 2: the group's active slots only, no pad row (the
+                        // worker refuses a window over a slot it holds nothing of), so an idle slot keeps its state
+                        G.hbase = pick * GS;
+                        G.active = 0;
+                        for (int t = 0; t < GS; ++t) {
+                            const int b = pick * GS + t;
+                            const BSlot& sl = bs[(size_t) b];
+                            if (!sl.active) continue;
+                            G.rows[G.S] = b;
+                            G.tok[G.S] = sl.x;
+                            G.pos[G.S] = sl.p;
+                            ++G.S;
+                            ++G.active;
+                        }
+                        if (G.S == 0) { G.inflight = false; continue; }
                     } else {
                         G.active = 0;
                         for (int t = 0; t < GS; ++t) if (bs[(size_t) (pick * GS + t)].active) {
@@ -15179,8 +15387,11 @@ int main(int argc, char** argv) {
                 PGroup& G = pg[(size_t) pick];
                 strata::core::progress().busy.store(true);
                 if (batch_telemetry_enabled) stage_in_flight.launch(k, Clock::now());
+                if (rpt.on) (k == 0 ? rpt.launch0 : rpt.head0)[(size_t) pick] = Clock::now();
                 if (!(pmtp ? stage_verifier(k).batch_launch_rows(G.rows, G.S, G.hbase, G.tok, G.pos, err)
+                           : remote_pipe ? stage_verifier(k).batch_launch_slots(G.rows, G.S, G.hbase, G.tok, G.pos, err)
                            : stage_verifier(k).batch_launch(pick * GS, G.S, G.tok, G.pos, err))) {
+                    if (remote_pipe) return rpipe_fail(err);
                     std::printf("ERR %s\n", err.c_str());
                     return false;
                 }
@@ -15246,6 +15457,11 @@ int main(int argc, char** argv) {
         auto pipe_drain = [&]() -> bool {
             while (pipe_inflight())
                 if (!pump(false)) return false;
+            // remote-batch stage 2: every window sent has had its reply taken (2.2.8: nothing else goes on the link
+            // while one is out)
+            if (remote_pipe && rpipe->outstanding() != 0)
+                return rpipe_fail("the pipelined windows did not drain (" + std::to_string(rpipe->outstanding()) +
+                                  " still out)");
             return pmtp_settle();
         };
         for (;;) {
@@ -17030,7 +17246,8 @@ int main(int argc, char** argv) {
                     }
                     return true;
                 }();
-                if (piped && pr_conc && req_imgs.empty()) {   // (with no slot decoding it only watches for a BYIELD)
+                // (remote-batch stage 2: not over a remote stage - it reads a prompt between serial windows, 2.2.6)
+                if (piped && !remote_pipe && pr_conc && req_imgs.empty()) {   // (with no slot decoding it only watches for a BYIELD)
                     // the drafter's prompt pass captures its graphs and grows its records at first use, and the
                     // prompt path's pinned upload slots grow at their first larger upload: done here, with nothing in
                     // flight (on the reader's thread a capture, an allocation or a free takes the driver's lock and
@@ -17271,13 +17488,15 @@ int main(int argc, char** argv) {
                     const char* v = std::getenv("STRATA_PIPED_DECODE_MIN_MS");
                     return v != nullptr ? std::max(0.0, std::atof(v)) : 0.0;
                 }();
-                // TODO(remote-batch-2 C3): 2.2.6 - remote_pipe reads the prompt as stage 1 does (serial windows between
-                // the chunks, BYIELD at the chunk boundaries): not the pipelined groups' one-piece read
-                const bool pr_on = piped && pr_piece > 0;
+                // remote-batch stage 2 (2.2.6): a remote stage's pipelined groups read a prompt as stage 1 does - the
+                // groups drained before it (the line that started it), the slots decode in serial windows (batch_step,
+                // whose SlotRun and SlotCommit go on the link directly) between its chunks, a BYIELD is taken at a
+                // chunk's end - not in one piece with the slots stopped, as the layer split's pipelined groups read it
+                const bool pr_on = piped && !remote_pipe && pr_piece > 0;
                 auto piece_now = [&]() -> int64_t {
                     return pr_on ? strata::program::piped_read_piece(pr_piece, C)
-                                 : strata::program::batch_read_piece(o.batch > 0, piped, !stages.empty(), batch_on(), C,
-                                                                     yield_chunks);
+                                 : strata::program::batch_read_piece(o.batch > 0, piped && !remote_pipe, !stages.empty(),
+                                                                     batch_on(), C, yield_chunks);
                 };
                 // the slots decode through the pipeline for budget_ms, drained before the next read
                 auto piped_decode = [&](double budget_ms, std::string& err) -> bool {
