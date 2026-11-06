@@ -554,6 +554,13 @@ settings make the comparison exact:
 - `--adapt-every 1000000` (the VRAM tier fixed), and `--no-prefill-borrow` while a prompt is read beside decoding
   slots: their windows then see the expert cache without the slots the prompt borrowed (those experts run on the
   CPU).
+- Both runs must read the same tokens through the same path. A solo next turn continues from the live session only
+  when the last verify window of the turn before accepted no draft past its last token (a window commits all its
+  accepted drafts, the reply stops at the token limit); otherwise it is read again from the turn checkpoint, and a
+  part longer than `--short-read` (64) goes through the batched prompt path, which rounds differently from the
+  windows a slot decoded the same tokens in. `tools/batch_interleave_test.py` therefore starts its engine with a
+  `--short-read` that covers its solo next turn (on a remote stage, 2026-11-07, the step "A's next turn from its
+  slot" differed at token 3 without it: the solo reference had read A's 219-token reply in one batched chunk).
 
 With the default settings the outputs stay coherent but drift apart after some tokens, as two solo runs whose
 windows differ can. Measured on the RTX 5070 (Q2_0, 4 conversations of 200 tokens, `tools/batch_test.py` without
