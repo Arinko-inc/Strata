@@ -30,10 +30,11 @@ the head and the drafter on the worker would have saved that return trip and mov
 ### The protocol
 
 One TCP connection per main process. Every message is a 40-byte header (`magic` "STRM", `type`, three int64 fields
-`a b c`, payload `bytes`) and a payload. Protocol version 7 (3 before the hello carried the tail-skip rank, 4 before
+`a b c`, payload `bytes`) and a payload. Protocol version 8 (3 before the hello carried the tail-skip rank, 4 before
 images, which added the Positions message and the hello's `vision`, 5 before the conversation checkpoints, which
 added `CkptSave` / `CkptRestore`, a keep list on `Reset` and the hello's `ckpt_max`: [CHECKPOINTS.md](CHECKPOINTS.md);
-6 before the row formats, below).
+6 before the row formats, 7 before the batch slots: both below). Values are in the host's byte order (every PC so
+far is x86-64).
 
 | message | header fields | payload | reply |
 |---|---|---|---|
@@ -45,6 +46,10 @@ added `CkptSave` / `CkptRestore`, a keep list on `Reset` and the hello's `ckpt_m
 | Positions (`--vision`: the next request's) | a = cells; b = 1: plain positions (no table) | int32 (t, h, w)[cells] | none (an error comes back on the next reply, a Reset's and a CkptRestore's included) |
 | CkptSave | a = id, b = position | int64 keep[] | CkptSaveOk: a = 1 stored, 0 not |
 | CkptRestore | a = id, b = position | int64 keep[] | CkptRestoreOk |
+| SlotRun (protocol 8: a batch window) | a = S rows (1 to the worker's window), b = flags (bit 0 `kStageSlotKeepAll`), c = tag | int32 slot[S], int32 tokens[S], int64 positions[S], rows[S x 12,804] | SlotRunOk: a = the worker's time (us), c = the tag, rows[S x 12,804] |
+| SlotCommit | a = m slots (1 to the agreed n), c = the window's tag | int32 keep[m] (the rows each slot keeps; 0: not in the window) | none (an error comes back on the next SlotRun, SlotSave or SlotLoad) |
+| SlotSave | a = slot, b = position (the session must be there) | none | SlotSaveOk: a = the worker's time (us) |
+| SlotLoad | a = slot, b = position, c = checkpoint id (0: the slot's own state) | none | SlotLoadOk: a = the worker's time (us) |
 | Error | | the message | |
 
 **The hello** carries what both sides must agree on, and each side checks the other's: the protocol, `n_embd`, `hc`,
@@ -71,6 +76,50 @@ buffers stay fp32 on both PCs; the link converts as it sends and reads, on the t
 prompt chunk's: the main process's sending thread and its receiving one, the worker's receiving thread and its reply
 thread; a window's few rows: the calling thread). With `STRATA_REMOTE_TIMING=1` each chunk's line adds the main
 process's conversion times, and the worker logs its own.
+
+**Batch slots (protocol 8).** With `--batch N` on every PC, the worker keeps a session per slot for its layers, carved
+at its start before its expert cache (`batch_slots` in its hello: the slots it carved; a relay answers the fewer of
+its own and its next worker's, linked again before it answers). The main process sends its `--batch` after its own
+carve; each side takes n = the fewer of the two hellos' and uses slots [0, n) only, so no hello is refused for its
+count. The two fields took the last 8 bytes of the hello's `build` text (40 bytes now, 48 up to protocol 7), so the
+hello stays 192 bytes and the token stays where every protocol has it; `batch_flags` bit 0 says the side takes
+SlotRun's keep-all flag, bit 1 (stage 2, informational) that it starts the next SlotRun while an earlier one is with
+its next worker. A worker without the slot handlers (started without `--batch`) answers 0 slots, and every slot
+message gets `this worker has no batch slots (start it with --batch N)`. Another protocol is refused before the
+worker's own checks look at the hello (a protocol 7 hello's `build` would sit where `batch_slots` is): `the two sides
+differ (protocol 7/8: every stage needs the same Strata build ...)`, which `stage_link_lost` does not count, so
+neither a main process nor a relay waits for such a worker. The 15 earlier messages are byte for byte protocol 7's;
+a run without `--batch` sends none of the new ones.
+
+What the main process does with them: a batch admission (and a long read that gives way) copies the worker's session
+at the read's end into the slot with SlotSave, beside its own copy; each batch window sends the main process's rows
+for its S slot rows with SlotRun (the worker runs them through `run_slot_rows`, a relay passes the same message on
+with its own tag after its layers), and the window's accepted rows per slot with SlotCommit; a slot whose
+conversation goes back to the solo path, or continues in a later request, is copied back into the worker's session
+with SlotLoad (with a checkpoint id, that checkpoint part's state and the slot's K/V cells). A slot's checkpoints are
+copies of the main process's, and the worker's parts stay under the same id as long as the main process's keep list
+holds them (at most 64 ids: the main process's own first, then the slots' newest).
+
+Order and errors: the worker serves messages in arrival order and replies in that order; each SlotRunOk carries its
+SlotRun's tag back. The main process may send the next SlotRun before reading the last one's reply (stage 2); a reply
+whose tag is not the one the main process waits for fails the link (out of step). While a SlotRun's reply is
+outstanding the main process sends nothing that has a reply of another kind (`StageClient` refuses a SlotSave or
+SlotLoad then), and it sends no SlotRun while a prompt chunk's reply is outstanding. SlotRun and SlotCommit leave the
+session's position where it is; SlotSave needs the session at its position (as CkptSave); after SlotLoad it is at the
+load's position. A failed Commit or position table is SlotRun's and SlotSave's error, as Run's and CkptSave's; a
+SlotLoad drops a failed Commit (logged) as CkptRestore does. A failed or malformed SlotCommit is held and becomes the
+next SlotRun's, SlotSave's or SlotLoad's error; a Reset or CkptRestore does not drop it (the slots outlive a prompt).
+A malformed SlotRun (S out of range, bytes that do not add up, an unknown flag bit) is drained and answered `bad slot
+window`; a SlotSave or SlotLoad with a payload or a slot number out of range, `bad slot message`; the link goes on
+after each. A SlotLoad of a checkpoint id the worker does not hold is answered with the `checkpoint not held: `
+prefix, which `StageClient::slot_load` reports as `missing` (the main process then reads the prompt from token 0, as
+after a CkptRestore it cannot have). The worker checks the slot numbers against its n and keeps, per connection, which
+slots this main process has saved and how long each is (a hello and a disconnect clear them), so a slot it never
+filled is refused instead of read. `stage_link_batch_test` covers the link over loopback: protocol 7 refused both
+ways, the hello's fields, SlotRun with S = 1 to 8 in fp32 and bf16, three SlotRuns sent before any reply, a reply
+asked for out of order and one with another tag, SlotCommit's keep list and its failure across a Reset, SlotSave's
+position, SlotLoad's position and a missing id, malformed messages and a worker without slots, and that none of
+these errors counts as a lost link. The design and its open points: strata-mesh `IMPL-PLAN-remote-batch.md`.
 
 **Recovery.** The worker serves one connection at a time. A new one stays in the listen backlog, unread, until the
 served one has had no message read, being read, or a reply going out for `STRATA_REMOTE_TAKEOVER_S` (30 s; 0:
@@ -945,6 +994,10 @@ link that is the bottleneck.
   network partition and a Windows PC on either side were not; conversation checkpoints across stages
   ([CHECKPOINTS.md](CHECKPOINTS.md): built, opt-in with `--prompt-cache N`, checked on two GPUs; a relay is not
   run).
+- **Batch slots over a remote stage** (`--batch N` on every PC, protocol 8): built and covered over loopback
+  (`stage_link_batch_test`); not run on GPUs yet, so neither the batch windows' exactness against the solo path nor
+  their speed is measured. Stage 2 (pipelined slot groups over the link, `kStageBatchOverlap`) is designed into the
+  messages but not built.
 - **A ring topology** for three or more PCs.
 - **Windows as the main PC** (only workers were run on Windows), and the clock behaviour of an in-process split on
   Windows.

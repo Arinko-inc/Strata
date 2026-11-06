@@ -579,6 +579,9 @@ counter-based draw (Philox(seed, position)).
 - `--batch-groups` needs every stage on its own GPU. A pipelined slot is a conversation cache again (0.1.41): a request left alone in its slot goes back to the solo path with its drafts, as on one GPU.
 - The pipelined `--batch-groups` path adapts the VRAM tier only with `STRATA_PIPE_ADAPT_EVERY` (above).
 - The slot sessions take VRAM (above) and, with KV streaming, pinned RAM.
+- Over a remote stage ([REMOTE_STAGE.md](REMOTE_STAGE.md#what-is-turned-off-or-refused)) every PC needs `--batch N`,
+  the slots used are the fewest any stage carved, the groups are one, and `--vision` is refused with `--batch`
+  (built 2026-11-07, not yet measured on GPUs).
 
 ## Measured
 

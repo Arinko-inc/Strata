@@ -699,7 +699,9 @@ bool StageClient::connect(const std::string& host_port, const StageHello& mine, 
     {
         std::lock_guard<std::mutex> lq(q_mu_);
         sent_at_.clear();   // (a connection before this one: no chunk of it is outstanding here)
+        slot_sent_.clear();   // (nor a batch window)
     }
+    hf_ = mine.handoff_floats;
     StageHeader h;
     h.type = (uint32_t) StageMsg::Hello;
     h.bytes = sizeof mine;
@@ -787,7 +789,7 @@ bool StageClient::alive(std::string& err) {
 
 // the next reply: `want` with exactly reply_bytes of payload, or the worker's error (the connection then stays)
 bool StageClient::read_reply_(StageMsg want, void* reply, size_t reply_bytes, int64_t& worker_us, std::string& err,
-                              size_t rows, size_t width, double* conv_ms) {
+                              size_t rows, size_t width, double* conv_ms, int64_t* reply_c) {
     StageHeader r;
     if (broken_) { err = "remote stage: the link failed earlier"; return false; }
     if (!recv_header(S(fd_), r, err)) { break_(); return false; }
@@ -819,6 +821,7 @@ bool StageClient::read_reply_(StageMsg want, void* reply, size_t reply_bytes, in
         return false;
     }
     if (conv_ms != nullptr) *conv_ms += conv;
+    if (reply_c != nullptr) *reply_c = r.c;
     worker_us = r.a;
     stats_.bytes_in += sizeof r + reply_bytes;
     return true;
@@ -993,54 +996,193 @@ bool StageClient::ckpt_restore(int64_t id, int64_t L, const std::vector<int64_t>
     return false;
 }
 
-// ---- protocol 8: batch slots.  SKELETON (strata-mesh IMPL-PLAN-remote-batch.md section 4, 担当A): the wire format is
-// section 3.3; serve_stage answers these messages as unknown until then.
+// ---- protocol 8: batch slots (strata-mesh IMPL-PLAN-remote-batch.md section 3.3 / 3.4)
 namespace {
-bool slot_skeleton(const char* what, std::string& err) {
-    err = std::string("remote stage: ") + what + " is not in this build yet (remote-batch skeleton)";
-    return false;
+// a batch window's rows: S whole rows of the link's row width (the hello's handoff_floats, when this side sent one)
+bool slot_rows_ok(int S, size_t floats, int64_t hf, size_t& width, std::string& err) {
+    width = S > 0 ? floats / (size_t) S : 0;
+    if (S < 1 || width * (size_t) S != floats || width == 0 || (hf > 0 && (int64_t) width != hf)) {
+        err = "remote stage: a batch window's rows are not S whole rows of the hand-off width (S " + std::to_string(S) +
+              ", " + std::to_string(floats) + " floats)";
+        return false;
+    }
+    return true;
 }
 }  // namespace
+
+bool StageClient::slot_send_(int S, const int32_t* slots, const int32_t* tokens, const int64_t* pos, int64_t flags,
+                             int64_t tag, const float* rows_in, size_t in_floats, std::string& err) {
+    if (!connected()) { err = "remote stage: not connected"; return false; }
+    size_t w = 0;
+    if (!slot_rows_ok(S, in_floats, hf_, w, err)) return false;
+    if (slots == nullptr || tokens == nullptr || pos == nullptr || rows_in == nullptr) {
+        err = "remote stage: a batch window without its slots, tokens, positions or rows";
+        return false;
+    }
+    if ((flags & ~kStageSlotKeepAll) != 0) {
+        err = "remote stage: a batch window's flags " + std::to_string(flags) + " (protocol 8 knows bit 0 only)";
+        return false;
+    }
+    // slot[S], token[S], pos[S] in one piece, then the rows in the link's format (send_rows: fp32 as they are)
+    std::vector<unsigned char> head((size_t) S * 16);
+    std::memcpy(head.data(), slots, (size_t) S * 4);
+    std::memcpy(head.data() + (size_t) S * 4, tokens, (size_t) S * 4);
+    std::memcpy(head.data() + (size_t) S * 8, pos, (size_t) S * 8);
+    StageHeader h;
+    h.type = (uint32_t) StageMsg::SlotRun;
+    h.a = S;
+    h.b = flags;
+    h.c = tag;
+    h.bytes = (uint64_t) head.size() + stage_rows_bytes(rows_, (size_t) S, w);
+    {
+        std::lock_guard<std::mutex> lq(q_mu_);
+        slot_sent_.push_back(SlotSent{Clock::now(), tag, S});
+    }
+    if (!send_msg((sock_t) fd_, h, head.data(), head.size(), nullptr, 0, err) ||
+        !send_rows((sock_t) fd_, rows_, rows_in, (size_t) S, w, tx_, stats_.ms_encode, err)) {
+        break_();
+        return false;
+    }
+    stats_.bytes_out += sizeof h + h.bytes;
+    return true;
+}
+
+bool StageClient::slot_recv_(int64_t tag, int S, float* rows_out, size_t out_floats, std::string& err) {
+    if (!connected()) { err = "remote stage: not connected"; return false; }
+    size_t w = 0;
+    if (!slot_rows_ok(S, out_floats, hf_, w, err)) return false;
+    SlotSent sent;
+    {
+        std::lock_guard<std::mutex> lq(q_mu_);
+        if (slot_sent_.empty()) {
+            err = "remote stage: no batch window's reply is outstanding (tag " + std::to_string(tag) + ")";
+            return false;
+        }
+        sent = slot_sent_.front();
+        slot_sent_.pop_front();
+    }
+    if (sent.tag != tag || sent.S != S) {
+        // the caller's books and the link's order disagree: whatever comes next is someone else's reply
+        err = "remote stage: the oldest batch window outstanding is tag " + std::to_string(sent.tag) + " (" +
+              std::to_string(sent.S) + " rows), not tag " + std::to_string(tag) + " (" + std::to_string(S) +
+              " rows): the link is out of step";
+        break_();
+        return false;
+    }
+    const bool f32 = rows_ == StageRows::F32;
+    const size_t reply_bytes = stage_rows_bytes(rows_, (size_t) S, w);
+    int64_t wus = 0, c = 0;
+    if (!read_reply_(StageMsg::SlotRunOk, rows_out, reply_bytes, wus, err, f32 ? 0 : (size_t) S, w, &stats_.ms_decode,
+                     &c))
+        return false;   // (the worker's error: the window is answered, the link goes on; else it is broken)
+    if (c != tag) {
+        err = "remote stage: the reply to batch window " + std::to_string(tag) + " came with tag " + std::to_string(c) +
+              " (the link is out of step)";
+        break_();
+        return false;
+    }
+    const double ms = ms_since(sent.at);
+    ++stats_.slot_runs;
+    stats_.ms_slot_run += ms;
+    slot_worker_ms_ += (double) wus / 1000.0;
+    if (remote_timing() && (stats_.slot_runs & 63) == 0)
+        std::fprintf(stderr, "strata remote: %llu batch windows: mean %.2f ms from the send to the rows = worker %.2f "
+                             "+ link and queue %.2f (last: S=%d, %.2f = %.2f + %.2f)\n",
+                     (unsigned long long) stats_.slot_runs, stats_.ms_slot_run / (double) stats_.slot_runs,
+                     slot_worker_ms_ / (double) stats_.slot_runs,
+                     (stats_.ms_slot_run - slot_worker_ms_) / (double) stats_.slot_runs, S, ms, (double) wus / 1000.0,
+                     ms - (double) wus / 1000.0);
+    return true;
+}
 
 bool StageClient::slot_run(int S, const int32_t* slots, const int32_t* tokens, const int64_t* pos, int64_t flags,
                            int64_t tag, const float* rows_in, size_t in_floats, float* rows_out, size_t out_floats,
                            std::string& err) {
-    // TODO(remote-batch A): slot_run_send, then slot_run_recv
-    (void) S; (void) slots; (void) tokens; (void) pos; (void) flags; (void) tag; (void) rows_in; (void) in_floats;
-    (void) rows_out; (void) out_floats;
-    return slot_skeleton("SlotRun", err);
+    std::lock_guard<std::mutex> ls(send_mu_);
+    std::lock_guard<std::mutex> lr(recv_mu_);
+    size_t w = 0;
+    if (!slot_rows_ok(S, out_floats, hf_, w, err)) return false;   // (before anything goes out)
+    return slot_send_(S, slots, tokens, pos, flags, tag, rows_in, in_floats, err) &&
+           slot_recv_(tag, S, rows_out, out_floats, err);
 }
 
 bool StageClient::slot_run_send(int S, const int32_t* slots, const int32_t* tokens, const int64_t* pos, int64_t flags,
                                 int64_t tag, const float* rows_in, size_t in_floats, std::string& err) {
-    // TODO(remote-batch A)
-    (void) S; (void) slots; (void) tokens; (void) pos; (void) flags; (void) tag; (void) rows_in; (void) in_floats;
-    return slot_skeleton("SlotRun", err);
+    std::lock_guard<std::mutex> ls(send_mu_);
+    return slot_send_(S, slots, tokens, pos, flags, tag, rows_in, in_floats, err);
 }
 
 bool StageClient::slot_run_recv(int64_t tag, int S, float* rows_out, size_t out_floats, std::string& err) {
-    // TODO(remote-batch A)
-    (void) tag; (void) S; (void) rows_out; (void) out_floats;
-    return slot_skeleton("SlotRunOk", err);
+    std::lock_guard<std::mutex> lr(recv_mu_);
+    return slot_recv_(tag, S, rows_out, out_floats, err);
 }
 
 bool StageClient::slot_commit(const int32_t* keep, int n, int64_t tag, std::string& err) {
-    // TODO(remote-batch A)
-    (void) keep; (void) n; (void) tag;
-    return slot_skeleton("SlotCommit", err);
+    std::lock_guard<std::mutex> lk(send_mu_);
+    if (!connected()) { err = "remote stage: not connected"; return false; }
+    if (n < 1 || n > kStageSlotMax || keep == nullptr) {
+        err = "remote stage: a batch commit of " + std::to_string(n) + " slots (1.." + std::to_string(kStageSlotMax) +
+              ")";
+        return false;
+    }
+    StageHeader h;
+    h.type = (uint32_t) StageMsg::SlotCommit;
+    h.a = n;
+    h.c = tag;
+    h.bytes = (uint64_t) n * sizeof(int32_t);
+    if (!send_msg(S(fd_), h, keep, (size_t) h.bytes, nullptr, 0, err)) { break_(); return false; }
+    stats_.bytes_out += sizeof h + h.bytes;
+    ++stats_.slot_commits;
+    return true;
+}
+
+bool StageClient::slot_call_(StageMsg type, StageMsg want, int64_t a, int64_t b, int64_t c, int64_t& worker_us,
+                             std::string& err) {
+    std::lock_guard<std::mutex> ls(send_mu_);
+    std::lock_guard<std::mutex> lr(recv_mu_);
+    if (!connected()) { err = "remote stage: not connected"; return false; }
+    size_t windows = 0;
+    {
+        std::lock_guard<std::mutex> lq(q_mu_);
+        windows = slot_sent_.size();
+    }
+    if (windows > 0) {   // (their replies come first: this one's would be read in their place)
+        err = std::string("remote stage: a ") + (type == StageMsg::SlotSave ? "SlotSave" : "SlotLoad") + " while " +
+              std::to_string(windows) + " batch windows' replies are outstanding";
+        return false;
+    }
+    if (a < 0 || a >= kStageSlotMax || b < 0) {
+        err = "remote stage: slot " + std::to_string(a) + " at " + std::to_string(b) + " (slots 0.." +
+              std::to_string(kStageSlotMax - 1) + ")";
+        return false;
+    }
+    StageHeader h;
+    h.type = (uint32_t) type;
+    h.a = a;
+    h.b = b;
+    h.c = c;
+    if (!send_msg(S(fd_), h, nullptr, 0, nullptr, 0, err)) { break_(); return false; }
+    stats_.bytes_out += sizeof h;
+    return read_reply_(want, nullptr, 0, worker_us, err);
 }
 
 bool StageClient::slot_save(int slot, int64_t L, std::string& err) {
-    // TODO(remote-batch A)
-    (void) slot; (void) L;
-    return slot_skeleton("SlotSave", err);
+    int64_t wus = 0;
+    if (!slot_call_(StageMsg::SlotSave, StageMsg::SlotSaveOk, slot, L, 0, wus, err)) return false;
+    ++stats_.slot_saves;
+    return true;
 }
 
 bool StageClient::slot_load(int slot, int64_t L, int64_t ckpt_id, bool& missing, std::string& err) {
-    // TODO(remote-batch A)
-    (void) slot; (void) L; (void) ckpt_id;
+    int64_t wus = 0;
     missing = false;
-    return slot_skeleton("SlotLoad", err);
+    if (slot_call_(StageMsg::SlotLoad, StageMsg::SlotLoadOk, slot, L, ckpt_id, wus, err)) {
+        ++stats_.slot_loads;
+        return true;
+    }
+    // as ckpt_restore: the worker's own text starting with kStageCkptMissing (a relay passes its next worker's on so)
+    missing = ckpt_id != 0 && connected() && err.rfind(std::string("remote stage (worker): ") + kStageCkptMissing, 0) == 0;
+    return false;
 }
 
 bool StageClient::positions(const int32_t* table, int64_t cells, std::string& err) {
@@ -1069,6 +1211,9 @@ struct Inbox {
     std::vector<float> rows;    ///< a window's rows, fp32 (copied to run_in by the serving thread)
     double decode_ms = 0;       ///< the rows' conversion from the link's format (the receiving thread's)
     std::vector<int64_t> keep;  ///< Reset / CkptSave / CkptRestore: the checkpoint ids the main process holds
+    std::vector<int32_t> slots32;   ///< SlotRun: each row's slot (its tokens in tok32, its rows in rows)
+    std::vector<int64_t> pos64;     ///< SlotRun: each row's position
+    std::vector<int32_t> keep32;    ///< SlotCommit: the rows each slot keeps
     StageHello hello;
     int slot = -1;
     std::string bad;            ///< the message was malformed: reply this error
@@ -1381,6 +1526,43 @@ int serve_stage(const std::string& bind_addr, int port, const std::string& token
                             in.keep.resize((size_t) (in.h.bytes / 8));
                             if (!recv_all(fd, in.keep.data(), (size_t) in.h.bytes, in.err)) in.closed = true;
                         }
+                    } else if (type == StageMsg::SlotRun) {
+                        // protocol 8, a batch window: S bounded before any product with it, as a window's T
+                        const int64_t S = in.h.a;
+                        const int64_t max_s =
+                            (int64_t) (buf.run_floats / (size_t) std::max<int64_t>(buf.handoff_floats, 1));
+                        const bool fits = S >= 1 && S <= max_s && (in.h.b & ~kStageSlotKeepAll) == 0;
+                        const size_t rows_bytes =
+                            fits ? stage_rows_bytes(fmt, (size_t) S, (size_t) buf.handoff_floats) : 0;
+                        if (!fits || in.h.bytes != (uint64_t) S * 16 + rows_bytes) {
+                            in.bad = "bad slot window";
+                            if (!drain(fd, in.h.bytes, in.err)) in.closed = true;
+                        } else {
+                            in.slots32.resize((size_t) S);
+                            in.tok32.resize((size_t) S);
+                            in.pos64.resize((size_t) S);
+                            in.rows.resize((size_t) S * (size_t) buf.handoff_floats);
+                            if (!recv_all(fd, in.slots32.data(), (size_t) S * 4, in.err) ||
+                                !recv_all(fd, in.tok32.data(), (size_t) S * 4, in.err) ||
+                                !recv_all(fd, in.pos64.data(), (size_t) S * 8, in.err) ||
+                                !recv_rows(fd, fmt, in.rows.data(), (size_t) S, (size_t) buf.handoff_floats, wire,
+                                           in.decode_ms, in.err))
+                                in.closed = true;
+                        }
+                    } else if (type == StageMsg::SlotCommit) {
+                        const int64_t m = in.h.a;   // (bounded first)
+                        if (m < 1 || m > kStageSlotMax || in.h.bytes != (uint64_t) m * 4) {
+                            in.bad = "bad slot commit";
+                            if (!drain(fd, in.h.bytes, in.err)) in.closed = true;
+                        } else {
+                            in.keep32.resize((size_t) m);
+                            if (!recv_all(fd, in.keep32.data(), (size_t) m * 4, in.err)) in.closed = true;
+                        }
+                    } else if (type == StageMsg::SlotSave || type == StageMsg::SlotLoad) {
+                        if (in.h.bytes != 0 || in.h.a < 0 || in.h.a >= kStageSlotMax || in.h.b < 0) {
+                            in.bad = "bad slot message";
+                            if (!drain(fd, in.h.bytes, in.err)) in.closed = true;
+                        }
                     } else if (type != StageMsg::Commit) {
                         in.bad = "unknown message type " + std::to_string(in.h.type);
                         if (!drain(fd, in.h.bytes, in.err)) in.closed = true;
@@ -1413,6 +1595,17 @@ int serve_stage(const std::string& bind_addr, int port, const std::string& token
             pos_err.clear();
             return e;
         };
+        // protocol 8: a failed SlotCommit (or a malformed one), reported on the next SlotRun's, SlotSave's or
+        // SlotLoad's reply - a Reset or a CkptRestore does not drop it (the slots outlive a prompt)
+        std::string slot_err;
+        auto join_err = [](std::string a, const std::string& b) { return a.empty() ? b : b.empty() ? a : a + "; " + b; };
+        auto take_slot_err = [&]() {
+            std::string e = slot_err;
+            slot_err.clear();
+            return e;
+        };
+        const bool has_slots = h.slot_run && h.slot_commit && h.slot_save && h.slot_load;
+        static constexpr const char* kNoSlots = "this worker has no batch slots (start it with --batch N)";
         bool greeted = false;
         // the position the session holds (a checkpoint is saved only there): a chunk's end, a window's first
         // position plus its accepted count, 0 after a reset, L after a checkpoint restore
@@ -1590,6 +1783,10 @@ int serve_stage(const std::string& bind_addr, int port, const std::string& token
                     pos_err = in.bad;
                     continue;
                 }
+                if (type == StageMsg::SlotCommit) {
+                    slot_err = join_err(slot_err, in.bad);
+                    continue;
+                }
                 if (!reply_error(in.bad)) break;
                 continue;
             }
@@ -1606,10 +1803,23 @@ int serve_stage(const std::string& bind_addr, int port, const std::string& token
                     keep = false;
                     break;
                 }
+                // another protocol is refused before the handler sees the hello (its fields may sit elsewhere: protocol
+                // 7's batch_slots are the end of its build text)
+                if (in.hello.protocol != kStageProtocol) {
+                    (void) hello_matches(in.hello, StageHello{}, he);
+                    (void) reply_error(he);
+                    keep = false;
+                    break;
+                }
                 if (!h.hello(in.hello, mine, he) || !hello_matches(in.hello, mine, he)) {
                     (void) reply_error(he);
                     keep = false;
                     break;
+                }
+                // protocol 8: a worker without the slot handlers has no batch slots, whatever its handler said
+                if (!has_slots) {
+                    mine.batch_slots = 0;
+                    mine.batch_flags = 0;
                 }
                 // (after the protocol check: an older peer's hello has its build text here)
                 if (const std::string r = ckpt_max_refusal(in.hello); !r.empty()) {
@@ -1812,6 +2022,106 @@ int serve_stage(const std::string& bind_addr, int port, const std::string& token
                 StageHeader r;
                 r.type = (uint32_t) StageMsg::CkptRestoreOk;
                 if (!send_msg(fd, r, nullptr, 0, nullptr, 0, err)) keep = false;
+                break;
+            }
+            // ---- protocol 8: batch slots (strata-mesh IMPL-PLAN-remote-batch.md section 3.4).  A slot message does not
+            // move `pos`, except a SlotLoad (to its L).  Every one waits for a chunk's reply still going out first (a
+            // relay's handler talks to its next worker, whose link that reply's thread reads).
+            case StageMsg::SlotRun: {
+                const int S = (int) in.h.a;
+                if (!replies_out()) { keep = false; break; }
+                std::memcpy(buf.run_in, in.rows.data(), in.rows.size() * 4);
+                stats.ms_decode += in.decode_ms;
+                std::string e;
+                bool ok = false;
+                if (!has_slots) e = kNoSlots;
+                else if (!pending_err.empty() || !pos_err.empty() || !slot_err.empty())
+                    e = join_err(take_pending(), take_slot_err());
+                else ok = h.slot_run(S, in.slots32.data(), in.tok32.data(), in.pos64.data(), in.h.b, e);
+                if (!ok) {
+                    keep = reply_error(e.empty() ? std::string("the batch window failed") : e);
+                    break;
+                }
+                StageHeader r;
+                r.type = (uint32_t) StageMsg::SlotRunOk;
+                r.a = (int64_t) (ms_since(t0) * 1000.0);   // the worker's own time, microseconds
+                r.c = in.h.c;                              // the window's tag, as it came
+                r.bytes = stage_rows_bytes(rows_fmt, (size_t) S, (size_t) buf.handoff_floats);
+                if (!send_msg(fd, r, nullptr, 0, nullptr, 0, err) ||
+                    !send_rows(fd, rows_fmt, buf.run_out, (size_t) S, (size_t) buf.handoff_floats, run_tx,
+                               stats.ms_encode, err))
+                    keep = false;
+                stats.bytes_out += sizeof r + r.bytes;
+                ++stats.slot_runs;
+                stats.ms_slot_run += ms_since(t0);
+                break;
+            }
+            case StageMsg::SlotCommit: {
+                // one way: a failure is the next slot message's error (a later commit is not applied over it)
+                std::string e;
+                if (!replies_out()) { keep = false; break; }
+                if (!has_slots) slot_err = join_err(slot_err, kNoSlots);
+                else if (slot_err.empty() && !h.slot_commit(in.keep32.data(), (int) in.h.a, e))
+                    slot_err = e.empty() ? std::string("the batch commit failed") : e;
+                ++stats.slot_commits;
+                break;
+            }
+            case StageMsg::SlotSave: {
+                // as a CkptSave: the session must be where the main process thinks
+                std::string e;
+                bool ok = false;
+                if (!replies_out()) { keep = false; break; }
+                if (!has_slots) e = kNoSlots;
+                else if (!pending_err.empty() || !pos_err.empty() || !slot_err.empty())
+                    e = join_err(take_pending(), take_slot_err());
+                else if (in.h.b != pos)
+                    e = "a slot save at " + std::to_string(in.h.b) + ", the worker's session is at " + std::to_string(pos);
+                else ok = h.slot_save((int) in.h.a, in.h.b, e);
+                if (!ok) {
+                    keep = reply_error(e.empty() ? std::string("the slot save failed") : e);
+                    break;
+                }
+                StageHeader r;
+                r.type = (uint32_t) StageMsg::SlotSaveOk;
+                r.a = (int64_t) (ms_since(t0) * 1000.0);
+                if (!send_msg(fd, r, nullptr, 0, nullptr, 0, err)) keep = false;
+                stats.bytes_out += sizeof r;
+                ++stats.slot_saves;
+                break;
+            }
+            case StageMsg::SlotLoad: {
+                // as a CkptRestore: the session is replaced, so a Commit that failed before no longer matters (logged);
+                // a failed position table does, and so does a failed SlotCommit
+                std::string e;
+                bool ok = false;
+                if (!replies_out()) { keep = false; break; }
+                if (!has_slots) {
+                    e = kNoSlots;
+                } else {
+                    if (!pending_err.empty()) {
+                        std::fprintf(stderr, "strata stage worker: a commit failed before a slot load: %s\n",
+                                     pending_err.c_str());
+                        std::fflush(stderr);
+                        pending_err.clear();
+                    }
+                    if (!pos_err.empty() || !slot_err.empty()) {
+                        e = join_err(pos_err, take_slot_err());
+                        pos_err.clear();
+                    } else {
+                        ok = h.slot_load((int) in.h.a, in.h.b, in.h.c, e);
+                    }
+                }
+                if (!ok) {
+                    keep = reply_error(e.empty() ? std::string("the slot load failed") : e);
+                    break;
+                }
+                pos = in.h.b;
+                StageHeader r;
+                r.type = (uint32_t) StageMsg::SlotLoadOk;
+                r.a = (int64_t) (ms_since(t0) * 1000.0);
+                if (!send_msg(fd, r, nullptr, 0, nullptr, 0, err)) keep = false;
+                stats.bytes_out += sizeof r;
+                ++stats.slot_loads;
                 break;
             }
             default:

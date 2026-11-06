@@ -262,7 +262,14 @@ private:
     /// `rows` > 0: the payload is that many rows of `width` floats in the link's format, read into `reply` (floats),
     /// their conversion's time added to *conv_ms
     bool read_reply_(StageMsg want, void* reply, size_t reply_bytes, int64_t& worker_us, std::string& err,
-                     size_t rows = 0, size_t width = 0, double* conv_ms = nullptr);
+                     size_t rows = 0, size_t width = 0, double* conv_ms = nullptr, int64_t* reply_c = nullptr);
+    /// slot_run_send / slot_run_recv with send_mu_ (recv_mu_) already held (slot_run holds both, as run does)
+    bool slot_send_(int S, const int32_t* slots, const int32_t* tokens, const int64_t* pos, int64_t flags, int64_t tag,
+                    const float* rows_in, size_t in_floats, std::string& err);
+    bool slot_recv_(int64_t tag, int S, float* rows_out, size_t out_floats, std::string& err);
+    /// SlotSave / SlotLoad: header only, a reply without payload; `want` its type
+    bool slot_call_(StageMsg type, StageMsg want, int64_t a, int64_t b, int64_t c, int64_t& worker_us,
+                    std::string& err);
     /// a synchronous message with a keep[] payload (Reset, CkptSave, CkptRestore); `reply_a`: the reply's `a`
     bool keep_call_(StageMsg type, StageMsg want, int64_t a, int64_t b, const std::vector<int64_t>& keep,
                     int64_t& reply_a, std::string& err);
@@ -281,6 +288,15 @@ private:
     };
     std::deque<Sent> sent_at_;   ///< outstanding chunks (timing)
     uint64_t sent_seq_ = 0;
+    /// protocol 8: the batch windows sent whose replies are not read yet, oldest first (q_mu_'s)
+    struct SlotSent {
+        std::chrono::steady_clock::time_point at;   ///< the send's start
+        int64_t tag = 0;
+        int S = 0;
+    };
+    std::deque<SlotSent> slot_sent_;
+    int64_t hf_ = 0;                 ///< this side's hello's handoff_floats: a batch window row's width (connect)
+    double slot_worker_ms_ = 0;      ///< the worker's own share of stats_.ms_slot_run (STRATA_REMOTE_TIMING)
     std::vector<unsigned char> tx_, rx_;   ///< a slice of rows in the link's format (not fp32): send_mu_'s, recv_mu_'s
     StageStats stats_;
 };

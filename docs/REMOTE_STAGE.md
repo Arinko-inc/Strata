@@ -700,7 +700,17 @@ python3 tools/stage_tune.py apply cluster.json OUTDIR    # start the workers as 
 
 ## What is turned off or refused
 
-- **Refused at start** with a remote stage: `--batch`, `--peer-device`, `--control-vector` (and the speed
+- **Batch slots** (`--batch N`, the server's `"parallel": N`) work with a remote stage when **every PC starts with
+  `--batch N`**: each worker carves a session per slot for its own layers at its start (before its expert cache, so
+  the slots' VRAM comes out of the cache), and the main process uses the fewest slots any stage has (it says so in its
+  log and in a second `INFO batch_slots=` line). A worker without `--batch` answers every slot message with an error
+  naming `--batch`. Every PC needs the same build (protocol 8: an older worker is refused for its protocol). With a
+  remote stage, `--vision` and `--batch` together are refused, `--batch-groups` above 1 runs one group (the log says
+  why), `--batch-mtp` is turned off (as on a layer split with two stages on one GPU) and so is `--pipeline-windows`
+  (as with any `--batch`).
+  Built 2026-11-07 and covered over loopback; not yet measured on GPUs. The protocol:
+  [ENGINEERING.md](remote-stage/ENGINEERING.md#the-protocol).
+- **Refused at start** with a remote stage: `--peer-device`, `--control-vector` (and the speed
   projection, which is one), `--expert-cache-remote`, `--prefill-head-alias`, and `--pipeline-windows` on a worker
   (the main process takes it, see [Overlapping the decode windows](#overlapping-the-decode-windows---pipeline-windows-2)).
   So are a Qwen3.6-35B-A3B file (its own engine path, one GPU) and the Metal build.
