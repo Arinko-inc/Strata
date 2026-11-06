@@ -3642,10 +3642,11 @@ int main(int argc, char** argv) {
         else if (!o.serve) why = "it needs --serve";
         else if (remote_main && (!split_same || split_at.size() != 1))
             why = "--remote-stage needs --layer-split K --split-device 0 (layers K.. run in the worker)";
-        // remote-batch (protocol 8, strata-mesh IMPL-PLAN-remote-batch.md): --batch over the link.  SKELETON: refused
-        // until the main process's part is in (担当D removes this line)
-        else if (remote_main && o.batch > 0)
-            why = "--batch over a remote stage is not in this build yet (remote-batch: the main process)";
+        // remote-batch (protocol 8, strata-mesh IMPL-PLAN-remote-batch.md): --batch runs over the link, but not with
+        // pictures - the worker holds one position table (StageMsg::Positions), not one per slot
+        else if (remote_main && o.batch > 0 && o.vision)
+            why = "--batch with --vision over a remote stage is not supported (the worker holds one position table, "
+                  "not one per batch slot)";
         else if (stage_worker && (!o.layer_split.empty() || o.stage_begin < 2 ||
                                   o.stage_begin >= strata::core::ModelGeometry{}.n_layers))
             why = "--stage-worker needs --stage-begin K (2 <= K < the layer count: the main process's --layer-split K) "
@@ -6236,6 +6237,13 @@ int main(int argc, char** argv) {
                          r.groups == 1 ? "" : "s", o.batch / r.groups, o.batch / r.groups == 1 ? "" : "s");
     };
     if (o.batch > 0) resolve_groups_auto();
+    // remote-batch, stage 1: a remote stage's main process runs its slots in one group (its windows go through the
+    // worker in turn); the pipelined groups over the link are stage 2 (IMPL-PLAN-remote-batch.md section 3.12)
+    if (remote_main && o.batch > 0 && o.batch_groups > 1) {
+        std::fprintf(stderr, "strata generate: --batch-groups %d is one group over a remote stage (the slot groups do "
+                             "not pipeline over the link yet)\n", o.batch_groups);
+        o.batch_groups = 1;
+    }
     if (o.batch > 0 && o.batch_groups > 1 && (stages.empty() || o.batch % o.batch_groups != 0)) {
         std::fprintf(stderr, "strata generate: WARNING: --batch-groups %d needs a layer split and to divide --batch %d; "
                              "one group\n", o.batch_groups, o.batch);
@@ -9877,6 +9885,11 @@ int main(int argc, char** argv) {
         // `--prefill auto` split could stop at start with "device buffers for a chunk of 2048 tokens do not fit".  A
         // chunk that does not fit is tried again one size smaller, down to 512 tokens (a smaller chunk only reads slower).
         strata::net::StageClient remote_link;   // remote-stage: the worker that runs layers [K, n_layers)
+        // remote-batch (protocol 8): the batch slots this link agreed - the main process's --batch once the worker's
+        // hello is in (the fewer of the two sides' slots; 0: none, then no slot message goes out) - and the tag of the
+        // last batch window sent (its SlotCommit names it)
+        int remote_slots_n = 0;
+        int64_t remote_slot_tag = 0;
         strata::net::StageClient next_link;     // remote-stage relay worker: the next worker
         strata::net::StageRelay relay(next_link);
         int64_t relay_skip = 0;                 // the chunk's skip from the main process (the reply leaves those rows out)
@@ -10251,8 +10264,61 @@ int main(int argc, char** argv) {
                 ver_same.set_remote(remote_run_of(out0, rx),
                                     [&remote_link](int n_keep, std::string& e) { return remote_link.commit(n_keep, e); },
                                     [&remote_link] { remote_link.abort(); });
-                // TODO(remote-batch D): with --batch, ver_same.set_remote_slots(...): SlotRun with out0's rows [0, S)
-                // into rx, SlotCommit (IMPL-PLAN-remote-batch.md section 7.2 D-4)
+                // remote-batch (protocol 8, IMPL-PLAN-remote-batch.md sections 3.1 and 3.7): a batch window's worker
+                // part.  Stage 0 has written its rows [0, S) of the hand-off (run_slot_rows synchronised it), the head
+                // stage sends them as a SlotRun and reads the worker's rows back into its own hand-off, `rx`; the
+                // commit sends each slot's kept rows (one way), as many slots as the link agreed.
+                if (o.batch > 0) {
+                    static MainGap sgap;   // STRATA_REMOTE_TIMING=1: as `gap`, for the batch windows
+                    sgap.on = gap.on;
+                    ver_same.set_remote_slots(
+                        [&remote_link, &remote_slot_tag, out0, rx, HBF](const int* rows, int S, const int32_t* tokens,
+                                                                       const int64_t* pos, std::string& e) -> bool {
+                            if (S < 1 || S > (int) strata::kernels::kVerifyMaxT) {
+                                e = "remote stage: a batch window of " + std::to_string(S) + " rows";
+                                return false;
+                            }
+                            int32_t slots[strata::kernels::kVerifyMaxT] = {};
+                            for (int t = 0; t < S; ++t) slots[t] = (int32_t) rows[t];
+                            const auto t0 = Clock::now();
+                            if (sgap.on && sgap.last.time_since_epoch().count() != 0) {
+                                const double d = std::chrono::duration<double, std::milli>(t0 - sgap.last).count();
+                                if (d < 1000.0) {   // (a longer gap is the slots going idle, or a prompt read)
+                                    sgap.ms += d;
+                                    if (++sgap.n % 64 == 0) {
+                                        std::fprintf(stderr, "strata remote: main process between batch windows "
+                                                             "%.2f ms each (64 windows: head, sampling, layers 0-K)\n",
+                                                     sgap.ms / 64);
+                                        sgap.ms = 0;
+                                    }
+                                }
+                            }
+                            const bool ok = remote_link.slot_run(S, slots, tokens, pos, 0, ++remote_slot_tag, out0,
+                                                                 (size_t) S * HBF, rx, (size_t) S * HBF, e);
+                            sgap.last = Clock::now();
+                            return ok;
+                        },
+                        // keep[]: this verifier's capacity (the slot sessions carved); the link agreed the first
+                        // remote_slots_n of them, and no window holds a slot past those
+                        [&remote_link, &remote_slot_tag, &remote_slots_n](const int* keep, int n,
+                                                                          std::string& e) -> bool {
+                            const int m = remote_slots_n;
+                            if (m < 1 || m > n || m > strata::net::kStageSlotMax) {
+                                e = "remote stage: a batch commit with " + std::to_string(m) + " agreed slots of " +
+                                    std::to_string(n);
+                                return false;
+                            }
+                            for (int s = m; s < n; ++s)
+                                if (keep[s] != 0) {
+                                    e = "remote stage: a batch window kept rows of slot " + std::to_string(s) +
+                                        ", past the " + std::to_string(m) + " slots the link agreed";
+                                    return false;
+                                }
+                            int32_t k32[strata::net::kStageSlotMax] = {};
+                            for (int s = 0; s < m; ++s) k32[s] = (int32_t) keep[s];
+                            return remote_link.slot_commit(k32, m, remote_slot_tag, e);
+                        });
+                }
             }
             for (int st = 1; st < n_stages; ++st) {
                 bool ok_s = false;
@@ -10442,8 +10508,6 @@ int main(int argc, char** argv) {
             }
         }
         // each stage's verifier gets its stage's slot sessions
-        // TODO(remote-batch D): a remote stage's main process gives ver_same (the head on the worker's rows) the slot
-        // sessions of stage 0 too (D-3)
         if (o.batch > 0) {
             for (size_t k = 0; k < bslot_ss.size(); ++k) {
                 std::vector<strata::core::SessionState*> ptrs;
@@ -10452,6 +10516,13 @@ int main(int argc, char** argv) {
                 const strata::core::OnDevice on_k(k == 0 ? 0 : stages[k - 1]->dev);
                 if (!vk.init_slots(ptrs, err)) {
                     std::fprintf(stderr, "strata serve: --batch, stage %zu: %s\n", k + 1, err.c_str());
+                    return 1;
+                }
+                // remote-batch: a remote stage's main process runs the head on the worker's rows in `ver_same`, a
+                // second verifier on stage 0's session (the same carve, so the same slot sessions): its batch windows
+                // sample each slot's row with that slot's settings, and hold no layer (no commit graph: verify.cpp)
+                if (k == 0 && remote_main && !ver_same.init_slots(ptrs, err)) {
+                    std::fprintf(stderr, "strata serve: --batch, the head on the remote stage's rows: %s\n", err.c_str());
                     return 1;
                 }
                 // STRATA_PIPED_MTP: the rows a group's commit replays after the verdict, one hand-off row each
@@ -11084,6 +11155,15 @@ int main(int argc, char** argv) {
                                                                tail_flags.get(), pin_flags.get());
         };
         int32_t remote_ckpt_id = 0;   // remote-stage: the last id a checkpoint's worker part got (from 1, never reused)
+        // remote-batch (IMPL-PLAN-remote-batch.md section 3.8): a keep[] for the worker (the main chain's ids first, and
+        // the one being saved) gets the ids of the batch slots' checkpoints too, so their worker parts stay - newest
+        // first, up to the worker's limit; a slot checkpoint whose id does not fit leaves its slot, as its part leaves
+        // the worker.  Set once the slots exist (below, with `bs`); unset - no --batch on a remote stage - nothing.
+        std::function<void(std::vector<int64_t>&)> remote_keep_slots;
+        // remote-batch: the last checkpoint id given out when the link was last made again with batch slots - the parts
+        // up to it went with the old connection (ids are never reused), so the checkpoints that carry one are dropped
+        // at the next request's start (remote_relink_slots, below).  0: never.
+        int32_t remote_slot_floor = 0;
         StageThreads ckpt_threads;   // STRATA_CKPT_THREADS: the later stages' parts of a checkpoint (started on first use)
         auto checkpoint_at = [&](int64_t L, std::vector<ConvCheckpoint>* parts = nullptr, bool as_tail = false) -> bool {
             ckpt_why.clear();
@@ -11119,6 +11199,7 @@ int main(int argc, char** argv) {
                 for (const ConvCheckpoint* k : after)
                     if (k->remote_id != 0) keep.push_back(k->remote_id);
                 if (std::find(keep.begin(), keep.end(), c.remote_id) == keep.end()) keep.push_back(c.remote_id);
+                if (remote_keep_slots) remote_keep_slots(keep);   // remote-batch: and the slots' (section 3.8)
                 // the part's windows are on the wire before this (read_windows_pl ends with nothing in flight), and
                 // a pipelined window that failed meanwhile is not saved over
                 if (!pl_drain_err.empty()) {
@@ -12902,8 +12983,19 @@ int main(int argc, char** argv) {
             // conversation checkpoints: the parts the main process may have the worker keep (the chain and the one
             // being saved); a worker's own hello: its limit
             me.ckpt_max = stage_worker ? strata::net::kStageCkptMax : o.prompt_cache > 0 ? o.prompt_cache + 1 : 0;
-            // TODO(remote-batch D): with --batch the main process's ckpt_max covers the slots' checkpoints too
-            // (IMPL-PLAN-remote-batch.md section 3.8)
+            // remote-batch (IMPL-PLAN-remote-batch.md section 3.8): the batch slots keep copies of the chain's
+            // checkpoints, whose parts the worker keeps too - up to (chain + 1) per slot beside the chain's own, never
+            // more than the worker's limit (the slots' oldest give way first: remote_keep_slots).  A chain the limit
+            // cannot hold (--prompt-cache 64 or more) is still asked for whole, so the worker refuses it as before.
+            if (remote_main && o.batch > 0 && o.prompt_cache > 0) {
+                const int64_t want = (int64_t) (o.prompt_cache + 1) * (int64_t) (1 + o.batch);
+                me.ckpt_max = std::max<int32_t>(o.prompt_cache + 1,
+                                                (int32_t) std::min<int64_t>(strata::net::kStageCkptMax, want));
+                if (want > strata::net::kStageCkptMax)
+                    std::fprintf(stderr, "strata serve: remote stage: --prompt-cache %d with --batch %d may keep more "
+                                         "than %d checkpoints on the worker: the batch slots' oldest ones are dropped "
+                                         "first\n", o.prompt_cache, o.batch, (int) strata::net::kStageCkptMax);
+            }
             // protocol 8: the batch slots this process runs - a main process its --batch after its own carve, a worker
             // the slot sessions it carved (a relay's hello takes the fewer of its own and its next worker's)
             me.batch_slots = o.batch > 0 ? (int32_t) o.batch : 0;
@@ -12948,6 +13040,23 @@ int main(int argc, char** argv) {
                              "rows %s)\n", o.remote_stage.c_str(), remote_peer.layer_begin, remote_peer.n_layers - 1,
                              (long long) remote_peer.chunk, (long long) remote_peer.max_context,
                              strata::net::stage_rows_name(remote_link.rows()));
+                // remote-batch (IMPL-PLAN-remote-batch.md section 3.7): the slots run are the fewer of this process's
+                // (carved above: the capacity) and the worker's (a relay's: the fewer of its own and its next
+                // worker's); fewer than 2: none.  The rest of the capacity stays carved and unused.  The server reads
+                // the INFO lines up to READY and keeps the last value, so this second line is the one it runs.
+                if (o.batch > 0) {
+                    const int cap_main = o.batch;
+                    const int n = std::min(cap_main, std::max<int>(0, remote_peer.batch_slots));
+                    if (n < cap_main)
+                        std::fprintf(stderr, "strata serve: remote stage: the worker has %d batch slots, this main process "
+                                             "carved %d: %s\n", (int) remote_peer.batch_slots, cap_main,
+                                     n >= 2 ? (std::to_string(n) + " slots").c_str()
+                                            : "no batch slots (2 or more on both sides run them; start the worker "
+                                              "with --batch N)");
+                    o.batch = n >= 2 ? n : 0;
+                    remote_slots_n = o.batch;
+                    std::printf("INFO batch_slots=%d batch_groups=1\n", o.batch);
+                }
             } else {
                 // remote-stage worker: serve the main process instead of stdin.  A prompt starts with a reset; windows,
                 // commits and chunks arrive in order, each whole, and run here one at a time.
@@ -13486,6 +13595,9 @@ int main(int argc, char** argv) {
         // checkpoints are dropped (before the resume decision, or after a read from token 0 that made it again).
         // Never cleared before that: a request refused in between leaves it to the next one.
         bool remote_fresh = false;
+        // remote-batch (IMPL-PLAN-remote-batch.md sections 3.7 and 3.9): what a link made again means for the batch
+        // slots - set with them (below); unset without --batch.  False (the error in `e`): the engine ends.
+        std::function<bool(std::string&)> remote_relink_slots;
         // A request's first messages (its positions, its reset) found the link lost: connect again (remote_connect)
         // and send this request's positions again; the caller then sends its message again.  Nothing of the old
         // connection carries over: the worker zeroes its session at the reset, its checkpoint parts went with the old
@@ -13502,6 +13614,7 @@ int main(int argc, char** argv) {
                 e = lost + "; connecting again: " + (e.rfind("remote stage: ", 0) == 0 ? e.substr(14) : e);
                 return false;
             }
+            if (remote_relink_slots && !remote_relink_slots(e)) return false;
             std::fprintf(stderr, "strata serve: remote stage: the link to %s was lost (%s): connected again\n",
                          o.remote_stage.c_str(), lost.c_str());
             std::fflush(stderr);
@@ -13744,7 +13857,7 @@ int main(int argc, char** argv) {
             if (!sync_all()) { e = "batch slot copy: device sync failed"; return false; }
             return true;
         };
-        auto copy_to_slot = [&](int b, const std::vector<int32_t>& ids, std::string& e) -> bool {
+        auto copy_to_slot_here = [&](int b, const std::vector<int32_t>& ids, std::string& e) -> bool {
             const int64_t upto = (int64_t) ids.size();
             if (slot_copy_direct) {
                 if (!direct_slot_copy(true, b, ids, e)) return false;
@@ -13788,7 +13901,7 @@ int main(int argc, char** argv) {
         // slot b's sessions -> the main ones (the reverse of copy_to_slot): a request that continues the
         // conversation an idle slot holds reads on from there.  Every stage, the same calls.
         // `at`: one of the slot's checkpoints - only the K/V up to it is copied and its state restored instead
-        auto copy_from_slot = [&](int b, const ConvCheckpoint* at, std::string& e) -> bool {
+        auto copy_from_slot_here = [&](int b, const ConvCheckpoint* at, std::string& e) -> bool {
             // the main session's K/V is replaced by the slot's: K/V retained from a restore described the old one
             conversations.take_reuse();
             const int64_t upto = at != nullptr ? (int64_t) at->ids.size() : (int64_t) bs[(size_t) b].ids.size();
@@ -13835,6 +13948,121 @@ int main(int argc, char** argv) {
             }
             return true;
         };
+        // remote-batch (IMPL-PLAN-remote-batch.md sections 3.1 and 3.3, D-7 and D-8): a remote stage's main process
+        // holds only its own layers of a slot; the worker holds the rest in its slot sessions.  So every copy into or
+        // out of a slot goes to the worker too - SlotSave (its session, at the same length, into slot b) and SlotLoad
+        // (slot b's cells, with the slot's own state or the part of checkpoint `at`, into its session) - sent on a
+        // thread of its own while this process copies its layers (the link has no other user then: the main thread
+        // is here, no prompt chunk or window is in flight).  The worker's error fails the copy as a local failure does
+        // (the callers': the slot is not kept, or the prompt is read from token 0; a checkpoint the worker does not
+        // hold is one of those); a link lost on the way is also kept in `remote_slot_lost`, and the caller ends the
+        // engine with it, as a lost window does.  Without a remote stage: this process's copy alone, as before.
+        std::string remote_slot_lost;
+        auto with_remote_slot = [&](const std::function<bool(std::string&)>& remote, std::string& e,
+                                    const std::function<bool(std::string&)>& here) -> bool {
+            remote_slot_lost.clear();
+            if (!remote_main) return here(e);
+            std::string re;
+            std::future<bool> rf;
+            try {
+                rf = std::async(std::launch::async, [&] { return remote(re); });
+            } catch (const std::system_error&) {   // no thread for it: one after the other
+            }
+            const bool ok = here(e);
+            const bool rok = rf.valid() ? rf.get() : remote(re);
+            if (rok) return ok;
+            if (strata::net::stage_link_lost(re)) remote_slot_lost = re;
+            e = ok ? re : e + "; and the remote stage: " + re;
+            return false;
+        };
+        auto copy_to_slot = [&](int b, const std::vector<int32_t>& ids, std::string& e) -> bool {
+            const int64_t upto = (int64_t) ids.size();
+            return with_remote_slot([&, b, upto](std::string& re) { return remote_link.slot_save(b, upto, re); }, e,
+                                    [&, b](std::string& le) { return copy_to_slot_here(b, ids, le); });
+        };
+        auto copy_from_slot = [&](int b, const ConvCheckpoint* at, std::string& e) -> bool {
+            const int64_t upto = at != nullptr ? (int64_t) at->ids.size() : (int64_t) bs[(size_t) b].ids.size();
+            const int64_t id = at != nullptr ? (int64_t) at->remote_id : 0;
+            if (remote_main && at != nullptr && id == 0) {   // (every checkpoint of a remote stage has its worker part)
+                remote_slot_lost.clear();
+                e = "a slot checkpoint without its remote stage part";
+                return false;
+            }
+            return with_remote_slot([&, b, upto, id](std::string& re) {
+                                        bool missing = false;
+                                        return remote_link.slot_load(b, upto, id, missing, re);
+                                    }, e, [&, b](std::string& le) { return copy_from_slot_here(b, at, le); });
+        };
+        // remote-batch: the keep[] of the batch slots' checkpoints (section 3.8, remote_keep_slots above) and what a
+        // link made again means for the slots (sections 3.7 and 3.9, remote_relink_slots above)
+        if (remote_main && o.batch > 0) {
+            remote_keep_slots = [&](std::vector<int64_t>& keep) {
+                struct Cand {
+                    uint64_t used;
+                    int64_t id;
+                };
+                std::vector<Cand> cand;   // the slots' ids not in keep yet (one each: a slot keeps copies)
+                for (const BSlot& sl : bs)
+                    for (const ConvCheckpoint& c : sl.checks) {
+                        if (c.remote_id <= remote_slot_floor ||   // (gone with an older link: dropped at the next request)
+                            std::find(keep.begin(), keep.end(), (int64_t) c.remote_id) != keep.end())
+                            continue;
+                        auto it = std::find_if(cand.begin(), cand.end(), [&](const Cand& x) { return x.id == c.remote_id; });
+                        if (it == cand.end()) cand.push_back({c.used, (int64_t) c.remote_id});
+                        else it->used = std::max(it->used, c.used);
+                    }
+                std::stable_sort(cand.begin(), cand.end(), [](const Cand& a, const Cand& b) { return a.used > b.used; });
+                std::vector<int64_t> dropped;
+                for (const Cand& x : cand) {
+                    if (keep.size() < (size_t) strata::net::kStageCkptMax) keep.push_back(x.id);
+                    else dropped.push_back(x.id);
+                }
+                if (dropped.empty()) return;
+                size_t n_dropped = 0;
+                auto gone = [&](const ConvCheckpoint& c) {
+                    const bool d = std::find(dropped.begin(), dropped.end(), (int64_t) c.remote_id) != dropped.end();
+                    n_dropped += d ? 1 : 0;
+                    return d;
+                };
+                for (BSlot& sl : bs) {
+                    if (ckpt_pool.on()) ckpt_pool.erase_if(sl.checks, gone);
+                    else sl.checks.erase(std::remove_if(sl.checks.begin(), sl.checks.end(), gone), sl.checks.end());
+                }
+                std::fprintf(stderr, "strata batch: remote stage: %zu batch slot checkpoint%s dropped (the worker keeps "
+                                     "%d checkpoint parts at most; the main chain's and the newest go first)\n",
+                             n_dropped, n_dropped == 1 ? "" : "s", (int) strata::net::kStageCkptMax);
+            };
+            remote_relink_slots = [&](std::string& e) -> bool {
+                if (remote_peer.batch_slots < o.batch) {
+                    e = "remote stage: the worker's hello was refused: it has " + std::to_string(remote_peer.batch_slots) +
+                        " batch slots now, fewer than the " + std::to_string(o.batch) +
+                        " this main process runs (start the main process again)";
+                    remote_link.close();
+                    return false;
+                }
+                for (const BSlot& sl : bs)
+                    if (sl.active) {
+                        e = "remote stage: the link was made again while batch slots were decoding (their state on the "
+                            "worker is gone)";
+                        return false;
+                    }
+                // the worker holds none of the slots now (a new connection; maybe a new process): no slot is a source
+                // any more, and their checkpoints, whose parts went with the old connection, leave at the next
+                // request's start (here a caller may still point into them)
+                int n_cached = 0;
+                for (BSlot& sl : bs) {
+                    n_cached += sl.cached ? 1 : 0;
+                    sl.cached = false;
+                    sl.partial = false;
+                }
+                remote_slot_floor = remote_ckpt_id;
+                if (n_cached > 0)
+                    std::fprintf(stderr, "strata batch: remote stage: the link was made again: %d batch slot%s no longer "
+                                         "hold%s a conversation\n", n_cached, n_cached == 1 ? "" : "s",
+                                 n_cached == 1 ? "s" : "");
+                return true;
+            };
+        }
         auto stage_verifier = [&](int k) -> strata::core::Verifier& { return k == 0 ? ver : stages[(size_t) k - 1]->ver; };
         // What an idle slot holds (the conversation it decoded last: its sessions, its draft K/V and its checkpoints)
         // goes to the parked conversations before an admission overwrites it.  The main session was parked with that
@@ -15060,6 +15288,17 @@ int main(int argc, char** argv) {
                 if (remote_cancelled) continue;
                 return 1;
             }
+            // remote-batch: the checkpoints whose worker parts went with an older connection (remote_relink_slots) leave
+            // the batch slots and the chain here, before anything restores from them (nothing points into them now)
+            if (remote_slot_floor > 0) {
+                auto gone = [&](const ConvCheckpoint& c) { return c.remote_id != 0 && c.remote_id <= remote_slot_floor; };
+                auto drop_gone = [&](std::vector<ConvCheckpoint>& v) {
+                    if (ckpt_pool.on()) ckpt_pool.erase_if(v, gone);
+                    else v.erase(std::remove_if(v.begin(), v.end(), gone), v.end());
+                };
+                drop_gone(checks);
+                for (BSlot& sl : bs) drop_gone(sl.checks);
+            }
             if (geni || !mrope_identity) {
                 // positions for every cell this request can reach; the identity again for a text request
                 std::string ve;
@@ -15542,6 +15781,12 @@ int main(int argc, char** argv) {
                 lent_slot = -1;   // (a longer start than the main session's)
                 const auto t0 = Clock::now();
                 if (!copy_from_slot(slot_source, slot_ck, err)) {
+                    // remote-batch: the link went meanwhile - the engine ends, as on a lost window
+                    if (!remote_slot_lost.empty()) {
+                        std::printf("ERR %s (restoring batch slot %d)\n", remote_slot_lost.c_str(), slot_source);
+                        std::fflush(stdout);
+                        return 1;
+                    }
                     // the main session may be half written: read this prompt from the start
                     std::fprintf(stderr, "strata batch: restoring slot %d failed (%s); reading the prompt\n",
                                  slot_source, err.c_str());
@@ -15752,12 +15997,33 @@ int main(int argc, char** argv) {
                 }
             }
             int64_t reread_to = -1;   // STRATA_CKPT_REREAD only: read [0, reread_to) again instead of restoring
-            // remote-stage: the worker's parts of the checkpoints kept here (a Reset or CkptRestore keeps only those)
-            // TODO(remote-batch D): and the ones the batch slots hold (bs[b].checks, section 3.8)
-            auto remote_keep = [&] {
+            // remote-stage: the worker's parts of the checkpoints kept here (a Reset or CkptRestore keeps only those),
+            // and with --batch the ones the batch slots hold (remote_keep_slots).  `pin`: a checkpoint about to be
+            // mounted, maybe one a slot keeps (STRATA_SLOT_CKPT_MOVE) - it stays, and *pin is found again by its id,
+            // since dropping a slot's other checkpoints moves the elements of that slot's vector.  `chain` false: not
+            // the chain's (it is dropped next)
+            auto remote_keep = [&](ConvCheckpoint** pin = nullptr, bool chain = true) {
                 std::vector<int64_t> v;
                 for (const ConvCheckpoint& k : checks)
-                    if (k.remote_id != 0) v.push_back(k.remote_id);
+                    if (chain && k.remote_id != 0) v.push_back(k.remote_id);
+                if (!remote_keep_slots) return v;
+                ConvCheckpoint* const c = pin != nullptr ? *pin : nullptr;
+                int in_slot = -1;
+                if (c != nullptr) {
+                    if (c->remote_id != 0 && std::find(v.begin(), v.end(), (int64_t) c->remote_id) == v.end())
+                        v.push_back(c->remote_id);
+                    const std::less<const ConvCheckpoint*> lt;
+                    for (size_t b = 0; b < bs.size(); ++b) {
+                        const std::vector<ConvCheckpoint>& sc = bs[b].checks;
+                        if (!sc.empty() && !lt(c, sc.data()) && lt(c, sc.data() + sc.size())) in_slot = (int) b;
+                    }
+                }
+                const int32_t pin_id = c != nullptr ? c->remote_id : 0;
+                const size_t pin_len = c != nullptr ? c->ids.size() : 0;
+                remote_keep_slots(v);
+                if (in_slot >= 0)
+                    for (ConvCheckpoint& k : bs[(size_t) in_slot].checks)
+                        if (k.remote_id == pin_id && k.ids.size() == pin_len) *pin = &k;
                 return v;
             };
             // every session zeroed for a read from token 0 - a remote worker's too, keeping its checkpoint parts `keep`
@@ -15803,7 +16069,7 @@ int main(int argc, char** argv) {
                     // (--adapt-swaps 0) the answer must match the restored one token for token; anything the
                     // checkpoint missed shows up as a difference.  (A remote stage: the worker's session too, its
                     // checkpoint parts kept.)
-                    if (!session_from0(remote_keep())) {
+                    if (!session_from0(remote_keep(&c))) {
                         std::printf("ERR %s\n", err.c_str());
                         std::fflush(stdout);
                         if (remote_cancelled) continue;
@@ -15828,7 +16094,8 @@ int main(int argc, char** argv) {
                     return 1;
                 } else if (remote_main) {   // the worker's part of the same checkpoint
                     bool missing = false;
-                    if (!remote_link.ckpt_restore(c->remote_id, resume, remote_keep(), missing, err)) {
+                    const std::vector<int64_t> keep_c = remote_keep(&c);   // (first: with --batch it may move `c`)
+                    if (!remote_link.ckpt_restore(c->remote_id, resume, keep_c, missing, err)) {
                         // the link lost (the worker's end closed after the request's start looked): made again, as a
                         // reset's is; the new connection holds no checkpoint part, so this is the missing case
                         if (!missing && strata::net::stage_link_lost(err)) {
@@ -15859,7 +16126,9 @@ int main(int argc, char** argv) {
                                                  "tokens (%s): reading the prompt from token 0\n", (long long) resume,
                                          err.c_str());
                         err.clear();
-                        if (!session_from0({})) {
+                        // (the chain goes below; with --batch the slots' checkpoint parts stay on the worker: section
+                        // 3.8 - `c` among them, which it does not hold, so nothing is lost by naming it)
+                        if (!session_from0(remote_keep_slots ? remote_keep(&c, false) : std::vector<int64_t>{})) {
                             std::printf("ERR %s\n", err.c_str());
                             std::fflush(stdout);
                             if (remote_cancelled) continue;
@@ -18275,6 +18544,12 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata serve: batch admission failed: %s\n", err.c_str());
                     bs[(size_t) admit_slot].cached = false;   // its sessions may be half written
                     cont = false;
+                    // remote-batch: the link went meanwhile - the engine ends, as on a lost window
+                    if (!remote_slot_lost.empty()) {
+                        std::printf("ERR %s (a batch admission)\n", remote_slot_lost.c_str());
+                        std::fflush(stdout);
+                        return 1;
+                    }
                 }
                 const auto tc1 = Clock::now();
                 if (cont) {
