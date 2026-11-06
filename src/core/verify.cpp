@@ -3829,7 +3829,19 @@ bool Verifier::capture_batch(const int* rows, int S, int hbase, std::string& err
         (void) cudaGetLastError();   // only a warm-up: the first launch uploads it (see capture)
     std::string list;
     for (int t = 0; t < S; ++t) list += (t ? "," : "") + std::to_string(rows[t]);
-    std::fprintf(stderr, "strata verify: captured the batch window over slots %s\n", list.c_str());
+    // remote-batch stage 2: on a remote stage's main side (the head-only stage, and the stage before it) which stage,
+    // which hand-off rows and the VRAM left, for counting the pipelined groups' graphs (IMPL-PLAN-remote-batch-stage2.md
+    // 2.2.4); every other setup says what it always said
+    std::string where;
+    if (head_only_stage() || (next_ != nullptr && next_->head_only_stage())) {
+        size_t free_b = 0, total_b = 0;
+        if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) (void) cudaGetLastError();
+        where = std::string(head_only_stage() ? " (the head" : " (layers ") +
+                (head_only_stage() ? std::string() : std::to_string(lb_) + "-" + std::to_string(le_ - 1)) +
+                ", hand-off rows from " + std::to_string(hbase) + "; " + std::to_string(free_b >> 20) +
+                " MiB of VRAM free)";
+    }
+    std::fprintf(stderr, "strata verify: captured the batch window over slots %s%s\n", list.c_str(), where.c_str());
     return true;
 }
 
