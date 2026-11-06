@@ -3835,6 +3835,9 @@ bool Verifier::capture_batch(const int* rows, int S, int hbase, std::string& err
 
 bool Verifier::capture_commit_batch(const int* rows, int S, int hbase, std::string& err) {
     if (batch_self_commits(rows, S)) return true;   // the window keeps its rows: no commit graph
+    // remote-batch: a head-only stage (the main side of a remote stage) holds no layer, so its commit graph would only
+    // copy the accepted prefixes to a buffer no layer reads: none (commit_slot_prefixes keeps the bookkeeping)
+    if (head_only_stage()) return true;
     cudaGraphExec_t& cex = commit_bm_[bkey(rows, S, hbase)];
     if (cex != nullptr) return true;
     using namespace strata::kernels;
@@ -4589,7 +4592,8 @@ bool Verifier::commit_slot_prefixes(const int* keep, std::string& err) {
             c[2 + j] = j < n ? (int32_t) last_pos_b_[first + j] : -1;
     }
     std::atomic_thread_fence(std::memory_order_seq_cst);
-    if (!batch_self_commits(last_rows_, S)) {   // (else the window has kept its rows)
+    // (a head-only stage has no commit graph: capture_commit_batch)
+    if (!batch_self_commits(last_rows_, S) && !head_only_stage()) {   // (else the window has kept its rows)
         const cudaError_t le = cudaGraphLaunch(commit_bm_[bkey(last_rows_, S, row_base_)], cs_);
         if (le != cudaSuccess) { err = std::string("verify: batch commit launch: ") + cudaGetErrorString(le); return false; }
         const cudaError_t se = cudaStreamSynchronize(cs_);
@@ -4632,8 +4636,8 @@ bool Verifier::batch_launch(int base, int S, const int32_t* tokens, const int64_
     if (pre_launch_ && !pre_launch_(cs_, err)) return false;
     if (!stage_batch(rows, S, base, tokens, pos, err)) return false;
     cudaError_t le = cudaGraphLaunch(exec_bm_[bkey(rows, S, base)], cs_);
-    if (le == cudaSuccess && !batch_self_commits(rows, S))   // (else the window has kept its rows itself)
-        le = cudaGraphLaunch(commit_bm_[bkey(rows, S, base)], cs_);   // right behind it: every row is kept
+    if (le == cudaSuccess && !batch_self_commits(rows, S) && !head_only_stage())   // (else the window has kept its rows
+        le = cudaGraphLaunch(commit_bm_[bkey(rows, S, base)], cs_);   // itself, or has none); every row is kept
     if (le != cudaSuccess) { err = std::string("verify: batch launch: ") + cudaGetErrorString(le); return false; }
     (void) cudaStreamQuery(cs_);
     if (ple_stage())   // the host's side of the commit (the hash's last two tokens)

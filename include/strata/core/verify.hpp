@@ -610,6 +610,9 @@ private:
     std::function<bool(const int*, int, const int32_t*, const int64_t*, std::string&)> remote_slot_run_;   ///< set_remote_slots
     std::function<bool(const int*, int, std::string&)> remote_slot_commit_;
     bool writes_handoff() const { return le_ < g_->n_layers || no_head_; }   ///< no head here: the residual goes on
+    /// remote-stage, the main side: the head on the worker's rows (set_stage(n_layers, ...)), no layer here - a batch
+    /// window's commit has nothing to advance (remote-batch: no commit graph, the slots' bookkeeping only)
+    bool head_only_stage() const { return g_ != nullptr && lb_ == g_->n_layers && le_ == g_->n_layers; }
     bool ple_stage() const { return lb_ <= 1 && 1 < le_; }   ///< holds layer 1, where the PLE block runs
     void stage_inputs(int T, const int32_t* tokens, int64_t pos0);
     bool staged_ = false;
