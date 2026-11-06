@@ -44,6 +44,18 @@ def tokenizer(path):
     return ST.Tokenizer(tokens, merges, types)
 
 
+def batch_groups_asked(args):
+    """The number after --batch-groups (or --batch-groups=N) in the engine's arguments, the last one winning; None when
+    there is none or it is not a number (auto: the engine picks)."""
+    n = None
+    for i, x in enumerate(args):
+        v = args[i + 1] if x == "--batch-groups" and i + 1 < len(args) else \
+            x.split("=", 1)[1] if x.startswith("--batch-groups=") else None
+        if v is not None:
+            n = int(v) if v.isdigit() else None
+    return n
+
+
 class Engine:
     def __init__(self, exe, cfg, batch, extra_env, extra_args):
         args = list(cfg["args"])
@@ -60,10 +72,34 @@ class Engine:
         self.log = open(self.log_path, "w")
         self.p = subprocess.Popen([exe, "--serve", *args], cwd=cfg.get("cwd"), stdin=subprocess.PIPE,
                                   stdout=subprocess.PIPE, stderr=self.log, text=True, bufsize=1, env=env)
+        # the INFO lines before READY, the later value of a key winning (as serve/server.py reads them): the batch
+        # slots and groups the engine settled on (a remote stage says them again after its worker's hello)
+        self.info = {}
         for line in self.p.stdout:
+            if line.startswith("INFO "):
+                for kv in line.split()[1:]:
+                    k, _, v = kv.partition("=")
+                    self.info[k] = v
             if line.startswith("READY"):
+                if batch:
+                    self.check_batch(batch, batch_groups_asked(args))
                 return
         raise SystemExit(f"the engine ended before READY - see {self.log_path}")
+
+    def check_batch(self, batch, groups):
+        """The run must test what it asked for: the engine may run fewer slots (the VRAM) or one group (the groups do
+        not divide the slots, a worker without them) and still pass a solo-equality check."""
+        got = {k: self.info.get(k) for k in ("batch_slots", "batch_groups", "batch_pad")}
+        print("engine: " + " ".join(f"{k}={v}" for k, v in got.items() if v is not None), flush=True)
+        bad = []
+        if got["batch_slots"] != str(batch):
+            bad.append(f"batch_slots={got['batch_slots']} (asked --batch {batch})")
+        if groups is not None and got["batch_groups"] != str(groups):
+            bad.append(f"batch_groups={got['batch_groups']} (asked --batch-groups {groups})")
+        if bad:
+            self.p.kill()
+            raise SystemExit("FAIL: the engine does not run the batch asked for: " + ", ".join(bad) +
+                             f" - see {self.log_path}")
 
     def send(self, line):
         self.p.stdin.write(line + "\n")
