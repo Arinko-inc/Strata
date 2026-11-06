@@ -1328,6 +1328,30 @@ bool StageRelay::send(const int64_t* tokens, int64_t T, int64_t pos0, int64_t fl
     return true;
 }
 
+// ---- StageSlotPipe (remote-batch stage 2 skeleton: C1 writes it)
+StageSlotPipe::StageSlotPipe(StageClient& link) : link_(link) {}
+
+StageSlotPipe::~StageSlotPipe() { stop(); }
+
+bool StageSlotPipe::send(int id, int S, const int32_t* slots, const int32_t* tokens, const int64_t* pos, int64_t flags,
+                         int64_t tag, const float* rows_in, size_t in_floats, float* rows_out, size_t out_floats,
+                         std::string& err) {
+    (void) id; (void) S; (void) slots; (void) tokens; (void) pos; (void) flags; (void) tag; (void) rows_in;
+    (void) in_floats; (void) rows_out; (void) out_floats;
+    err = "remote stage: StageSlotPipe is not in this build yet";
+    return false;
+}
+
+int StageSlotPipe::poll(int id, std::string& err) {
+    (void) id;
+    err = "remote stage: StageSlotPipe is not in this build yet";
+    return -1;
+}
+
+int StageSlotPipe::outstanding() const { return 0; }
+
+void StageSlotPipe::stop() { (void) link_; }
+
 int serve_stage(const std::string& bind_addr, int port, const std::string& token, const StageHandlers& h,
                 const StageBuffers& buf, StageStats& stats, const std::atomic<bool>* stop) {
     if (!net_init()) {

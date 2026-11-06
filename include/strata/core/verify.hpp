@@ -273,6 +273,13 @@ public:
     // a window in flight from one thread (batch_poll does not block).  Stage k can then run group g while stage k+1
     // runs group g-1.  Rows of group `base` use hand-off rows [base, base + S), so groups never share a hand-off row.
     bool batch_launch(int base, int S, const int32_t* tokens, const int64_t* pos, std::string& err);
+    /// remote-batch stage 2 (a remote stage's main side, strata-mesh IMPL-PLAN-remote-batch-stage2.md 2.2.4): as
+    /// batch_launch, over the S slots `rows` (any distinct slots, in this order: a group's active slots only, no pad row)
+    /// at hand-off rows [hbase, hbase + S).  batch_launch itself is the layer split's and stays as it is.
+    bool batch_launch_slots(const int* rows, int S, int hbase, const int32_t* tokens, const int64_t* pos,
+                            std::string& err);
+    /// that window's graph is captured already (batch_launch_slots then makes no capture)
+    bool batch_captured(const int* rows, int S, int hbase) const;
     /// 1 = this stage's window and commit are done (the last stage's picks are in batch_out), 0 = still running,
     /// -1 = an error (err).  Serves every layer that has rung so far.
     int batch_poll(PoolMultiFn pool, void* user, std::string& err);

@@ -4653,6 +4653,17 @@ bool Verifier::batch_launch(int base, int S, const int32_t* tokens, const int64_
     return true;
 }
 
+bool Verifier::batch_launch_slots(const int* rows, int S, int hbase, const int32_t* tokens, const int64_t* pos,
+                                  std::string& err) {
+    (void) rows; (void) S; (void) hbase; (void) tokens; (void) pos;
+    err = "verify: batch_launch_slots is not in this build yet (remote-batch stage 2 skeleton)";
+    return false;
+}
+
+bool Verifier::batch_captured(const int* rows, int S, int hbase) const {
+    return exec_bm_.find(bkey(rows, S, hbase)) != exec_bm_.end();
+}
+
 int Verifier::batch_serve(PoolMultiFn pool, void* user) {
     if (!b_running_.load(std::memory_order_acquire)) return 1;
     volatile uint32_t* const seq = h_seq_;

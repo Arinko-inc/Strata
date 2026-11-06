@@ -323,6 +323,35 @@ private:
     std::vector<int64_t> tokens_;
 };
 
+/// protocol 8, the main side's pipelined batch windows (stage 2, strata-mesh IMPL-PLAN-remote-batch-stage2.md 2.2.5):
+/// SlotRuns go out from the caller's thread (slot_run_send); a thread of its own reads their replies in the order they
+/// went out (slot_run_recv), each into the rows its send named, and marks it in.  The caller never waits on the link.
+/// The reader holds the link's receive lock only while a window is out.  Not copyable.
+class StageSlotPipe {
+public:
+    explicit StageSlotPipe(StageClient& link);
+    ~StageSlotPipe();   ///< stop()
+    StageSlotPipe(const StageSlotPipe&) = delete;
+    StageSlotPipe& operator=(const StageSlotPipe&) = delete;
+    /// Window `id` (0..kStageSlotMax-1, not out already): the SlotRun now, its reply later into rows_out (S rows of
+    /// out_floats / S floats; valid until poll returned 1 or the pipe stopped).  False: err (the link breaks as
+    /// slot_run_send breaks it; the pipe has failed then).
+    bool send(int id, int S, const int32_t* slots, const int32_t* tokens, const int64_t* pos, int64_t flags, int64_t tag,
+              const float* rows_in, size_t in_floats, float* rows_out, size_t out_floats, std::string& err);
+    /// 1: window id's rows are in (and it is no longer out); 0: still out (or never sent); -1: the pipe failed (err: the
+    /// first error, every later call returns -1)
+    int poll(int id, std::string& err);
+    /// windows sent and not yet taken by poll
+    int outstanding() const;
+    /// ends the reader: a read in progress is cut (link.abort()), then joined.  Idempotent.
+    void stop();
+
+private:
+    StageClient& link_;
+    // (C1: the queue of {id, tag, S, rows_out, out_floats}, a mutex and a condition variable, the per-id state, the first
+    // error, the thread)
+};
+
 /// The worker's end.  Every handler runs on the serving thread, one message at a time in arrival order.
 struct StageHandlers {
     std::function<bool(const StageHello& main_hello, StageHello& mine, std::string& err)> hello;
@@ -363,6 +392,13 @@ struct StageHandlers {
     /// `slot` (and checkpoint part `ckpt_id`, 0: none) into the session; a part not held: an error starting with
     /// kStageCkptMissing.
     std::function<bool(int slot, int64_t L, int64_t ckpt_id, std::string& err)> slot_load;
+    /// optional (a relay worker, protocol 8 stage 2): with it, a SlotRun with kStageSlotKeepAll is answered late - slot_run
+    /// runs this worker's layers, sends the window on (slot_run_send) and keeps its rows, and returns without the next
+    /// worker's rows; serve_stage lets the reply before it go out, then sends this window's reply on the replying thread,
+    /// where slot_run_reply fills rows_out (S rows) from the next worker.  Replies go out in the order the windows came;
+    /// the serving thread reads the next message meanwhile.  A failure sends an error for that window instead.  A SlotRun
+    /// without kStageSlotKeepAll is answered as before (slot_run fills run_out and the reply goes out at once).
+    std::function<bool(int S, float* rows_out, std::string& err)> slot_run_reply;
     /// optional (a relay worker): about once a second while the served main process is idle (no message read or being
     /// read, no reply going out), on the serving thread.  False ends that connection with `err`, as a closed one ends:
     /// its main process finds the link lost at its next request and connects again.

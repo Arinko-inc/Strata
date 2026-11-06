@@ -6236,6 +6236,8 @@ int main(int argc, char** argv) {
     if (o.batch > 0) resolve_groups_auto();
     // remote-batch, stage 1: a remote stage's main process runs its slots in one group (its windows go through the
     // worker in turn); the pipelined groups over the link are stage 2 (IMPL-PLAN-remote-batch.md section 3.12)
+    // TODO(remote-batch-2 C3): 2.2.1 - --batch-groups over a remote stage (none: 1 group; auto: 2 if --batch is even;
+    // G >= 2 dividing --batch: G), and the check below skips the "needs a layer split" rule for remote_main
     if (remote_main && o.batch > 0 && o.batch_groups > 1) {
         std::fprintf(stderr, "strata generate: --batch-groups %d is one group over a remote stage (the slot groups do "
                              "not pipeline over the link yet)\n", o.batch_groups);
@@ -13084,6 +13086,8 @@ int main(int argc, char** argv) {
                                               "with --batch N)");
                     o.batch = n >= 2 ? n : 0;
                     remote_slots_n = o.batch;
+                    // TODO(remote-batch-2 C3): 2.2.1 - the groups checked again against the agreed slots and the worker's
+                    // batch_flags; INFO batch_slots=%d batch_groups=%d batch_pad=0
                     std::printf("INFO batch_slots=%d batch_groups=1\n", o.batch);
                 }
             } else {
@@ -14508,6 +14512,7 @@ int main(int argc, char** argv) {
                 return true;
             };
         }
+        // TODO(remote-batch-2 C3): 2.2.3 - remote_pipe: stage 1 is ver_same (the head)
         auto stage_verifier = [&](int k) -> strata::core::Verifier& { return k == 0 ? ver : stages[(size_t) k - 1]->ver; };
         // What an idle slot holds (the conversation it decoded last: its sessions, its draft K/V and its checkpoints)
         // goes to the parked conversations before an admission overwrites it.  The main session was parked with that
@@ -14786,6 +14791,7 @@ int main(int argc, char** argv) {
             return true;
         };
         // ---- --batch-groups: the slot groups pipelined through the stages (--batch-groups G > 1 with a layer split)
+        // TODO(remote-batch-2 C3): 2.2.3 - remote_pipe: 2 stages (ver, then ver_same); a StageSlotPipe on remote_link
         const int n_pipe = (int) stages.size() + 1;
         const bool piped = o.batch > 0 && o.batch_groups > 1 && n_pipe > 1;
         strata::core::StageInFlightSampler stage_in_flight(n_pipe, piped && batch_telemetry_enabled);
@@ -15019,6 +15025,9 @@ int main(int argc, char** argv) {
             return strata::program::batch_groups::pipe_adapt_due(p);
         };
         // one turn: serve every running stage, hand finished groups on, start what can start
+        // TODO(remote-batch-2 C3): 2.2.3 / 2.2.4 - remote_pipe: stage 0 done -> SlotRun (kStageSlotKeepAll) through the
+        // pipe; stage 1 starts once its rows are in; a group holds its active slots only (batch_launch_slots); the head
+        // of a group not captured yet launches only while stage 0 is idle; BT/BDONE name G.rows[t]
         auto pump = [&](bool may_start) -> bool {
             ++pipe_tick;
             if (bt_windows == 0 && !pipe_inflight()) {
@@ -17262,6 +17271,8 @@ int main(int argc, char** argv) {
                     const char* v = std::getenv("STRATA_PIPED_DECODE_MIN_MS");
                     return v != nullptr ? std::max(0.0, std::atof(v)) : 0.0;
                 }();
+                // TODO(remote-batch-2 C3): 2.2.6 - remote_pipe reads the prompt as stage 1 does (serial windows between
+                // the chunks, BYIELD at the chunk boundaries): not the pipelined groups' one-piece read
                 const bool pr_on = piped && pr_piece > 0;
                 auto piece_now = [&]() -> int64_t {
                     return pr_on ? strata::program::piped_read_piece(pr_piece, C)
