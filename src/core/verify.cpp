@@ -3829,7 +3829,19 @@ bool Verifier::capture_batch(const int* rows, int S, int hbase, std::string& err
         (void) cudaGetLastError();   // only a warm-up: the first launch uploads it (see capture)
     std::string list;
     for (int t = 0; t < S; ++t) list += (t ? "," : "") + std::to_string(rows[t]);
-    std::fprintf(stderr, "strata verify: captured the batch window over slots %s\n", list.c_str());
+    // remote-batch stage 2: on a remote stage's main side (the head-only stage, and the stage before it) which stage,
+    // which hand-off rows and the VRAM left, for counting the pipelined groups' graphs (IMPL-PLAN-remote-batch-stage2.md
+    // 2.2.4); every other setup says what it always said
+    std::string where;
+    if (head_only_stage() || (next_ != nullptr && next_->head_only_stage())) {
+        size_t free_b = 0, total_b = 0;
+        if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) (void) cudaGetLastError();
+        where = std::string(head_only_stage() ? " (the head" : " (layers ") +
+                (head_only_stage() ? std::string() : std::to_string(lb_) + "-" + std::to_string(le_ - 1)) +
+                ", hand-off rows from " + std::to_string(hbase) + "; " + std::to_string(free_b >> 20) +
+                " MiB of VRAM free)";
+    }
+    std::fprintf(stderr, "strata verify: captured the batch window over slots %s%s\n", list.c_str(), where.c_str());
     return true;
 }
 
@@ -4653,14 +4665,41 @@ bool Verifier::batch_launch(int base, int S, const int32_t* tokens, const int64_
     return true;
 }
 
+// remote-batch stage 2: batch_launch's copy over any slots (a remote stage's group holds its active slots only: the
+// worker refuses a window over a slot it holds nothing of, so there is no pad row).  Rows [hbase, hbase + S) of the
+// hand-off are the group's own, as batch_launch's [base, base + S).
 bool Verifier::batch_launch_slots(const int* rows, int S, int hbase, const int32_t* tokens, const int64_t* pos,
                                   std::string& err) {
-    (void) rows; (void) S; (void) hbase; (void) tokens; (void) pos;
-    err = "verify: batch_launch_slots is not in this build yet (remote-batch stage 2 skeleton)";
-    return false;
+    const OnDevice on_device(device_);
+    if (b_running_) { err = "verify: batch_launch_slots while this stage is busy"; return false; }
+    if (S < 1 || S > (int) strata::kernels::kVerifyMaxT) { err = "verify: batch rows out of range (init_slots)"; return false; }
+    int rw[strata::kernels::kVerifyMaxT] = {};   // (stage_batch keeps its own copy in last_rows_)
+    for (int t = 0; t < S; ++t) rw[t] = rows[t];
+    if (pre_launch_ && !pre_launch_(cs_, err)) return false;
+    if (!stage_batch(rw, S, hbase, tokens, pos, err)) return false;
+    const auto key = bkey(rw, S, hbase);
+    cudaError_t le = cudaGraphLaunch(exec_bm_[key], cs_);
+    if (le == cudaSuccess && !batch_self_commits(rw, S) && !head_only_stage())   // (else the window has kept its rows
+        le = cudaGraphLaunch(commit_bm_[key], cs_);   // itself, or has none); every row is kept
+    if (le != cudaSuccess) { err = std::string("verify: batch launch: ") + cudaGetErrorString(le); return false; }
+    (void) cudaStreamQuery(cs_);
+    if (ple_stage())   // the host's side of the commit (the hash's last two tokens)
+        for (int t = 0; t < S; ++t) {
+            SessionState& sx = *slots_[(size_t) rw[t]];
+            sx.ple_prev[0] = sx.ple_prev[1];
+            sx.ple_prev[1] = tokens[t];
+        }
+    b_k_ = 0;
+    b_steps_ = le_ - lb_;
+    ring_now();
+    b_running_.store(true, std::memory_order_release);   // last: an external server reads the rest after it
+    return true;
 }
 
+// (the key's doorbell bit is the one the last window ran with: exact on a head-only stage, which holds no expert, so
+// refresh_ar never turns it; on a stage with experts a swap can make the next launch capture the other variant)
 bool Verifier::batch_captured(const int* rows, int S, int hbase) const {
+    if (S < 1 || S > (int) strata::kernels::kVerifyMaxT) return false;
     return exec_bm_.find(bkey(rows, S, hbase)) != exec_bm_.end();
 }
 
