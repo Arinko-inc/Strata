@@ -1155,6 +1155,28 @@ int main() {
                 check(!pc.connected(), "16. pipe: stopped with a window out, the link is down");
                 gate.open();
             }
+            // reply rows of another width than the window's (1 row of 4 in, 8 floats out; Codex [P2]): refused before
+            // anything goes out, so no reply is left unread on a link that looks in step
+            pc.close();
+            check(pc.connect(lw.where, lmine, lpeer, e), "16. (the main process connects again)");
+            {
+                StageSlotPipe pipe(pc);
+                Win w = make(1, 9800, 6.0f);
+                std::vector<float> wide((size_t) (2 * kHbf), -1.0f);
+                std::string we;
+                const bool refused = !pipe.send(2, w.S, w.sl.data(), w.tk.data(), w.ps.data(), kStageSlotKeepAll, 609,
+                                                w.in.data(), w.in.size(), wide.data(), wide.size(), we) &&
+                                     contains(we, "hand-off width") && pipe.outstanding() == 0;
+                pipe.stop();
+                std::string e5;
+                const bool on = pc.connected() &&
+                                pc.slot_run(w.S, w.sl.data(), w.tk.data(), w.ps.data(), 0, 610, w.in.data(),
+                                            w.in.size(), w.out.data(), w.out.size(), e5) &&
+                                rows_ok(w);
+                if (!on) std::printf("    (%s / %s)\n", we.c_str(), e5.c_str());
+                check(refused && on, "16. pipe: reply rows wider than the window's are refused before the send; the "
+                                     "link serves on");
+            }
             pc.close();
         }
 
