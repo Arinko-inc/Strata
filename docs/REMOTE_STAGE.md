@@ -719,6 +719,20 @@ python3 tools/stage_tune.py apply cluster.json OUTDIR    # start the workers as 
   One group was run on GPUs on 2026-11-07 over three stages (`--batch 4`: the batch windows matched the solo path,
   and the HTTP checks and `serve_load` passed); the pipelined groups are covered over loopback only, not yet run on
   GPUs. The protocol: [ENGINEERING.md](remote-stage/ENGINEERING.md#the-protocol).
+  A prompt read while no slot decodes goes in **one run**: its chunks go through the link and the workers as a
+  pipeline, as without `--batch`, and a waiting shorter request (`BYIELD`) ends the run before its next chunk, where
+  the part read gives way. Beside decoding slots a read goes a chunk at a time and the slots decode between the
+  chunks, so each chunk waits for its rows from the last worker before the next one is sent. Before 2026-11-07 every
+  read went a chunk at a time: over three PCs (RTX 5070 Ti, RX 7900 XT, Arc B70; 2048-token chunks) a single
+  54,878-token prompt was read at 635 tok/s with `--batch 4` against 1,422 without it (4,146 tokens: 574 against
+  866). `STRATA_REMOTE_READ_ONE_RUN=0` on the main process brings that back (an A/B).
+  The slots' sessions take VRAM from every PC's expert cache, so a request alone decodes somewhat slower than without
+  `--batch` (the same three PCs: -3 to -9%, the main process's cache 3,797 -> 3,264 slots and its decode hits
+  95.0% -> 92.6%). A worker that held every expert of its layers without `--batch` and no longer does also loses
+  its zero-doorbell graph (its log's `100% VRAM resident: zero-doorbell graph` line is gone; an RX 7900 XT relay
+  held 6,030 of its layers' 6,144 experts with `--batch 4`): a lower `--vram-reserve-mib` there gives the cache the
+  difference back, if the card keeps enough free VRAM after it (its log's `VRAM free with everything loaded`), or
+  every PC carves fewer slots (the link runs the fewest any PC carved).
 - **Refused at start** with a remote stage: `--peer-device`, `--control-vector` (and the speed
   projection, which is one), `--expert-cache-remote`, `--prefill-head-alias`, and `--pipeline-windows` on a worker
   (the main process takes it, see [Overlapping the decode windows](#overlapping-the-decode-windows---pipeline-windows-2)).

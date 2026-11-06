@@ -17717,10 +17717,37 @@ int main(int argc, char** argv) {
                 }
                 int64_t piece = piece_now();
                 if (piece <= 0) return run(a0, b0);
+                // remote-stage (--remote-stage's main process) with no slot decoding: the rest is read in ONE run, so
+                // its chunks go through the link and the workers as a pipeline, as without --batch (a run per chunk
+                // waited for each chunk's rows from the last worker before it sent the next one: 54,878 tokens over
+                // three PCs took 86 s instead of 39 s).  A BYIELD that comes meanwhile ends the run before its next
+                // chunk (Prefill::stop_at_chunk: the run still takes the rows of every chunk it sent), and the part
+                // read gives way there as between two pieces; a BYIELD give_way does not take leaves the rest to be
+                // read the same way.  Beside decoding slots a remote read still goes a chunk at a time (they decode
+                // between the chunks).  STRATA_REMOTE_READ_ONE_RUN=0 keeps the run per chunk (an A/B).
+                static const bool remote_one_run_env = [] {
+                    const char* v = std::getenv("STRATA_REMOTE_READ_ONE_RUN");
+                    return v == nullptr || std::atoi(v) != 0;
+                }();
+                const bool remote_one_run = remote_main && remote_one_run_env && !batch_on();
                 for (int64_t q = a0; q < b0;) {
-                    const int64_t r = std::min(b0, q + piece);
+                    int64_t r = remote_one_run ? b0 : std::min(b0, q + piece);
                     const auto tq = Clock::now();
-                    if (!run(q, r)) return false;
+                    if (remote_one_run) {
+                        sp.stop_at_chunk = [&] {   // a BYIELD is waiting (the look below takes it off the queue)
+                            std::lock_guard<std::mutex> lk(in_mu);
+                            return std::any_of(in_lines.begin(), in_lines.end(),
+                                               [](const std::string& l) { return l.rfind("BYIELD ", 0) == 0; });
+                        };
+                        struct StopReset {
+                            std::function<bool()>& f;
+                            ~StopReset() { f = nullptr; }
+                        } stop_reset{sp.stop_at_chunk};
+                        if (!run(q, r)) return false;
+                        if (sp.stopped_at() > 0) r = q + sp.stopped_at();
+                    } else if (!run(q, r)) {
+                        return false;
+                    }
                     const double piece_ms = std::chrono::duration<double, std::milli>(Clock::now() - tq).count();
                     if (pr_on && r < b0) pr_prev_piece_ms = piece_ms;
                     const int64_t piece_tokens = r - q;
