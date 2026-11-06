@@ -13538,7 +13538,8 @@ int main(int argc, char** argv) {
                             e = "bad slot window: it came before the last window's SlotCommit";
                             return false;
                         }
-                        if (S < 1 || S > ver.max_t() || (flags & ~strata::net::kStageSlotKeepAll) != 0) {
+                        if (S < 1 || S > ver.max_t() || S > (int) strata::kernels::kVerifyMaxT ||
+                            (flags & ~strata::net::kStageSlotKeepAll) != 0) {
                             e = "bad slot window: " + std::to_string(S) + " rows (this worker's windows hold " +
                                 std::to_string(ver.max_t()) + "), flags " + std::to_string((long long) flags);
                             return false;
@@ -13624,7 +13625,7 @@ int main(int argc, char** argv) {
                             wk_slot_rows += S;
                             if (++wk_slot_windows % 64 == 0) {
                                 std::fprintf(stderr, "strata stage worker: batch windows: own layers %.2f ms%s each "
-                                                     "(64 windows, %.2f rows each; the layers alone %.2f ms)\n",
+                                                     "(64 windows, %.2f rows each; the last one's layers alone %.2f ms)\n",
                                              wk_slot_own_ms / 64, stage_relay ? (", next worker " +
                                                                                  std::to_string(wk_slot_next_ms / 64) +
                                                                                  " ms").c_str() : "",
