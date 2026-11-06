@@ -13113,9 +13113,12 @@ int main(int argc, char** argv) {
                     o.batch = n >= 2 ? n : 0;
                     remote_slots_n = o.batch;
                     // remote-batch stage 2 (IMPL-PLAN-remote-batch-stage2.md 2.2.1): the groups again, over the slots
-                    // agreed; the pipelined windows keep every row on the worker (kStageSlotKeepAll), so a worker
-                    // whose hello does not say it understands that runs one group.  batch_pad=0: no group window here
-                    // carries an idle slot's pad row, so an idle slot keeps its conversation (the server's slot choice)
+                    // agreed (the rule itself: `auto` or the G given, against o.batch now - --batch 5 with `auto` was
+                    // one group, the 4 slots a worker agreed are 2), then the worker's side: the pipelined windows keep
+                    // every row on the worker (kStageSlotKeepAll), so a worker whose hello does not say it understands
+                    // that runs one group.  batch_pad=0: no group window here carries an idle slot's pad row, so an
+                    // idle slot keeps its conversation (the server's slot choice)
+                    remote_groups(false);
                     if (o.batch_groups > 1) {
                         const char* why = o.batch < 2 ? "fewer than 2 batch slots were agreed"
                                         : o.batch % o.batch_groups != 0 ? "the groups do not divide the slots agreed"
