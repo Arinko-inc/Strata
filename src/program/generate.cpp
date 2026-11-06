@@ -3652,10 +3652,6 @@ int main(int argc, char** argv) {
                   "and no --layer-split";
         else if (stage_worker && !o.mtp.empty())
             why = "a --stage-worker does not take --mtp (the draft layer runs in the main process, with the head)";
-        // remote-batch (protocol 8): a worker's --batch N carves N slot sessions for its layers.  SKELETON: refused until
-        // the worker's part is in (担当B removes this line)
-        else if (stage_worker && o.batch > 0)
-            why = "--batch on a stage worker is not in this build yet (remote-batch: the worker)";
         else if (!stage_worker && (o.stage_end >= 0 || !o.stage_next.empty()))
             why = "--stage-end and --stage-next are for a relay --stage-worker";
         else if (stage_worker && ((o.stage_end >= 0) != !o.stage_next.empty() ||
@@ -13402,33 +13398,370 @@ int main(int argc, char** argv) {
                 // strata-mesh IMPL-PLAN-remote-batch.md sections 3 and 5.  Only with --batch (the slot sessions carved
                 // at the start, bslot_ss[0]); without it the handlers stay unset and a slot message gets an error.
                 // 担当B writes everything between these two marks (it may wrap hs.hello and hs.disconnected here).
+                // (the state below outlives this block: the handlers set in it keep references to it; without
+                // --batch it is empty and nothing reads it)
+                // per connection (IMPL-PLAN section 3.9): the slots this link agreed (n = the fewer of the main
+                // process's and this worker's - a relay's: the fewer of its own and its next worker's), and for each
+                // slot whether this main process saved into it and how many cells it holds
+                int wk_slot_n = 0;
+                std::vector<char> wk_slot_live((size_t) std::max(o.batch, 0), 0);
+                std::vector<int64_t> wk_slot_len((size_t) std::max(o.batch, 0), 0);
+                // a window sent without kStageSlotKeepAll waits for its SlotCommit: its rows (the slots, in row order)
+                bool wk_slot_wait = false;
+                int wk_wait_S = 0;
+                int wk_wait_rows[strata::kernels::kVerifyMaxT] = {};
+                int64_t wk_next_tag = 0;   // a relay: its own tags to the next worker (this connection's)
+                double wk_slot_own_ms = 0, wk_slot_next_ms = 0;
+                int64_t wk_slot_windows = 0, wk_slot_rows = 0;
+                auto wk_slots_forget = [&] {
+                    std::fill(wk_slot_live.begin(), wk_slot_live.end(), 0);
+                    std::fill(wk_slot_len.begin(), wk_slot_len.end(), 0);
+                    wk_slot_wait = false;
+                    wk_wait_S = 0;
+                    wk_next_tag = 0;
+                };
+                // a slot number this link may use (and, `live`, one this main process saved into); else the error
+                // (the wording is the SYCL worker's)
+                auto slot_ok = [&](int b, bool live, std::string& e) -> bool {
+                    if (wk_slot_n <= 0) {
+                        e = "stage worker: this main process agreed no batch slots (its --batch or this worker's is 0)";
+                        return false;
+                    }
+                    if (b < 0 || b >= wk_slot_n) {
+                        e = "stage worker: slot " + std::to_string(b) + " is outside the " + std::to_string(wk_slot_n) +
+                            " batch slots this main process agreed";
+                        return false;
+                    }
+                    if (live && !wk_slot_live[(size_t) b]) {
+                        e = "stage worker: slot " + std::to_string(b) + " holds nothing from this main process";
+                        return false;
+                    }
+                    return true;
+                };
+                // the adaptive tier on this worker's layers, counted per commit as hs.commit counts
+                auto wk_after_commit = [&](std::string& e) -> bool {
+                    if (!drive.d.usage.empty() && o.adapt_every > 0 && (++wk_rounds % o.adapt_every) == 0 && !adapt()) {
+                        e = "stage worker: an adaptive refill failed";
+                        return false;
+                    }
+                    return true;
+                };
+                // `from` -> `to` (the main session and a slot session, carved alike on this GPU) at L cells: the
+                // running state at L (or checkpoint part `part`, saved at L, in its place) and the K/V of cells
+                // [0, L) - the main process's copy_to_slot / copy_from_slot for stage 0, with the length forms
+                // (a worker's state carries no ids; it has no PLE)
+                auto wk_slot_copy = [&](strata::core::SessionState& from, strata::core::SessionState& to, int64_t L,
+                                        const strata::core::ConversationCheckpoint* part, std::string& e) -> bool {
+                    if (cudaDeviceSynchronize() != cudaSuccess) {
+                        e = std::string("stage worker: before a slot copy: ") + cudaGetErrorString(cudaGetLastError());
+                        return false;
+                    }
+                    try {   // (the images are host vectors: RAM that runs out is this copy's error, not the worker's end)
+                        if (part != nullptr) {
+                            if (!strata::core::conversation_checkpoint_restore(*part, to, g, (size_t) L, e)) return false;
+                        } else {
+                            strata::core::ConversationCheckpoint ck;
+                            if (!strata::core::conversation_checkpoint_save(ck, from, g, (size_t) L, e) ||
+                                !strata::core::conversation_checkpoint_restore(ck, to, g, (size_t) L, e))
+                                return false;
+                        }
+                        for (int64_t j = 0; j < from.qsa_alloc; ++j) {
+                            strata::core::ConversationKv img;
+                            if (!strata::core::conversation_kv_save(img, from.qsa_states[from.qsa_ord0 + j], g, L, true, e))
+                                return false;
+                            if (cudaDeviceSynchronize() != cudaSuccess) {
+                                e = "stage worker: a slot copy: device sync failed";
+                                return false;
+                            }
+                            if (!strata::core::conversation_kv_restore(img, to.qsa_states[to.qsa_ord0 + j], g, L, true, e))
+                                return false;
+                        }
+                    } catch (const std::bad_alloc&) {
+                        (void) cudaDeviceSynchronize();
+                        e = "stage worker: a slot copy: host allocation failed";
+                        return false;
+                    }
+                    if (cudaDeviceSynchronize() != cudaSuccess) {
+                        e = "stage worker: a slot copy: device sync failed";
+                        return false;
+                    }
+                    return true;
+                };
                 if (o.batch > 0) {
+                    // the slot sessions this worker carved at its start (bslot_ss[0]: this worker's layers, carved like
+                    // `ss`; the verifier took them in init_slots).  o.batch is the count that fit (the capacity).
+                    std::fprintf(stderr, "strata serve: stage worker: --batch %d: %zu slot sessions for layers %lld-%lld "
+                                         "(the windows hold up to %d rows)\n", o.batch, bslot_ss.empty() ? (size_t) 0 :
+                                         bslot_ss[0].size(), (long long) own_lo,
+                                 (long long) (stage_relay ? own_hi : g.n_layers) - 1, ver.max_t());
+                    // B-3: the main process's hello.  A relay links its next worker again now (the original handler
+                    // has closed that link), so the slots it answers are those of the next worker running now; it
+                    // tells the main process the fewer of its own and the next worker's.
+                    auto wk_hello = hs.hello;
+                    hs.hello = [&, wk_hello](const strata::net::StageHello& theirs, strata::net::StageHello& mine,
+                                             std::string& e) -> bool {
+                        if (!wk_hello(theirs, mine, e)) return false;
+                        // another protocol: the link refuses it for its number (its fields may sit elsewhere)
+                        if (theirs.protocol != strata::net::kStageProtocol) return true;
+                        int32_t cap = (int32_t) o.batch;
+                        if (stage_relay) {
+                            const NextWorkerWait wait("stage worker: the next worker's hello");
+                            std::string ne;
+                            if (!connect_next(ne)) {
+                                e = "relay: the next worker: " + ne;
+                                return false;
+                            }
+                            cap = std::min(cap, std::max<int32_t>(next_batch_slots, 0));
+                        }
+                        mine.batch_slots = cap;
+                        // (a take-over's candidate is answered here too; its connection is served next, after the
+                        // served one's `disconnected`, and its hello runs again then)
+                        wk_slots_forget();
+                        wk_slot_n = std::max<int32_t>(0, std::min<int32_t>({theirs.batch_slots, cap,
+                                                                           strata::net::kStageSlotMax}));
+                        std::fprintf(stderr, "strata stage worker: batch slots: this link runs %d (the main process "
+                                             "carved %d, this worker %d%s)\n", wk_slot_n, (int) theirs.batch_slots,
+                                     o.batch, stage_relay ? (", the next worker " + std::to_string(next_batch_slots) +
+                                                             ")").c_str() : ")");
+                        return true;
+                    };
+                    // B-3b: a relay that links its next worker again at a reset (it went away meanwhile) must still
+                    // have the slots this link agreed there
+                    if (stage_relay) {
+                        auto wk_reset = hs.reset;
+                        hs.reset = [&, wk_reset](const std::vector<int64_t>& keep, std::string& e) -> bool {
+                            if (!wk_reset(keep, e)) return false;
+                            if (wk_slot_n > 0 && next_batch_slots < wk_slot_n) {
+                                e = "relay: the next worker now has " + std::to_string(next_batch_slots) +
+                                    " batch slots, fewer than the " + std::to_string(wk_slot_n) +
+                                    " this link agreed (start the main process again)";
+                                return false;
+                            }
+                            return true;
+                        };
+                    }
+                    // B-9: a new main process is a new slot space
+                    auto wk_disconnected = hs.disconnected;
+                    hs.disconnected = [&, wk_disconnected] {
+                        if (wk_disconnected) wk_disconnected();
+                        wk_slots_forget();
+                        wk_slot_n = 0;
+                    };
+                    // B-5: one batch window over this worker's layers (rows in wk_in, out in wk_out - a relay's go
+                    // through wk_relay to the next worker, whose rows are the reply)
                     hs.slot_run = [&](int S, const int32_t* slots, const int32_t* tokens, const int64_t* pos,
                                       int64_t flags, std::string& e) -> bool {
-                        // TODO(remote-batch B): IMPL-PLAN section 5.2 B-5
-                        (void) S; (void) slots; (void) tokens; (void) pos; (void) flags;
-                        e = "stage worker: batch slots are not in this build yet (remote-batch skeleton)";
-                        return false;
+                        const WkBusy busy("stage worker batch window");
+                        const auto t0 = Clock::now();
+                        if (wk_slot_wait) {
+                            e = "stage worker: bad slot window: it came before the last window's SlotCommit";
+                            return false;
+                        }
+                        if (S < 1 || S > ver.max_t() || S > (int) strata::kernels::kVerifyMaxT ||
+                            (flags & ~strata::net::kStageSlotKeepAll) != 0) {
+                            e = "stage worker: bad slot window: " + std::to_string(S) + " rows (this worker's windows hold " +
+                                std::to_string(ver.max_t()) + "), flags " + std::to_string((long long) flags);
+                            return false;
+                        }
+                        // each slot's rows together, at its cells: its first row where the slot is, the rest after it
+                        int rows[strata::kernels::kVerifyMaxT] = {};
+                        for (int t = 0; t < S; ++t) {
+                            const int b = slots[t];
+                            if (!slot_ok(b, true, e)) return false;
+                            rows[t] = b;
+                            if (t > 0 && slots[t - 1] == b) {
+                                if (pos[t] != pos[t - 1] + 1) {
+                                    e = "stage worker: bad slot window: slot " + std::to_string(b) + "'s rows are not at consecutive cells";
+                                    return false;
+                                }
+                                continue;
+                            }
+                            for (int u = 0; u < t; ++u)
+                                if (slots[u] == b) {
+                                    e = "stage worker: bad slot window: slot " + std::to_string(b) + "'s rows are not together";
+                                    return false;
+                                }
+                            if (pos[t] != wk_slot_len[(size_t) b]) {
+                                e = "stage worker: bad slot window: slot " + std::to_string(b) + " holds " +
+                                    std::to_string((long long) wk_slot_len[(size_t) b]) + " cells, its row is at " +
+                                    std::to_string((long long) pos[t]);
+                                return false;
+                            }
+                        }
+                        if (stage_relay && !relay.wait(e)) {
+                            e = "relay: the next worker: " + e;
+                            return false;
+                        }
+                        // as hs.run: a prompt's loan goes back first (a window reads the whole cache), then the adaptive
+                        // tier's swaps land - all of them when the overlap is on (a batch window takes no gate)
+                        if (!refill(e)) return false;
+                        if (adapt_nowait()) apply_pending(false);
+                        else if (aov && !pending.empty()) apply_pending(true);
+                        else if (pending.empty() || ++pending_age >= adapt_lag()) apply_pending(true);
+                        drive.d.layers = 0;
+                        drive.d.experts = 0;
+                        drive.d.failed = false;
+                        if (!ver.run_slot_rows(rows, S, tokens, pos, win_pool_fn, win_pool_user, wk_outv.data(), e) ||
+                            drive.d.failed) {
+                            if (drive.d.failed && drive.d.fail) e = drive.d.fail;
+                            return false;
+                        }
+                        const auto t1 = Clock::now();
+                        const bool keep_all = (flags & strata::net::kStageSlotKeepAll) != 0;
+                        // a relay: the next worker runs the rest of the window (after this worker's layers) and its
+                        // rows are the reply; meanwhile this worker keeps its rows when the window keeps them all
+                        const int64_t tag = ++wk_next_tag;
+                        if (stage_relay) {
+                            const NextWorkerWait wait("stage worker: the next worker's batch window");
+                            if (!next_link.slot_run_send(S, slots, tokens, pos, flags, tag, wk_relay, (size_t) S * HBF, e)) {
+                                e = "relay: the next worker: " + e;
+                                return false;
+                            }
+                        }
+                        if (keep_all) {
+                            if (!ver.commit_slots(e) || !ver.wait_commit(e)) return false;
+                            for (int t = 0; t < S; ++t) ++wk_slot_len[(size_t) rows[t]];
+                            if (!wk_after_commit(e)) return false;
+                        } else {
+                            wk_slot_wait = true;
+                            wk_wait_S = S;
+                            std::copy(rows, rows + S, wk_wait_rows);
+                        }
+                        const auto t2 = Clock::now();
+                        if (stage_relay) {
+                            const NextWorkerWait wait("stage worker: the next worker's batch window");
+                            if (!next_link.slot_run_recv(tag, S, wk_out, (size_t) S * HBF, e)) {
+                                e = "relay: the next worker: " + e;
+                                return false;
+                            }
+                        }
+                        if (wk_timing) {
+                            wk_slot_own_ms += std::chrono::duration<double, std::milli>(t2 - t0).count();
+                            wk_slot_next_ms += std::chrono::duration<double, std::milli>(Clock::now() - t2).count();
+                            wk_slot_rows += S;
+                            if (++wk_slot_windows % 64 == 0) {
+                                std::fprintf(stderr, "strata stage worker: batch windows: own layers %.2f ms%s each "
+                                                     "(64 windows, %.2f rows each; the last one's layers alone %.2f ms)\n",
+                                             wk_slot_own_ms / 64, stage_relay ? (", next worker " +
+                                                                                 std::to_string(wk_slot_next_ms / 64) +
+                                                                                 " ms").c_str() : "",
+                                             (double) wk_slot_rows / 64,
+                                             std::chrono::duration<double, std::milli>(t1 - t0).count());
+                                wk_slot_own_ms = wk_slot_next_ms = 0;
+                                wk_slot_rows = 0;
+                            }
+                        }
+                        return true;
                     };
-                    hs.slot_commit = [&](const int32_t* keep, int n, std::string& e) -> bool {
-                        // TODO(remote-batch B): B-6
-                        (void) keep; (void) n;
-                        e = "stage worker: batch slots are not in this build yet (remote-batch skeleton)";
-                        return false;
+                    // B-6: the last window's rows to keep per slot (keep[s], s < m), padded to this worker's capacity
+                    hs.slot_commit = [&](const int32_t* keep, int m, std::string& e) -> bool {
+                        const WkBusy busy("stage worker batch commit");
+                        if (wk_slot_n <= 0) return slot_ok(0, false, e);
+                        if (m < 1 || m > wk_slot_n) {
+                            e = "stage worker: bad slot commit: " + std::to_string(m) + " slots, this link agreed " +
+                                std::to_string(wk_slot_n);
+                            return false;
+                        }
+                        if (!wk_slot_wait) {
+                            e = "stage worker: bad slot commit: no batch window waits for it";
+                            return false;
+                        }
+                        wk_slot_wait = false;
+                        std::vector<int> k((size_t) ver.n_slots(), 0);
+                        for (int s = 0; s < m; ++s) k[(size_t) s] = keep[s];
+                        // a slot outside the window keeps nothing (the verifier checks the window's own: 1..its rows)
+                        for (int s = 0; s < m; ++s) {
+                            if (k[(size_t) s] == 0) continue;
+                            if (std::find(wk_wait_rows, wk_wait_rows + wk_wait_S, s) == wk_wait_rows + wk_wait_S) {
+                                e = "stage worker: bad slot commit: slot " + std::to_string(s) + " keeps " + std::to_string(k[(size_t) s]) +
+                                    " rows of a window it was not in";
+                                return false;
+                            }
+                        }
+                        if (stage_relay) {   // the next worker commits meanwhile (one way)
+                            const NextWorkerWait wait("stage worker: the next worker's batch commit");
+                            if (!next_link.slot_commit(keep, m, wk_next_tag, e)) {
+                                e = "relay: the next worker: " + e;
+                                return false;
+                            }
+                        }
+                        if (!ver.commit_slot_prefixes(k.data(), e) || !ver.wait_commit(e)) return false;
+                        for (int t = 0; t < wk_wait_S; ++t)
+                            if (t == 0 || wk_wait_rows[t] != wk_wait_rows[t - 1])
+                                wk_slot_len[(size_t) wk_wait_rows[t]] += k[(size_t) wk_wait_rows[t]];
+                        return wk_after_commit(e);
                     };
-                    hs.slot_save = [&](int slot, int64_t L, std::string& e) -> bool {
-                        // TODO(remote-batch B): B-7
-                        (void) slot; (void) L;
-                        e = "stage worker: batch slots are not in this build yet (remote-batch skeleton)";
-                        return false;
+                    // B-7: the session (serve_stage checked it is at L) into slot b - the main process's copy_to_slot
+                    hs.slot_save = [&](int b, int64_t L, std::string& e) -> bool {
+                        const WkBusy busy("stage worker slot save");
+                        if (!slot_ok(b, false, e)) return false;
+                        if (L < 1 || L > o.max_context || wk_slot_wait) {
+                            e = wk_slot_wait ? "stage worker: a slot save while a batch window waits for its commit"
+                                             : "stage worker: a slot save at " + std::to_string((long long) L) +
+                                               " (the context is " + std::to_string(o.max_context) + ")";
+                            return false;
+                        }
+                        if (stage_relay) {   // the next worker first, synchronously
+                            const NextWorkerWait wait("stage worker: the next worker's slot save");
+                            if (!relay.wait(e) || !next_link.slot_save(b, L, e)) {
+                                e = "relay: the next worker: " + e;
+                                return false;
+                            }
+                        }
+                        wk_slot_live[(size_t) b] = 0;   // (half written until the copy is done)
+                        if (!ver.wait_commit(e) || !refill(e)) return false;
+                        apply_pending(true);
+                        if (!wk_slot_copy(ss, *bslot_ss[0][(size_t) b], L, nullptr, e)) return false;
+                        wk_slot_live[(size_t) b] = 1;
+                        wk_slot_len[(size_t) b] = L;
+                        return true;
                     };
-                    hs.slot_load = [&](int slot, int64_t L, int64_t ckpt_id, std::string& e) -> bool {
-                        // TODO(remote-batch B): B-8
-                        (void) slot; (void) L; (void) ckpt_id;
-                        e = "stage worker: batch slots are not in this build yet (remote-batch skeleton)";
-                        return false;
+                    // B-8: slot b (and checkpoint part ckpt_id at L, 0: the slot's own state at its length) into the
+                    // session - the main process's copy_from_slot
+                    hs.slot_load = [&](int b, int64_t L, int64_t ckpt_id, std::string& e) -> bool {
+                        const WkBusy busy("stage worker slot load");
+                        if (wk_slot_wait) {
+                            e = "stage worker: bad slot message: a slot load while a batch window waits for its commit";
+                            return false;
+                        }
+                        if (!slot_ok(b, true, e)) return false;
+                        const int64_t len = wk_slot_len[(size_t) b];
+                        if (ckpt_id == 0 ? L != len : (L < 1 || L > len)) {
+                            e = "stage worker: bad slot message: slot " + std::to_string(b) + " holds " + std::to_string((long long) len) +
+                                " cells, the load asks for " + std::to_string((long long) L) +
+                                (ckpt_id == 0 ? "" : " (checkpoint " + std::to_string((long long) ckpt_id) + ")");
+                            return false;
+                        }
+                        // this worker's part before anything changes (a missing one: the main process reads the
+                        // prompt from token 0)
+                        const strata::net::StageCkptStore::Part* part = nullptr;
+                        if (ckpt_id != 0) {
+                            part = ckpt_store.find(ckpt_id);
+                            if (part == nullptr) {
+                                e = strata::net::kStageCkptMissing + std::to_string(ckpt_id);
+                                return false;
+                            }
+                            if (part->L != L) {
+                                e = "checkpoint " + std::to_string(ckpt_id) + " was saved at " + std::to_string(part->L) +
+                                    ", not at " + std::to_string(L);
+                                return false;
+                            }
+                        }
+                        if (stage_relay) {
+                            const NextWorkerWait wait("stage worker: the next worker's slot load");
+                            bool next_missing = false;
+                            if (!relay.wait(e) || !next_link.slot_load(b, L, ckpt_id, next_missing, e)) {
+                                // (the next worker's missing part is this worker's too: the same fallback)
+                                e = next_missing ? strata::net::kStageCkptMissing + std::to_string(ckpt_id) +
+                                                       " (the next worker)"
+                                                 : "relay: the next worker: " + e;
+                                return false;
+                            }
+                        }
+                        if (!ver.wait_commit(e) || !refill(e)) return false;
+                        apply_pending(true);
+                        return wk_slot_copy(*bslot_ss[0][(size_t) b], ss, L, part != nullptr ? &part->state : nullptr, e);
                     };
-                    (void) next_batch_slots;   // TODO(remote-batch B): B-3, a relay's hello
                 }
                 // ==== end REMOTE-BATCH WORKER (B) ====
                 strata::net::StageBuffers bufs;
