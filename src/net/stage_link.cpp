@@ -1361,12 +1361,15 @@ bool StageSlotPipe::send(int id, int S, const int32_t* slots, const int32_t* tok
             return false;
         }
     }
-    // (the out rows are checked here too, so a reply never has to be refused for its size)
+    // The reply's rows are as wide as the window's (the link's hand-off width, which slot_run_send checks in_floats
+    // against): checked before anything goes out, as slot_run checks them - a reply the reader refused for its size
+    // would stay unread on a link that looks in step.
     std::string e;
     bool ok = false;
-    if (S < 1 || out_floats == 0 || out_floats % (size_t) S != 0)
+    if (S < 1 || out_floats != in_floats)
         e = "remote stage: batch window " + std::to_string(id) + "'s reply rows (" + std::to_string(out_floats) +
-            " floats) are not S = " + std::to_string(S) + " rows";
+            " floats) are not its S = " + std::to_string(S) + " rows of the hand-off width (" +
+            std::to_string(in_floats) + " floats in)";
     else
         ok = link_.slot_run_send(S, slots, tokens, pos, flags, tag, rows_in, in_floats, e);
     std::lock_guard<std::mutex> lk(mu_);
