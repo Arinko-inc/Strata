@@ -14634,6 +14634,30 @@ int main(int argc, char** argv) {
         };
         // one batch window over the active slots only (row t is the t-th active slot): an idle slot is not touched,
         // so it keeps the conversation it holds
+        // The timed windows' start (the timing lines' baselines) and their end, one for batch_step and pump: a remote
+        // stage's pipelined groups (remote-batch stage 2) run both in turn - pump's group windows, a prompt read's serial
+        // windows (batch_step) between its chunks, pump again - and either may print the line the other's windows began
+        // (batch_step's reads the per-stage baselines, which pump's start left unset before).  Elsewhere only one of them
+        // ever runs (a layer split's pipelined groups read a prompt in one piece or through pump), and these do what each
+        // did: pump's start now sets the serial baselines too, and its end clears the serial counters, which only
+        // batch_step moves.
+        auto bt_begin = [&] {
+            bt_start = Clock::now();
+            bt_wait0 = ver.ms_wait; bt_pool0 = ver.ms_pool;
+            bt_miss0 = drive.d.multi_misses; bt_hits0 = drive.d.cache_hits; bt_pcie0 = drive.d.pcie_experts;
+            bt_stage_wait0.assign(stages.size() + 1, 0.0);
+            bt_stage_pool0.assign(stages.size() + 1, 0.0);
+            for (size_t k = 0; k <= stages.size(); ++k) {
+                bt_stage_wait0[k] = stage_verifier((int) k).ms_wait;
+                bt_stage_pool0[k] = stage_verifier((int) k).ms_pool;
+            }
+            bt_cpu_ent0 = drive.d.multi_entries; bt_off_ent0 = drive.d.offload_entries;
+            bt_a_rounds0 = a_rounds; bt_a_swapped0 = a_swapped;
+        };
+        auto bt_clear = [&] {
+            bt_run = bt_commit = bt_emit = bt_adapt_wait = 0;
+            bt_windows = bt_rows = bt_tokens = bt_accepted = bt_adapt_rounds = bt_adapt_swaps = 0;
+        };
         auto batch_step = [&]() -> bool {
             int S = 0;
             int rows[strata::kernels::kVerifyMaxT] = {};
@@ -14684,19 +14708,7 @@ int main(int argc, char** argv) {
                 }
                 bt_adapt_wait += std::chrono::duration<double, std::milli>(Clock::now() - ta).count();
             }
-            if (bt_windows == 0) {
-                bt_start = Clock::now();
-                bt_wait0 = ver.ms_wait; bt_pool0 = ver.ms_pool;
-                bt_miss0 = drive.d.multi_misses; bt_hits0 = drive.d.cache_hits; bt_pcie0 = drive.d.pcie_experts;
-                bt_stage_wait0.assign(stages.size() + 1, 0.0);
-                bt_stage_pool0.assign(stages.size() + 1, 0.0);
-                for (size_t k = 0; k <= stages.size(); ++k) {
-                    bt_stage_wait0[k] = stage_verifier((int) k).ms_wait;
-                    bt_stage_pool0[k] = stage_verifier((int) k).ms_pool;
-                }
-                bt_cpu_ent0 = drive.d.multi_entries; bt_off_ent0 = drive.d.offload_entries;
-                bt_a_rounds0 = a_rounds; bt_a_swapped0 = a_swapped;
-            }
+            if (bt_windows == 0) bt_begin();
             const Clock::time_point w0 = Clock::now();
             if (!ver.run_slot_rows(rows, S, tok, pos, win_pool_fn, win_pool_user, outb, err) || drive.d.failed) {
                 std::printf("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
@@ -14849,8 +14861,7 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata batch: MTP proposals accepted %lld of %lld (%.1f%%)\n",
                                  (long long) bt_accepted, (long long) (bt_rows - bt_accepted),
                                  100.0 * (double) bt_accepted / (double) std::max<int64_t>(bt_rows - bt_accepted, 1));
-                bt_run = bt_commit = bt_emit = bt_adapt_wait = 0;
-                bt_windows = bt_rows = bt_tokens = bt_accepted = bt_adapt_rounds = bt_adapt_swaps = 0;
+                bt_clear();
             }
             return true;
         };
@@ -15170,11 +15181,7 @@ int main(int argc, char** argv) {
                     rpt.ov = rpt.ov || (h != stage_group[0] && pg[(size_t) h].inflight && pg[(size_t) h].stage == 1 &&
                                         !rp_in[(size_t) h]);
             }
-            if (bt_windows == 0 && !pipe_inflight()) {
-                bt_start = Clock::now();
-                bt_wait0 = ver.ms_wait; bt_pool0 = ver.ms_pool;
-                bt_miss0 = drive.d.multi_misses; bt_hits0 = drive.d.cache_hits; bt_pcie0 = drive.d.pcie_experts;
-            }
+            if (bt_windows == 0 && !pipe_inflight()) bt_begin();   // (the serial windows' baselines too: see bt_begin)
             for (int k = 0; k < n_pipe; ++k) {
                 const int gi = stage_group[(size_t) k];
                 if (gi < 0) continue;
@@ -15450,7 +15457,7 @@ int main(int argc, char** argv) {
                     const std::string pr = stage_verifier(k).profile_report();
                     if (!pr.empty()) std::fprintf(stderr, "strata batch GPU stages, stage %d (ms/window):%s\n", k + 1, pr.c_str());
                 }
-                bt_windows = bt_rows = bt_tokens = bt_accepted = 0;
+                bt_clear();   // (and the serial windows' counters: see bt_begin)
                 // (not while a prompt is read in a request: its windows ran beside it, and the watchdog stays on for
                 // the rest of the read, STRATA_PIPED_CONCURRENT; the request's end turns it off)
                 if (!in_prompt_read) strata::core::progress().busy.store(false);
