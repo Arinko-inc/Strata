@@ -226,7 +226,8 @@ public:
     /// REMOTE STAGE, the main side, batch windows (protocol 8, strata-mesh IMPL-PLAN-remote-batch.md): as set_remote
     /// for run() / commit().  run_slot_rows first calls `slot_run(rows, S, tokens, pos, err)`, which must leave the
     /// worker's S rows in this stage's handoff_in (rows [0, S)); commit_slot_prefixes first calls
-    /// `slot_commit(keep, n_slots(), err)` (one way).  Unset (the default): nothing is called.  Before the first window.
+    /// `slot_commit(keep, n_slots(), err)` (one way; keep[] has this verifier's capacity, n_slots(): the hook sends the
+    /// slots the link agreed, which may be fewer).  Unset (the default): nothing is called.  Before the first window.
     void set_remote_slots(std::function<bool(const int* rows, int S, const int32_t* tokens, const int64_t* pos,
                                              std::string& err)> slot_run,
                           std::function<bool(const int* keep, int n, std::string& err)> slot_commit) {

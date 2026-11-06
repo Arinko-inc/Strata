@@ -41,7 +41,8 @@ inline constexpr int32_t kStageCkptMax = 64;
 /// recovers from (it reads the prompt from token 0); every other error means the worker's session is lost
 inline constexpr char kStageCkptMissing[] = "checkpoint not held: ";
 /// Batch slots over the link (protocol 8, `--batch N` on every stage; strata-mesh IMPL-PLAN-remote-batch.md): the most
-/// slots a SlotCommit lists, and the bound of a slot number
+/// slots a SlotCommit lists, and the bound of a slot number.  A link uses slots [0, n) only, n = the fewer of the two
+/// hellos' batch_slots (each side works it out and keeps it for the connection)
 inline constexpr int32_t kStageSlotMax = 64;
 /// SlotRun's flags (header b), bit 0: keep every row - the worker commits the window right behind it and no SlotCommit
 /// follows for it.  Every other bit must be 0 (a side that sends a later bit checks the peer's hello first).
@@ -77,9 +78,11 @@ enum class StageMsg : uint32_t {
     SlotRun = 16,     // a = S rows, b = flags (kStageSlotKeepAll), c = tag; payload: int32 slot[S] (row t is slot slot[t],
                       // a slot's rows contiguous), int32 tokens[S], int64 pos[S], rows[S * handoff_floats]
     SlotRunOk = 17,   // a = the worker's time (us), c = the SlotRun's tag; payload: rows[S * handoff_floats]
-    SlotCommit = 18,  // a = n, c = the tag of the window it commits (the last SlotRun, sent without kStageSlotKeepAll);
-                      // payload: int32 keep[n] (keep[s]: the rows of slot s the window keeps, 0: not in it).  No reply:
-                      // a failure comes back on the next SlotRun's, SlotSave's or SlotLoad's (a Reset does not drop it)
+    SlotCommit = 18,  // a = m (1 <= m <= the slots the link agreed; the main process sends that count, a relay passes m
+                      // on; slots from m on are not in the window), c = the tag of the window it commits (the last
+                      // SlotRun, sent without kStageSlotKeepAll); payload: int32 keep[m] (keep[s]: the rows of slot s
+                      // the window keeps, 0: not in it).  No reply: a failure comes back on the next SlotRun's,
+                      // SlotSave's or SlotLoad's (a Reset does not drop it)
     SlotSave = 19,    // a = slot, b = L (the worker's session must be at L): the session's running state and its K/V
                       // cells [0, L) into the slot (a batch admission, a read that gave way)
     SlotSaveOk = 20,  // a = the worker's time (us)
@@ -114,9 +117,10 @@ struct StageHello {
     /// process lists fp32 and the one it asks for (STRATA_REMOTE_ROWS), a worker every one it has
     uint32_t row_formats = 1u << 0;
     char build[40] = {};          ///< engine build id (informational; 48 bytes up to protocol 7)
-    /// protocol 8: the batch slots this side runs (a main process: its --batch after its own carve; a worker: the slot
-    /// sessions it carved at its start, a relay the fewer of its own and its next worker's; 0: none).  No side refuses
-    /// for it: the main process runs the fewest (strata-mesh IMPL-PLAN-remote-batch.md section 3.7)
+    /// protocol 8: this side's batch slot capacity (a main process: its --batch after its own carve; a worker: the slot
+    /// sessions it carved at its start; a relay: the fewer of its own and its next worker's, linked again before it
+    /// answers; 0: none).  No side refuses for it: the link uses the fewer of the two hellos' (strata-mesh
+    /// IMPL-PLAN-remote-batch.md section 3.7)
     int32_t batch_slots = 0;
     uint32_t batch_flags = 0;     ///< kStageBatchKeepAll / kStageBatchOverlap
     char token[64] = {};          ///< the shared secret (STRATA_STAGE_TOKEN); the worker refuses a wrong one
@@ -241,7 +245,7 @@ public:
                        int64_t tag, const float* rows_in, size_t in_floats, std::string& err);
     /// The oldest window's reply: S rows into rows_out.  Its tag must be `tag` (else the link is out of step: failed).
     bool slot_run_recv(int64_t tag, int S, float* rows_out, size_t out_floats, std::string& err);
-    /// The rows each slot keeps of window `tag` (keep[s], s < n; 0: not in it).  One way.
+    /// The rows each slot keeps of window `tag` (keep[s], s < n; 0: not in it); n: the slots the link agreed.  One way.
     bool slot_commit(const int32_t* keep, int n, int64_t tag, std::string& err);
     /// The worker's session (at L) into slot `slot`: its running state and its K/V cells [0, L).
     bool slot_save(int slot, int64_t L, std::string& err);
@@ -334,7 +338,9 @@ struct StageHandlers {
     /// right behind the window (no SlotCommit follows).
     std::function<bool(int S, const int32_t* slots, const int32_t* tokens, const int64_t* pos, int64_t flags,
                        std::string& err)> slot_run;
-    /// The last window's rows to keep per slot (keep[s], s < n).  A failure is reported on the next slot message's reply.
+    /// The last window's rows to keep per slot (keep[s], s < n; serve_stage checks 1 <= n <= kStageSlotMax, the handler
+    /// n <= the slots it agreed, and pads keep[] with zeros to its own capacity).  A failure is reported on the next slot
+    /// message's reply.
     std::function<bool(const int32_t* keep, int n, std::string& err)> slot_commit;
     /// The session (serve_stage has checked it is at L) into `slot`.
     std::function<bool(int slot, int64_t L, std::string& err)> slot_save;
