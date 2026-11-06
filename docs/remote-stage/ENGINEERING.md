@@ -121,6 +121,37 @@ asked for out of order and one with another tag, SlotCommit's keep list and its 
 position, SlotLoad's position and a missing id, malformed messages and a worker without slots, and that none of
 these errors counts as a lost link. The design and its open points: strata-mesh `IMPL-PLAN-remote-batch.md`.
 
+**Pipelined groups (stage 2, `--batch-groups G`).** Still protocol 8: no message or field is new. The main process
+sends each group's window as a SlotRun with the keep-all flag (bit 0) as soon as its own layers are done, without
+waiting for the reply to the window before it; a `StageSlotPipe` reads the replies on a thread of its own, in the
+order sent, into the rows each send named, and the main process polls it (it never waits on the link while another
+group's layers run). The reader holds the link's receive lock only while a window is out, so once the groups are
+drained the link is free for a prompt chunk, a SlotSave or a SlotLoad as before. The main process keeps four rules:
+a group's windows carry the keep-all flag and no SlotCommit follows them; a group's next window goes out only after
+its reply is in and its head has run (the same slot's windows never pass each other); while a group's window is out
+it sends nothing but SlotRuns (every other message waits until every reply is in); the tags are one count, as for the
+windows one at a time, and the pipe checks each reply's tag against the order sent (another one breaks the link). The
+pipe's first error (a send, a read, or the worker's Error for a window) fails it; `stop()` with a window out cuts the
+link (its reply would reach whoever reads next), and with none out leaves it as it was. A relay answers a keep-all
+window late (`StageHandlers::slot_run_reply`, unless `STRATA_RELAY_SLOT_OVERLAP=0`): `slot_run` runs its layers,
+sends the window on and returns; `serve_stage` lets the reply to the window before go out, then sends this one's on a
+reply thread, where `slot_run_reply` reads the next worker's rows, and serves the next message meanwhile. One reply
+thread runs at a time, so the replies keep the windows' order. A prompt chunk's reply still going out is waited for
+before a late window runs, and every message other than a SlotRun waits for the late replies first (so a SlotCommit,
+Reset, SlotSave, SlotLoad or hello comes after them, and the idle time and the take-over count from the last one). The
+next worker's replies are read on the reply thread only, in the order sent: `slot_run` returns false only when it
+sent nothing on (the error is answered at once, after the reply before it); a failure after the send is kept with
+the window, and its `slot_run_reply` reads the next worker's reply first, then answers the error - reading it on the
+serving thread instead could overtake the reply thread's read of the window before, find that window's tag first and
+break the link. A window without the keep-all flag is answered as before. `stage_link_batch_test` covers it over
+loopback: the next window runs before the reply before it is out and the replies keep their order and tags; a window
+without the flag is not answered late; a late window behind a chunk's reply; a late reply's failure answered as that
+window's error with the link going on; SlotCommit, Reset and SlotSave after a late window; `StageSlotPipe` (polls in
+any order, `outstanding`, the worker's error, a number sent twice, `stop()` with and without a window out); and three
+stages on loopback with a relay's failure after its send (the window before's rows, this window's error and the next
+window's rows, in order, the links standing - and the wrong form, the failed window's reply read on the serving
+thread, breaking the relay's next link). The design: strata-mesh `IMPL-PLAN-remote-batch-stage2.md`.
+
 **Recovery.** The worker serves one connection at a time. A new one stays in the listen backlog, unread, until the
 served one has had no message read, being read, or a reply going out for `STRATA_REMOTE_TAKEOVER_S` (30 s; 0:
 never) - the time counts from the last of those, so a relay's reply that waited long on its next worker starts it
@@ -239,7 +270,8 @@ head run this one: [REMOTE_STAGE.md](../REMOTE_STAGE.md#overlapping-the-decode-w
 ### More than two stages (relay workers)
 
 A relay worker (`--stage-end K2 --stage-next HOST:PORT`) runs [K, K2) and is a client of the next worker as the main
-process is its client: windows go on synchronously and the next worker's rows are this worker's reply; prompt chunks
+process is its client: windows go on synchronously and the next worker's rows are this worker's reply (a keep-all
+batch window of pipelined groups is answered late, on a reply thread: see the protocol); prompt chunks
 go on through a `StageRelay` (one send in flight, in order), and the next worker's reply to a chunk is read and
 forwarded on the replying thread (`StageHandlers::prefill_reply` defers the answer until it arrives). A reset and a
 commit go on to the next worker first; a reset waits for a chunk reply still going out. The main process sees one
@@ -996,8 +1028,8 @@ link that is the bottleneck.
   run).
 - **Batch slots over a remote stage** (`--batch N` on every PC, protocol 8): built and covered over loopback
   (`stage_link_batch_test`); not run on GPUs yet, so neither the batch windows' exactness against the solo path nor
-  their speed is measured. Stage 2 (pipelined slot groups over the link, `kStageBatchOverlap`) is designed into the
-  messages but not built.
+  their speed is measured. Stage 2 (pipelined slot groups over the link, `--batch-groups G`, a relay's late replies,
+  `kStageBatchOverlap`) is built and covered over loopback, not yet measured on GPUs.
 - **A ring topology** for three or more PCs.
 - **Windows as the main PC** (only workers were run on Windows), and the clock behaviour of an in-process split on
   Windows.

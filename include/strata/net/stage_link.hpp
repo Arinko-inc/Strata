@@ -21,6 +21,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -28,6 +29,7 @@
 #include <future>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace strata::net {
@@ -326,7 +328,11 @@ private:
 /// protocol 8, the main side's pipelined batch windows (stage 2, strata-mesh IMPL-PLAN-remote-batch-stage2.md 2.2.5):
 /// SlotRuns go out from the caller's thread (slot_run_send); a thread of its own reads their replies in the order they
 /// went out (slot_run_recv), each into the rows its send named, and marks it in.  The caller never waits on the link.
-/// The reader holds the link's receive lock only while a window is out.  Not copyable.
+/// The reader holds the link's receive lock only while a window is out.  Not copyable.  send from one thread (the
+/// order of the sends is the order of the replies); poll and outstanding from any.  The first error (a send's, a
+/// reply's, or the worker's Error for a window) fails the pipe and ends the reader.  stop() with a window out cuts
+/// the link (its reply is lost: the link is out of step and must be made again); with none out it leaves the link
+/// as it was, so the caller goes on with its other messages.
 class StageSlotPipe {
 public:
     explicit StageSlotPipe(StageClient& link);
@@ -347,9 +353,28 @@ public:
     void stop();
 
 private:
+    /// a window out: its reply is read into rows_out (out_floats floats)
+    struct Out {
+        int id = 0;
+        int64_t tag = 0;
+        int S = 0;
+        float* rows_out = nullptr;
+        size_t out_floats = 0;
+    };
+    enum : uint8_t { kIdle = 0, kOut = 1, kIn = 2 };   ///< a window number's state
+    void read_();          ///< the reader thread: the replies in the order sent, until stop() or the first error
+    void fail_(const std::string& e);   ///< mu_ held: the first error (the pipe has failed)
     StageClient& link_;
-    // (C1: the queue of {id, tag, S, rows_out, out_floats}, a mutex and a condition variable, the per-id state, the first
-    // error, the thread)
+    std::mutex send_mu_;   ///< the send and its entry in q_ together (the link's order is q_'s order)
+    mutable std::mutex mu_;
+    std::condition_variable cv_;   ///< (mu_'s) the reader waits for a window to read, or stop()
+    std::deque<Out> q_;            ///< sent, its reply not read yet; oldest first (mu_'s)
+    uint8_t st_[kStageSlotMax] = {};   ///< per window number (mu_'s)
+    int outstanding_ = 0;              ///< numbers out or in, not taken by poll (mu_'s)
+    bool reading_ = false;             ///< the reader is in slot_run_recv (mu_'s)
+    bool stopping_ = false, failed_ = false;   ///< (mu_'s)
+    std::string err_;                  ///< the first error (mu_'s)
+    std::thread th_;                   ///< started by the first send
 };
 
 /// The worker's end.  Every handler runs on the serving thread, one message at a time in arrival order.
@@ -396,8 +421,12 @@ struct StageHandlers {
     /// runs this worker's layers, sends the window on (slot_run_send) and keeps its rows, and returns without the next
     /// worker's rows; serve_stage lets the reply before it go out, then sends this window's reply on the replying thread,
     /// where slot_run_reply fills rows_out (S rows) from the next worker.  Replies go out in the order the windows came;
-    /// the serving thread reads the next message meanwhile.  A failure sends an error for that window instead.  A SlotRun
-    /// without kStageSlotKeepAll is answered as before (slot_run fills run_out and the reply goes out at once).
+    /// the serving thread reads the next message meanwhile.  The next worker's replies are read on the replying thread
+    /// only, one window after another: slot_run returns false only when it sent nothing on (serve_stage then answers
+    /// the error at once, after the reply before it); a failure after the send is kept with that window, and its
+    /// slot_run_reply reads the next worker's reply first (so the link stays in step), then returns false with the kept
+    /// error - that window's reply is an error.  A SlotRun without kStageSlotKeepAll is answered as before (slot_run
+    /// fills run_out and the reply goes out at once).  Any other message waits for the late replies to be out first.
     std::function<bool(int S, float* rows_out, std::string& err)> slot_run_reply;
     /// optional (a relay worker): about once a second while the served main process is idle (no message read or being
     /// read, no reply going out), on the serving thread.  False ends that connection with `err`, as a closed one ends:

@@ -705,11 +705,19 @@ python3 tools/stage_tune.py apply cluster.json OUTDIR    # start the workers as 
   the slots' VRAM comes out of the cache), and the main process uses the fewest slots any stage has (it says so in its
   log and in a second `INFO batch_slots=` line). A worker without `--batch` answers every slot message with an error
   naming `--batch`. Every PC needs the same build (protocol 8: an older worker is refused for its protocol). With a
-  remote stage, `--vision` and `--batch` together are refused, `--batch-groups` above 1 runs one group (the log says
-  why), `--batch-mtp` is turned off (as on a layer split with two stages on one GPU) and so is `--pipeline-windows`
-  (as with any `--batch`).
-  Built 2026-11-07 and covered over loopback; not yet measured on GPUs. The protocol:
-  [ENGINEERING.md](remote-stage/ENGINEERING.md#the-protocol).
+  remote stage, `--vision` and `--batch` together are refused, `--batch-mtp` is turned off (as on a layer split with
+  two stages on one GPU) and so is `--pipeline-windows` (as with any `--batch`).
+  The slots run as **one group** by default (one window over every busy slot, the main process waiting for its
+  reply). `--batch-groups G` on the main process (G >= 2 dividing the slots agreed; `auto`: 2 for an even count)
+  pipelines G groups over the link: when a group's window is through the main process's layers it goes out, and the
+  main process runs the next group's layers while the workers compute, taking the replies on a thread of its own in
+  the order sent. A count that does not divide the slots, fewer than 2 slots, or a worker whose hello lacks the
+  keep-all flag runs one group (the log says why). A relay worker overlaps the groups' windows too: it runs its
+  layers, sends the window on and serves the next window while its next worker computes, answering in the order the
+  windows came (`STRATA_RELAY_SLOT_OVERLAP=0` on the relay turns that off: the main process then overlaps with the
+  workers only). The last worker is unchanged. A worker that answers late says so in its hello (informational).
+  Built 2026-11-07 and covered over loopback; the pipelined groups (stage 2) are not yet measured on GPUs. The
+  protocol: [ENGINEERING.md](remote-stage/ENGINEERING.md#the-protocol).
 - **Refused at start** with a remote stage: `--peer-device`, `--control-vector` (and the speed
   projection, which is one), `--expert-cache-remote`, `--prefill-head-alias`, and `--pipeline-windows` on a worker
   (the main process takes it, see [Overlapping the decode windows](#overlapping-the-decode-windows---pipeline-windows-2)).

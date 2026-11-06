@@ -1328,29 +1328,128 @@ bool StageRelay::send(const int64_t* tokens, int64_t T, int64_t pos0, int64_t fl
     return true;
 }
 
-// ---- StageSlotPipe (remote-batch stage 2 skeleton: C1 writes it)
+// ---- StageSlotPipe (protocol 8 stage 2, strata-mesh IMPL-PLAN-remote-batch-stage2.md 2.2.5)
 StageSlotPipe::StageSlotPipe(StageClient& link) : link_(link) {}
 
 StageSlotPipe::~StageSlotPipe() { stop(); }
 
+void StageSlotPipe::fail_(const std::string& e) {
+    if (failed_) return;
+    failed_ = true;
+    err_ = e.empty() ? std::string("remote stage: a batch window failed") : e;
+}
+
 bool StageSlotPipe::send(int id, int S, const int32_t* slots, const int32_t* tokens, const int64_t* pos, int64_t flags,
                          int64_t tag, const float* rows_in, size_t in_floats, float* rows_out, size_t out_floats,
                          std::string& err) {
-    (void) id; (void) S; (void) slots; (void) tokens; (void) pos; (void) flags; (void) tag; (void) rows_in;
-    (void) in_floats; (void) rows_out; (void) out_floats;
-    err = "remote stage: StageSlotPipe is not in this build yet";
-    return false;
+    std::lock_guard<std::mutex> ls(send_mu_);
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (!failed_) {
+            if (stopping_)
+                fail_("remote stage: the batch window pipe has stopped");
+            else if (id < 0 || id >= kStageSlotMax)
+                fail_("remote stage: batch window number " + std::to_string(id) + " (0.." +
+                      std::to_string(kStageSlotMax - 1) + ")");
+            else if (st_[id] != kIdle)
+                fail_("remote stage: batch window " + std::to_string(id) + " sent again before its reply was taken");
+            else if (rows_out == nullptr)
+                fail_("remote stage: batch window " + std::to_string(id) + " without rows for its reply");
+        }
+        if (failed_) {
+            err = err_;
+            return false;
+        }
+    }
+    // (the out rows are checked here too, so a reply never has to be refused for its size)
+    std::string e;
+    bool ok = false;
+    if (S < 1 || out_floats == 0 || out_floats % (size_t) S != 0)
+        e = "remote stage: batch window " + std::to_string(id) + "'s reply rows (" + std::to_string(out_floats) +
+            " floats) are not S = " + std::to_string(S) + " rows";
+    else
+        ok = link_.slot_run_send(S, slots, tokens, pos, flags, tag, rows_in, in_floats, e);
+    std::lock_guard<std::mutex> lk(mu_);
+    if (!ok) {
+        fail_(e);
+        err = err_;
+        cv_.notify_all();
+        return false;
+    }
+    st_[id] = kOut;
+    ++outstanding_;
+    q_.push_back(Out{id, tag, S, rows_out, out_floats});
+    if (!th_.joinable()) th_ = std::thread([this] { read_(); });
+    cv_.notify_all();
+    return true;
+}
+
+void StageSlotPipe::read_() {
+    std::unique_lock<std::mutex> lk(mu_);
+    for (;;) {
+        cv_.wait(lk, [&] { return stopping_ || failed_ || !q_.empty(); });
+        if (stopping_ || failed_) return;
+        const Out o = q_.front();
+        q_.pop_front();
+        reading_ = true;
+        lk.unlock();
+        // (the receive lock only now, while this window is out: the link is the caller's again once the pipe is empty)
+        std::string e;
+        const bool ok = link_.slot_run_recv(o.tag, o.S, o.rows_out, o.out_floats, e);
+        lk.lock();
+        reading_ = false;
+        if (!ok) {
+            fail_(stopping_ ? "remote stage: the batch window pipe was stopped with window " + std::to_string(o.id) +
+                                  " out (" + e + ")"
+                            : e);
+            cv_.notify_all();
+            return;
+        }
+        st_[o.id] = kIn;   // (its rows are written: poll takes them under mu_, after this)
+    }
 }
 
 int StageSlotPipe::poll(int id, std::string& err) {
-    (void) id;
-    err = "remote stage: StageSlotPipe is not in this build yet";
-    return -1;
+    std::lock_guard<std::mutex> lk(mu_);
+    if (!failed_ && (id < 0 || id >= kStageSlotMax))
+        fail_("remote stage: batch window number " + std::to_string(id) + " (0.." + std::to_string(kStageSlotMax - 1) +
+              ")");
+    if (failed_) {
+        err = err_;
+        return -1;
+    }
+    if (st_[id] != kIn) return 0;
+    st_[id] = kIdle;
+    --outstanding_;
+    return 1;
 }
 
-int StageSlotPipe::outstanding() const { return 0; }
+int StageSlotPipe::outstanding() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return outstanding_;
+}
 
-void StageSlotPipe::stop() { (void) link_; }
+void StageSlotPipe::stop() {
+    bool cut = false;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        stopping_ = true;
+        // a window still out: its reply would come to whoever reads the link next - cut the link (a read in progress
+        // fails at once).  None out: the link is left as it was.
+        if (reading_ || !q_.empty()) {
+            cut = true;
+            link_.abort();
+            if (!reading_) fail_("remote stage: the batch window pipe was stopped with a window out");
+            q_.clear();   // (lost with the link: a second stop() does not cut a link made again since)
+        }
+    }
+    cv_.notify_all();
+    if (th_.joinable() && th_.get_id() != std::this_thread::get_id()) th_.join();
+    // a reply nobody read: the shut socket marks the link failed now (a cut read has done so itself), so the caller
+    // sees it down (connected() false) and makes it again
+    std::string e;
+    if (cut) (void) link_.alive(e);
+}
 
 int serve_stage(const std::string& bind_addr, int port, const std::string& token, const StageHandlers& h,
                 const StageBuffers& buf, StageStats& stats, const std::atomic<bool>* stop) {
@@ -1637,10 +1736,13 @@ int serve_stage(const std::string& bind_addr, int port, const std::string& token
         // a slice of the replies' rows in another format than fp32: a window's (this thread's), a prompt chunk's (its
         // reply thread's: one is out at a time), and that one's conversion time (stats has it once the reply is out)
         std::vector<unsigned char> run_tx, pf_tx;
+        // a late window's reply (protocol 8 stage 2, a relay): its rows in the link's format, on its reply thread
+        std::vector<unsigned char> sr_tx;
         double reply_encode_ms = 0;
         // a prompt chunk's reply goes out on its own thread while the next chunk is read; every later send waits
         // for it (the replies keep their order), and so does the reuse of its output buffer
         std::future<bool> reply_out;
+        bool reply_is_slot = false;   // reply_out is a late window's (else a prompt chunk's)
         std::string reply_err;
         int out_buf = 0;
         auto replies_out = [&]() -> bool {
@@ -1814,6 +1916,12 @@ int serve_stage(const std::string& bind_addr, int port, const std::string& token
                 if (!reply_error(in.bad)) break;
                 continue;
             }
+            // protocol 8 stage 2: a late window's reply goes out before any other message is served (a SlotRun
+            // decides for itself: a late one lets it run on)
+            if (reply_is_slot && reply_out.valid() && type != StageMsg::SlotRun && !replies_out()) {
+                release();
+                break;
+            }
             bool keep = true;
             const auto t0 = Clock::now();
             switch (type) {
@@ -1939,6 +2047,7 @@ int serve_stage(const std::string& bind_addr, int port, const std::string& token
                 r.bytes = stage_rows_bytes(rows_fmt, back_rows, D);
                 const float* src = out + (size_t) skip * D;
                 reply_err.clear();
+                reply_is_slot = false;
                 // (the rows in the link's format on the reply thread too, after a relay's next worker has filled them)
                 reply_out = std::async(std::launch::async, [fd, r, src, back_rows, D, out, T, skip, fmt = rows_fmt,
                                                             &pf_tx, &reply_encode_ms, &h, &reply_err] {
@@ -2053,6 +2162,55 @@ int serve_stage(const std::string& bind_addr, int port, const std::string& token
             // relay's handler talks to its next worker, whose link that reply's thread reads).
             case StageMsg::SlotRun: {
                 const int S = (int) in.h.a;
+                // protocol 8 stage 2 (strata-mesh IMPL-PLAN-remote-batch-stage2.md 2.3.2): a relay answers a window
+                // with kStageSlotKeepAll late - its own layers now, the next worker's rows on the reply thread
+                const bool late = has_slots && h.slot_run_reply && (in.h.b & kStageSlotKeepAll) != 0;
+                if (late) {
+                    // a prompt chunk's reply reads the next worker's link on its thread: out first.  The window
+                    // before this one's is not waited for yet (its thread may still wait on the next worker)
+                    if (reply_out.valid() && !reply_is_slot && !replies_out()) { keep = false; break; }
+                    std::memcpy(buf.run_in, in.rows.data(), in.rows.size() * 4);
+                    stats.ms_decode += in.decode_ms;
+                    std::string e;
+                    bool ok = false;
+                    if (!pending_err.empty() || !pos_err.empty() || !slot_err.empty())
+                        e = join_err(take_pending(), take_slot_err());
+                    else ok = h.slot_run(S, in.slots32.data(), in.tok32.data(), in.pos64.data(), in.h.b, e);
+                    if (!ok) {   // (nothing went on: answered now, after the reply before it - reply_error waits)
+                        keep = reply_error(e.empty() ? std::string("the batch window failed") : e);
+                        break;
+                    }
+                    const double work_ms = ms_since(t0);
+                    // the reply before this one is out: one reply thread at a time, so the replies keep the windows'
+                    // order and buf.run_out has one writer
+                    if (!replies_out()) { keep = false; break; }
+                    StageHeader r;
+                    r.type = (uint32_t) StageMsg::SlotRunOk;
+                    r.c = in.h.c;   // the window's tag, as it came
+                    r.bytes = stage_rows_bytes(rows_fmt, (size_t) S, (size_t) buf.handoff_floats);
+                    reply_err.clear();
+                    reply_is_slot = true;
+                    reply_out = std::async(std::launch::async, [fd, r, S, t0, fmt = rows_fmt, out = buf.run_out,
+                                                                hf = (size_t) buf.handoff_floats, &sr_tx,
+                                                                &reply_encode_ms, &h, &reply_err]() mutable {
+                        std::string e;
+                        if (!h.slot_run_reply(S, out, e)) {
+                            if (e.empty()) e = "the batch window failed";
+                            StageHeader eh;
+                            eh.type = (uint32_t) StageMsg::Error;
+                            eh.bytes = e.size();
+                            return send_msg(fd, eh, e.data(), e.size(), nullptr, 0, reply_err);
+                        }
+                        // this window's time here: from its arrival to its rows (the next worker's included)
+                        r.a = (int64_t) (ms_since(t0) * 1000.0);
+                        return send_msg(fd, r, nullptr, 0, nullptr, 0, reply_err) &&
+                               send_rows(fd, fmt, out, (size_t) S, hf, sr_tx, reply_encode_ms, reply_err);
+                    });
+                    stats.bytes_out += sizeof r + r.bytes;
+                    ++stats.slot_runs;
+                    stats.ms_slot_run += work_ms;
+                    break;
+                }
                 if (!replies_out()) { keep = false; break; }
                 std::memcpy(buf.run_in, in.rows.data(), in.rows.size() * 4);
                 stats.ms_decode += in.decode_ms;

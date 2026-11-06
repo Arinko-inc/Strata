@@ -587,8 +587,10 @@ counter-based draw (Philox(seed, position)).
 - The pipelined `--batch-groups` path adapts the VRAM tier only with `STRATA_PIPE_ADAPT_EVERY` (above).
 - The slot sessions take VRAM (above) and, with KV streaming, pinned RAM.
 - Over a remote stage ([REMOTE_STAGE.md](REMOTE_STAGE.md#what-is-turned-off-or-refused)) every PC needs `--batch N`,
-  the slots used are the fewest any stage carved, the groups are one, and `--vision` is refused with `--batch`
-  (built 2026-11-07, not yet measured on GPUs).
+  the slots used are the fewest any stage carved, the groups are one unless `--batch-groups G` is given (then the
+  groups' windows are pipelined over the link, and a relay overlaps them; the windows carry the busy slots only, so a
+  pipelined slot stays a conversation cache and the main process says `INFO batch_pad=0`), and `--vision` is refused
+  with `--batch` (built 2026-11-07, not yet measured on GPUs).
 
 ## Measured
 

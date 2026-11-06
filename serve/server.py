@@ -1173,6 +1173,11 @@ class StrataEngine:
         # conversation cache - see pick_slot
         groups_run = int(self.info.get("batch_groups") or groups)
         self.slot_gs = gs if groups > 1 and groups_run > 1 else 0
+        # INFO batch_pad=0 (a remote stage's main process, strata-mesh IMPL-PLAN-remote-batch-stage2.md 2.5): its group
+        # windows carry the busy slots only, no pad row writes an idle slot, so the slots stay conversation caches -
+        # pick_slot keeps a held prefix first and spreads the rest over the groups
+        if str(self.info.get("batch_pad", "")) == "0":
+            self.slot_gs = 0
         self.slot_q = [queue.Queue() for _ in range(self.batch)]
         self.slot_busy = [False] * self.batch
         # #1603: who owns a busy flag.  slot_claims: slots a request of this server picked or reserved and has not
