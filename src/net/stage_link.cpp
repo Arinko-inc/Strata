@@ -459,10 +459,13 @@ bool recv_header(sock_t fd, StageHeader& h, std::string& err) {
 }
 
 bool drain(sock_t fd, uint64_t n, std::string& err) {
-    char tmp[65536];
+    // (on the heap: inlined at each of the receiving thread's call sites, a stack array put 64 KiB per site in that
+    // thread's frame when the sites' slots are not shared - an AddressSanitizer build's frame, about 590 KiB, ran past
+    // the 512 KiB of a macOS thread's stack.  A drain is a malformed or refused message's: rare.)
+    std::vector<char> tmp((size_t) std::min<uint64_t>(n, 65536));
     while (n > 0) {
-        const size_t k = (size_t) std::min<uint64_t>(n, sizeof tmp);
-        if (!recv_all(fd, tmp, k, err)) return false;
+        const size_t k = (size_t) std::min<uint64_t>(n, tmp.size());
+        if (!recv_all(fd, tmp.data(), k, err)) return false;
         n -= k;
     }
     return true;

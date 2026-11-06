@@ -1026,10 +1026,12 @@ link that is the bottleneck.
   network partition and a Windows PC on either side were not; conversation checkpoints across stages
   ([CHECKPOINTS.md](CHECKPOINTS.md): built, opt-in with `--prompt-cache N`, checked on two GPUs; a relay is not
   run).
-- **Batch slots over a remote stage** (`--batch N` on every PC, protocol 8): built and covered over loopback
-  (`stage_link_batch_test`); not run on GPUs yet, so neither the batch windows' exactness against the solo path nor
-  their speed is measured. Stage 2 (pipelined slot groups over the link, `--batch-groups G`, a relay's late replies,
-  `kStageBatchOverlap`) is built and covered over loopback, not yet measured on GPUs.
+- **Batch slots over a remote stage** (`--batch N` on every PC, protocol 8): one group (stage 1) is covered over
+  loopback (`stage_link_batch_test`) and was run on GPUs on 2026-11-07 over three stages (RTX 5070 Ti main -> RX 7900
+  XT relay -> Arc B70, `--batch 4`): the batch windows matched the solo path (`batch_test` with 2 and 4 slots,
+  `batch_interleave_test` 10/10), and `http_check` and `serve_load` passed. Stage 2 (pipelined slot groups over the
+  link, `--batch-groups G`, a relay's late replies, `kStageBatchOverlap`) is built and covered over loopback only:
+  neither its exactness nor its speed is measured on GPUs yet.
 - **A ring topology** for three or more PCs.
 - **Windows as the main PC** (only workers were run on Windows), and the clock behaviour of an in-process split on
   Windows.

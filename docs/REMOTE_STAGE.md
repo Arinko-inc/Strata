@@ -716,8 +716,9 @@ python3 tools/stage_tune.py apply cluster.json OUTDIR    # start the workers as 
   layers, sends the window on and serves the next window while its next worker computes, answering in the order the
   windows came (`STRATA_RELAY_SLOT_OVERLAP=0` on the relay turns that off: the main process then overlaps with the
   workers only). The last worker is unchanged. A worker that answers late says so in its hello (informational).
-  Built 2026-11-07 and covered over loopback; the pipelined groups (stage 2) are not yet measured on GPUs. The
-  protocol: [ENGINEERING.md](remote-stage/ENGINEERING.md#the-protocol).
+  One group was run on GPUs on 2026-11-07 over three stages (`--batch 4`: the batch windows matched the solo path,
+  and the HTTP checks and `serve_load` passed); the pipelined groups are covered over loopback only, not yet run on
+  GPUs. The protocol: [ENGINEERING.md](remote-stage/ENGINEERING.md#the-protocol).
 - **Refused at start** with a remote stage: `--peer-device`, `--control-vector` (and the speed
   projection, which is one), `--expert-cache-remote`, `--prefill-head-alias`, and `--pipeline-windows` on a worker
   (the main process takes it, see [Overlapping the decode windows](#overlapping-the-decode-windows---pipeline-windows-2)).
