@@ -27,6 +27,7 @@
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/expert_nibble.hpp"
 #include "strata/core/conversation_snapshot.hpp"
+#include "strata/core/state_fingerprint.hpp"
 #include "strata/core/conversation_file.hpp"
 #include "strata/core/session_save_reclaim.hpp"
 #include "strata/core/conversation_memory.hpp"
@@ -11161,6 +11162,37 @@ int main(int argc, char** argv) {
         // at the next request's start (remote_relink_slots, below).  0: never.
         int32_t remote_slot_floor = 0;
         StageThreads ckpt_threads;   // STRATA_CKPT_THREADS: the later stages' parts of a checkpoint (started on first use)
+        // STRATA_CKPT_FP=1 (diagnostic, strata/core/state_fingerprint.hpp): the fingerprints of running state `c` (this
+        // process's first stage, at L) and of the K/V below L of session `kv_of` (the device synchronized here).  With a
+        // remote stage the worker prints the same line for its layers under the same checkpoint id
+        auto main_fp = [&](const char* what, long long id, const ConvCheckpoint& c, const strata::core::SessionState& kv_of,
+                           int64_t L) {
+            uint64_t h = strata::core::kStateFpBasis;
+            int64_t cells = 0;
+            std::string fe;
+            try {
+                strata::core::conversation_checkpoint_join(nullptr);   // (STRATA_CKPT_ASYNC: the GDN bytes landed)
+                if (cudaDeviceSynchronize() != cudaSuccess) cells = -1;
+                for (int64_t j = 0; cells >= 0 && j < kv_of.qsa_alloc; ++j) {
+                    strata::core::ConversationKv img;
+                    if (!strata::core::conversation_kv_save(img, kv_of.qsa_states[kv_of.qsa_ord0 + j], g, L, true, fe)) {
+                        cells = -1;
+                        break;
+                    }
+                    h = strata::core::state_fp_kv(h, img, L, cells);
+                }
+            } catch (const std::bad_alloc&) {
+                cells = -1;
+            }
+            if (cells < 0) h = 0;
+            (void) cudaDeviceSynchronize();
+            char who[96];
+            if (remote_main)
+                std::snprintf(who, sizeof who, "main process layers 0-%lld %s %lld", (long long) own_hi - 1, what, id);
+            else
+                std::snprintf(who, sizeof who, "main process stage 0 %s %lld", what, id);
+            strata::core::state_fp_print(who, L, c, h, cells);
+        };
         auto checkpoint_at = [&](int64_t L, std::vector<ConvCheckpoint>* parts = nullptr, bool as_tail = false) -> bool {
             ckpt_why.clear();
             if (o.prompt_cache <= 0 || L < 1) return true;
@@ -11317,6 +11349,7 @@ int main(int argc, char** argv) {
                                  (long long) L, sync_ms, save_ms, stages.size() + 1);
                 }
             }
+            if (strata::core::state_fp_on()) main_fp("checkpoint", (long long) c.remote_id, c, ss, L);
             c.used = ++check_clock;
             if (seg_plan.chunk > 0 && L > seg_plan.from && L < seg_plan.to) c.plan = seg_plan;   // inside a planned segment
             if (as_tail) {   // only one tail checkpoint stays alive: the previous request's goes
@@ -13371,6 +13404,36 @@ int main(int argc, char** argv) {
                     ckpt_store.prune(keep);
                     return true;
                 };
+                // STRATA_CKPT_FP=1 (diagnostic, strata/core/state_fingerprint.hpp): the fingerprints of running state
+                // `c` (this worker's layers, at L) and of the K/V below L of session `kv_of`; the device is synchronized
+                // before.  A solo turn and the same turn from a batch slot that save a checkpoint at the same length
+                // print the same line when their states are equal bit for bit
+                auto wk_fp = [&](const char* what, long long id, const strata::core::ConversationCheckpoint& c,
+                                 const strata::core::SessionState& kv_of, int64_t L) {
+                    uint64_t h = strata::core::kStateFpBasis;
+                    int64_t cells = 0;
+                    std::string fe;
+                    try {   // (host RAM that runs out: the line says so, the worker's step goes on)
+                        for (int64_t j = 0; j < kv_of.qsa_alloc; ++j) {
+                            strata::core::ConversationKv img;
+                            if (!strata::core::conversation_kv_save(img, kv_of.qsa_states[kv_of.qsa_ord0 + j], g, L,
+                                                                    true, fe)) {
+                                h = 0;
+                                cells = -1;
+                                break;
+                            }
+                            h = strata::core::state_fp_kv(h, img, L, cells);
+                        }
+                    } catch (const std::bad_alloc&) {
+                        h = 0;
+                        cells = -1;
+                    }
+                    (void) cudaDeviceSynchronize();
+                    char who[96];
+                    std::snprintf(who, sizeof who, "stage worker layers %lld-%s %s %lld", (long long) own_lo,
+                                  own_hi < 0 ? "last" : std::to_string((long long) own_hi - 1).c_str(), what, id);
+                    strata::core::state_fp_print(who, L, c, h, cells);
+                };
                 // a relay: the next worker first, synchronously (its reply then decides this worker's step)
                 hs.ckpt_save = [&](int64_t id, int64_t L, const std::vector<int64_t>& keep, std::string& e) -> int {
                     const WkBusy busy("stage worker checkpoint save");
@@ -13402,6 +13465,7 @@ int main(int argc, char** argv) {
                             return -1;
                         }
                         if (!strata::core::conversation_checkpoint_save(part.state, ss, g, (size_t) L, e)) return -1;
+                        if (strata::core::state_fp_on()) wk_fp("checkpoint", (long long) id, part.state, ss, L);
                         ckpt_store.put(id, std::move(part), keep);
                     } catch (const std::bad_alloc&) {   // host RAM: not stored, the store as it was
                         return not_stored("allocation failed");
@@ -13595,6 +13659,24 @@ int main(int argc, char** argv) {
                         return false;
                     }
                     return true;
+                };
+                // STRATA_CKPT_FP=1: the fingerprints of what a slot copy wrote (`to`, read back at L)
+                auto wk_slot_fp = [&](const char* what, int b, strata::core::SessionState& to, int64_t L) {
+                    if (!strata::core::state_fp_on()) return;
+                    strata::core::ConversationCheckpoint fc;
+                    std::string fe;
+                    bool ok = false;
+                    try {
+                        ok = cudaDeviceSynchronize() == cudaSuccess &&
+                             strata::core::conversation_checkpoint_save(fc, to, g, (size_t) L, fe);
+                    } catch (const std::bad_alloc&) {
+                        fe = "host allocation failed";
+                    }
+                    if (ok)
+                        wk_fp(what, b, fc, to, L);
+                    else
+                        std::fprintf(stderr, "strata ckpt fp: %s %d at %lld: not read (%s)\n", what, b, (long long) L,
+                                     fe.c_str());
                 };
                 if (o.batch > 0) {
                     // the slot sessions this worker carved at its start (bslot_ss[0]: this worker's layers, carved like
@@ -13823,6 +13905,7 @@ int main(int argc, char** argv) {
                         if (!wk_slot_copy(ss, *bslot_ss[0][(size_t) b], L, nullptr, e)) return false;
                         wk_slot_live[(size_t) b] = 1;
                         wk_slot_len[(size_t) b] = L;
+                        wk_slot_fp("slot save", b, *bslot_ss[0][(size_t) b], L);
                         return true;
                     };
                     // B-8: slot b (and checkpoint part ckpt_id at L, 0: the slot's own state at its length) into the
@@ -13869,7 +13952,11 @@ int main(int argc, char** argv) {
                         }
                         if (!ver.wait_commit(e) || !refill(e)) return false;
                         apply_pending(true);
-                        return wk_slot_copy(*bslot_ss[0][(size_t) b], ss, L, part != nullptr ? &part->state : nullptr, e);
+                        if (!wk_slot_copy(*bslot_ss[0][(size_t) b], ss, L, part != nullptr ? &part->state : nullptr, e))
+                            return false;
+                        wk_slot_fp(ckpt_id != 0 ? "slot load (checkpoint part) into the session from slot"
+                                                : "slot load into the session from slot", b, ss, L);
+                        return true;
                     };
                 }
                 // ==== end REMOTE-BATCH WORKER (B) ====
@@ -14190,6 +14277,22 @@ int main(int argc, char** argv) {
             if (!sync_all()) { e = "batch slot copy: device sync failed"; return false; }
             return true;
         };
+        // STRATA_CKPT_FP=1: the fingerprints of what a slot copy wrote on this process's first stage (`to`, read back
+        // at the length of `ids`)
+        auto main_slot_fp = [&](const char* what, int b, strata::core::SessionState& to, const std::vector<int32_t>& ids) {
+            if (!strata::core::state_fp_on()) return;
+            ConvCheckpoint fc;
+            fc.ids = ids;
+            std::string fe;
+            bool ok = false;
+            try {
+                ok = cudaDeviceSynchronize() == cudaSuccess && strata::core::conversation_checkpoint_save(fc, to, g, fe);
+            } catch (const std::bad_alloc&) {
+                fe = "host allocation failed";
+            }
+            if (ok) main_fp(what, b, fc, to, (int64_t) ids.size());
+            else std::fprintf(stderr, "strata ckpt fp: %s %d at %zu: not read (%s)\n", what, b, ids.size(), fe.c_str());
+        };
         auto copy_to_slot_here = [&](int b, const std::vector<int32_t>& ids, std::string& e) -> bool {
             const int64_t upto = (int64_t) ids.size();
             if (slot_copy_direct) {
@@ -14215,6 +14318,7 @@ int main(int argc, char** argv) {
                 }
                 if (cudaDeviceSynchronize() != cudaSuccess) { e = "batch admission: device sync failed"; return false; }
             }
+            main_slot_fp("slot save", b, *bslot_ss[0][(size_t) b], ids);
             if (batch_mtp) {
                 // Admission first builds the solo draft KV; copy it into the slot before drafting.  Both drafters' K/V
                 // are on the drafter's device (the last stage's GPU with a layer split): the copy's ring refill is a
@@ -14267,6 +14371,9 @@ int main(int argc, char** argv) {
                 }
                 if (cudaDeviceSynchronize() != cudaSuccess) { e = "batch slot restore: device sync failed"; return false; }
             }
+            main_slot_fp(at != nullptr ? "slot load (checkpoint) into the session from slot"
+                                       : "slot load into the session from slot", b, ss,
+                         at != nullptr ? at->ids : bs[(size_t) b].ids);
             if (batch_mtp) {
                 // A returning solo request resumes from its slot's draft KV (on the drafter's device, as above).
                 const strata::core::OnDevice on_mtp(mtp.device());

@@ -32,6 +32,7 @@
 #include "strata/core/remote_expert_opt.hpp"
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/conversation_snapshot.hpp"
+#include "strata/core/state_fingerprint.hpp"
 #include "strata/core/conversation_file.hpp"
 #include "strata/core/conversation_memory.hpp"
 #include "strata/core/coupled_draft.hpp"
@@ -9405,6 +9406,34 @@ int main(int argc, char **argv) try {
                 ckpt_store.prune(keep);
                 return true;
             };
+            // STRATA_CKPT_FP=1 (diagnostic, strata/core/state_fingerprint.hpp): the fingerprints of running state `c`
+            // (this worker's layers, at L) and of the K/V below L of session `kv_of`; the device is synchronized before
+            // (the CUDA worker prints the same line for its layers)
+            auto wk_fp = [&](const char* what, long long id, const strata::core::ConversationCheckpoint& c,
+                             const strata::core::SessionState& kv_of, int64_t L) {
+                uint64_t h = strata::core::kStateFpBasis;
+                int64_t cells = 0;
+                std::string fe;
+                try {
+                    for (int64_t j = 0; j < kv_of.qsa_alloc; ++j) {
+                        strata::core::ConversationKv img;
+                        if (!strata::core::conversation_kv_save(img, kv_of.qsa_states[kv_of.qsa_ord0 + j], g, L, true,
+                                                                fe) ||
+                            !device_sync("a fingerprint", fe)) {
+                            h = 0;
+                            cells = -1;
+                            break;
+                        }
+                        h = strata::core::state_fp_kv(h, img, L, cells);
+                    }
+                } catch (...) {   // (a device error or host RAM that runs out: the line says so, the step goes on)
+                    h = 0;
+                    cells = -1;
+                }
+                char who[96];
+                std::snprintf(who, sizeof who, "stage worker layers %lld-last %s %lld", (long long) own_lo, what, id);
+                strata::core::state_fp_print(who, L, c, h, cells);
+            };
             hs.ckpt_save = [&](int64_t id, int64_t L, const std::vector<int64_t>& keep, std::string& e) -> int {
                 const WkBusy busy("stage worker checkpoint save");
                 auto not_stored = [&](const char* why) -> int {
@@ -9418,6 +9447,7 @@ int main(int argc, char **argv) try {
                     part.L = L;
                     if (!device_sync("before a checkpoint", e)) return -1;
                     if (!strata::core::conversation_checkpoint_save(part.state, ss, g, (size_t) L, e)) return -1;
+                    if (strata::core::state_fp_on()) wk_fp("checkpoint", (long long) id, part.state, ss, L);
                     ckpt_store.put(id, std::move(part), keep);
                 } catch (const std::bad_alloc&) {   // host RAM: not stored, the store as it was
                     return not_stored("allocation failed");
@@ -9535,6 +9565,22 @@ int main(int argc, char **argv) try {
                     e = std::string("stage worker: ") + what + ": " + x.what();
                     return false;
                 }
+            };
+            // STRATA_CKPT_FP=1: the fingerprints of what a slot copy wrote (`to`, read back at L)
+            auto wk_slot_fp = [&](const char* what, int b, strata::core::SessionState& to, int64_t L) {
+                if (!strata::core::state_fp_on()) return;
+                strata::core::ConversationCheckpoint fc;
+                std::string fe;
+                bool ok = false;
+                try {
+                    ok = sync_q("a fingerprint", fe) && strata::core::conversation_checkpoint_save(fc, to, g, (size_t) L, fe);
+                } catch (const sycl::exception& x) {
+                    fe = x.what();
+                } catch (const std::bad_alloc&) {
+                    fe = "host allocation failed";
+                }
+                if (ok) wk_fp(what, b, fc, to, L);
+                else std::fprintf(stderr, "strata ckpt fp: %s %d at %lld: not read (%s)\n", what, b, (long long) L, fe.c_str());
             };
             if (o.batch > 0) {
                 wk_slot_live.assign((size_t) wk_cap, 0);
@@ -9676,6 +9722,7 @@ int main(int argc, char **argv) try {
                     if (!copy_session(ss, *bslot_ss[0][(size_t) slot], L, nullptr, "a slot save", e)) return false;
                     wk_slot_live[(size_t) slot] = 1;
                     wk_slot_len[(size_t) slot] = L;
+                    wk_slot_fp("slot save", slot, *bslot_ss[0][(size_t) slot], L);
                     return true;
                 };
                 hs.slot_load = [&](int slot, int64_t L, int64_t ckpt_id, std::string& e) -> bool {
@@ -9706,8 +9753,12 @@ int main(int argc, char **argv) try {
                     }
                     wk_win_S = 0;
                     if (!ver.wait_commit(e) || !refill(e)) return false;
-                    return copy_session(*bslot_ss[0][(size_t) slot], ss, L, part != nullptr ? &part->state : nullptr,
-                                        "a slot load", e);
+                    if (!copy_session(*bslot_ss[0][(size_t) slot], ss, L, part != nullptr ? &part->state : nullptr,
+                                      "a slot load", e))
+                        return false;
+                    wk_slot_fp(ckpt_id != 0 ? "slot load (checkpoint part) into the session from slot"
+                                            : "slot load into the session from slot", slot, ss, L);
+                    return true;
                 };
             }
             // ==== end REMOTE-BATCH WORKER (C) ====
