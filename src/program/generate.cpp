@@ -13420,10 +13420,23 @@ int main(int argc, char** argv) {
                     wk_wait_S = 0;
                     wk_next_tag = 0;
                 };
-                auto slot_bad = [&](int b) -> const char* {
-                    if (b < 0 || b >= wk_slot_n) return "is not one of the slots this link agreed";
-                    if (!wk_slot_live[(size_t) b]) return "holds nothing from this main process";
-                    return nullptr;
+                // a slot number this link may use (and, `live`, one this main process saved into); else the error
+                // (the wording is the SYCL worker's)
+                auto slot_ok = [&](int b, bool live, std::string& e) -> bool {
+                    if (wk_slot_n <= 0) {
+                        e = "stage worker: this main process agreed no batch slots (its --batch or this worker's is 0)";
+                        return false;
+                    }
+                    if (b < 0 || b >= wk_slot_n) {
+                        e = "stage worker: slot " + std::to_string(b) + " is outside the " + std::to_string(wk_slot_n) +
+                            " batch slots this main process agreed";
+                        return false;
+                    }
+                    if (live && !wk_slot_live[(size_t) b]) {
+                        e = "stage worker: slot " + std::to_string(b) + " holds nothing from this main process";
+                        return false;
+                    }
+                    return true;
                 };
                 // the adaptive tier on this worker's layers, counted per commit as hs.commit counts
                 auto wk_after_commit = [&](std::string& e) -> bool {
@@ -13443,24 +13456,30 @@ int main(int argc, char** argv) {
                         e = std::string("stage worker: before a slot copy: ") + cudaGetErrorString(cudaGetLastError());
                         return false;
                     }
-                    if (part != nullptr) {
-                        if (!strata::core::conversation_checkpoint_restore(*part, to, g, (size_t) L, e)) return false;
-                    } else {
-                        strata::core::ConversationCheckpoint ck;
-                        if (!strata::core::conversation_checkpoint_save(ck, from, g, (size_t) L, e) ||
-                            !strata::core::conversation_checkpoint_restore(ck, to, g, (size_t) L, e))
-                            return false;
-                    }
-                    for (int64_t j = 0; j < from.qsa_alloc; ++j) {
-                        strata::core::ConversationKv img;
-                        if (!strata::core::conversation_kv_save(img, from.qsa_states[from.qsa_ord0 + j], g, L, true, e))
-                            return false;
-                        if (cudaDeviceSynchronize() != cudaSuccess) {
-                            e = "stage worker: a slot copy: device sync failed";
-                            return false;
+                    try {   // (the images are host vectors: RAM that runs out is this copy's error, not the worker's end)
+                        if (part != nullptr) {
+                            if (!strata::core::conversation_checkpoint_restore(*part, to, g, (size_t) L, e)) return false;
+                        } else {
+                            strata::core::ConversationCheckpoint ck;
+                            if (!strata::core::conversation_checkpoint_save(ck, from, g, (size_t) L, e) ||
+                                !strata::core::conversation_checkpoint_restore(ck, to, g, (size_t) L, e))
+                                return false;
                         }
-                        if (!strata::core::conversation_kv_restore(img, to.qsa_states[to.qsa_ord0 + j], g, L, true, e))
-                            return false;
+                        for (int64_t j = 0; j < from.qsa_alloc; ++j) {
+                            strata::core::ConversationKv img;
+                            if (!strata::core::conversation_kv_save(img, from.qsa_states[from.qsa_ord0 + j], g, L, true, e))
+                                return false;
+                            if (cudaDeviceSynchronize() != cudaSuccess) {
+                                e = "stage worker: a slot copy: device sync failed";
+                                return false;
+                            }
+                            if (!strata::core::conversation_kv_restore(img, to.qsa_states[to.qsa_ord0 + j], g, L, true, e))
+                                return false;
+                        }
+                    } catch (const std::bad_alloc&) {
+                        (void) cudaDeviceSynchronize();
+                        e = "stage worker: a slot copy: host allocation failed";
+                        return false;
                     }
                     if (cudaDeviceSynchronize() != cudaSuccess) {
                         e = "stage worker: a slot copy: device sync failed";
@@ -13535,12 +13554,12 @@ int main(int argc, char** argv) {
                         const WkBusy busy("stage worker batch window");
                         const auto t0 = Clock::now();
                         if (wk_slot_wait) {
-                            e = "bad slot window: it came before the last window's SlotCommit";
+                            e = "stage worker: bad slot window: it came before the last window's SlotCommit";
                             return false;
                         }
                         if (S < 1 || S > ver.max_t() || S > (int) strata::kernels::kVerifyMaxT ||
                             (flags & ~strata::net::kStageSlotKeepAll) != 0) {
-                            e = "bad slot window: " + std::to_string(S) + " rows (this worker's windows hold " +
+                            e = "stage worker: bad slot window: " + std::to_string(S) + " rows (this worker's windows hold " +
                                 std::to_string(ver.max_t()) + "), flags " + std::to_string((long long) flags);
                             return false;
                         }
@@ -13548,25 +13567,22 @@ int main(int argc, char** argv) {
                         int rows[strata::kernels::kVerifyMaxT] = {};
                         for (int t = 0; t < S; ++t) {
                             const int b = slots[t];
-                            if (const char* why = slot_bad(b)) {
-                                e = "slot " + std::to_string(b) + " " + why;
-                                return false;
-                            }
+                            if (!slot_ok(b, true, e)) return false;
                             rows[t] = b;
                             if (t > 0 && slots[t - 1] == b) {
                                 if (pos[t] != pos[t - 1] + 1) {
-                                    e = "bad slot window: slot " + std::to_string(b) + "'s rows are not at consecutive cells";
+                                    e = "stage worker: bad slot window: slot " + std::to_string(b) + "'s rows are not at consecutive cells";
                                     return false;
                                 }
                                 continue;
                             }
                             for (int u = 0; u < t; ++u)
                                 if (slots[u] == b) {
-                                    e = "bad slot window: slot " + std::to_string(b) + "'s rows are not together";
+                                    e = "stage worker: bad slot window: slot " + std::to_string(b) + "'s rows are not together";
                                     return false;
                                 }
                             if (pos[t] != wk_slot_len[(size_t) b]) {
-                                e = "bad slot window: slot " + std::to_string(b) + " holds " +
+                                e = "stage worker: bad slot window: slot " + std::to_string(b) + " holds " +
                                     std::to_string((long long) wk_slot_len[(size_t) b]) + " cells, its row is at " +
                                     std::to_string((long long) pos[t]);
                                 return false;
@@ -13640,13 +13656,14 @@ int main(int argc, char** argv) {
                     // B-6: the last window's rows to keep per slot (keep[s], s < m), padded to this worker's capacity
                     hs.slot_commit = [&](const int32_t* keep, int m, std::string& e) -> bool {
                         const WkBusy busy("stage worker batch commit");
+                        if (wk_slot_n <= 0) return slot_ok(0, false, e);
                         if (m < 1 || m > wk_slot_n) {
-                            e = "bad slot commit: " + std::to_string(m) + " slots, this link agreed " +
+                            e = "stage worker: bad slot commit: " + std::to_string(m) + " slots, this link agreed " +
                                 std::to_string(wk_slot_n);
                             return false;
                         }
                         if (!wk_slot_wait) {
-                            e = "bad slot commit: no batch window waits for it";
+                            e = "stage worker: bad slot commit: no batch window waits for it";
                             return false;
                         }
                         wk_slot_wait = false;
@@ -13656,7 +13673,7 @@ int main(int argc, char** argv) {
                         for (int s = 0; s < m; ++s) {
                             if (k[(size_t) s] == 0) continue;
                             if (std::find(wk_wait_rows, wk_wait_rows + wk_wait_S, s) == wk_wait_rows + wk_wait_S) {
-                                e = "bad slot commit: slot " + std::to_string(s) + " keeps " + std::to_string(k[(size_t) s]) +
+                                e = "stage worker: bad slot commit: slot " + std::to_string(s) + " keeps " + std::to_string(k[(size_t) s]) +
                                     " rows of a window it was not in";
                                 return false;
                             }
@@ -13677,11 +13694,11 @@ int main(int argc, char** argv) {
                     // B-7: the session (serve_stage checked it is at L) into slot b - the main process's copy_to_slot
                     hs.slot_save = [&](int b, int64_t L, std::string& e) -> bool {
                         const WkBusy busy("stage worker slot save");
-                        if (b < 0 || b >= wk_slot_n || L < 1 || wk_slot_wait) {
-                            e = wk_slot_wait ? "bad slot message: a slot save while a batch window waits for its commit"
-                                             : "bad slot message: slot " + std::to_string(b) + " at " +
-                                               std::to_string((long long) L) + " (this link agreed " +
-                                               std::to_string(wk_slot_n) + " slots)";
+                        if (!slot_ok(b, false, e)) return false;
+                        if (L < 1 || L > o.max_context || wk_slot_wait) {
+                            e = wk_slot_wait ? "stage worker: a slot save while a batch window waits for its commit"
+                                             : "stage worker: a slot save at " + std::to_string((long long) L) +
+                                               " (the context is " + std::to_string(o.max_context) + ")";
                             return false;
                         }
                         if (stage_relay) {   // the next worker first, synchronously
@@ -13704,16 +13721,13 @@ int main(int argc, char** argv) {
                     hs.slot_load = [&](int b, int64_t L, int64_t ckpt_id, std::string& e) -> bool {
                         const WkBusy busy("stage worker slot load");
                         if (wk_slot_wait) {
-                            e = "bad slot message: a slot load while a batch window waits for its commit";
+                            e = "stage worker: bad slot message: a slot load while a batch window waits for its commit";
                             return false;
                         }
-                        if (const char* why = slot_bad(b)) {
-                            e = "slot " + std::to_string(b) + " " + why;
-                            return false;
-                        }
+                        if (!slot_ok(b, true, e)) return false;
                         const int64_t len = wk_slot_len[(size_t) b];
                         if (ckpt_id == 0 ? L != len : (L < 1 || L > len)) {
-                            e = "bad slot message: slot " + std::to_string(b) + " holds " + std::to_string((long long) len) +
+                            e = "stage worker: bad slot message: slot " + std::to_string(b) + " holds " + std::to_string((long long) len) +
                                 " cells, the load asks for " + std::to_string((long long) L) +
                                 (ckpt_id == 0 ? "" : " (checkpoint " + std::to_string((long long) ckpt_id) + ")");
                             return false;
