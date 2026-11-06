@@ -67,6 +67,8 @@ def run(eng, out, line, slot=None):
 def engine_pipelined(eng, extra):
     """Does the engine run the batch in pipelined groups (a layer split, more than one group)?  Then a BYIELD is
     dropped: a pipelined read never gives way."""
+    if str(eng.info.get("batch_groups", "")).isdigit():   # what the engine settled on (INFO, before READY)
+        return int(eng.info["batch_groups"]) > 1
     if "--batch-groups" in extra:
         v = extra[extra.index("--batch-groups") + 1] if extra.index("--batch-groups") + 1 < len(extra) else ""
         if v.isdigit():
@@ -83,14 +85,21 @@ def main():
     ap.add_argument("--max-new", type=int, default=200)
     ap.add_argument("--long", type=int, default=5000, help="tokens of the long prompt C (several prompt chunks)")
     ap.add_argument("--extra", default="")
+    ap.add_argument("--slots", type=int, default=3,
+                    help="the engine's batch slots (--batch; at least 3: the steps use slots 0, 1 and 2).  4 with "
+                         "--batch-groups 2 puts slots 0-1 and 2-3 in two groups: A and B (step 2) and E (step 4) run "
+                         "in one, C (step 2) and D (step 4) in the other; slot 3 stays free")
     ap.add_argument("--yield", dest="yield_mode", choices=("auto", "expect", "skip"), default="auto",
-                    help="step 4's give-way: auto = expect a YIELDED unless the batch is pipelined (the engine log "
-                         "says '--batch-groups auto: N groups' with N > 1, or --extra has --batch-groups N > 1), "
+                    help="step 4's give-way: auto = expect a YIELDED unless the batch is pipelined (the engine's INFO "
+                         "says batch_groups=N with N > 1, or its log '--batch-groups auto: N groups', or --extra has "
+                         "--batch-groups N > 1) on a layer split (a remote stage's groups, INFO batch_pad=0, give way), "
                          "where a read never gives way; expect = always required; skip = never required")
     ap.add_argument("--flush", type=int, default=8,
                     help="7b: unrelated solo GENs between A in slot 1 and F, so only the slot holds A's start (0: off)")
     ap.add_argument("--dump", default="", help="write every solo and slot token list as JSON: an A/B of two builds")
     a = ap.parse_args()
+    if a.slots < 3:
+        ap.error("--slots must be at least 3 (the steps use slots 0, 1 and 2)")
     cfg = json.loads(Path(a.config).read_text())
     tok = tokenizer(cfg["tokenizer"])
 
@@ -118,7 +127,8 @@ def main():
         else:
             print(f"note: --max-new {a.max_new} makes A2 as long as C or D: no --short-read is added, so step 3 may "
                   f"compare a batched re-read of A's reply with the slot's decoded one", flush=True)
-    eng = Engine(a.exe, cfg, 3, {"STRATA_IQ_MT_MIN": "1"}, extra)
+    # (Engine fails the run when the engine settles on other batch slots or, with --batch-groups N, other groups)
+    eng = Engine(a.exe, cfg, a.slots, {"STRATA_IQ_MT_MIN": "1"}, extra)
     eng.pending = []
     out = eng.lines()
     ids = lambda v: ",".join(map(str, v))
@@ -197,7 +207,10 @@ def main():
     # is dropped): D is then admitted whole into slot 2 and E goes into the free slot 1 while D decodes - both must
     # still equal solo, only the give-way itself is not checked (--yield)
     pipelined = engine_pipelined(eng, extra)
-    expect_yield = a.yield_mode == "expect" or (a.yield_mode == "auto" and not pipelined)
+    # (a remote stage's groups - INFO batch_pad=0 - read a prompt in pieces between serial windows as one group does:
+    # its read gives way; strata-mesh IMPL-PLAN-remote-batch-stage2.md 2.2.6)
+    gives_way = not pipelined or eng.info.get("batch_pad") == "0"
+    expect_yield = a.yield_mode == "expect" or (a.yield_mode == "auto" and gives_way)
     eng.send(f"BGEN 2 {M} {ids(D)}")
     eng.send("BYIELD 2")
     yielded, firstD, contD = None, [], None
