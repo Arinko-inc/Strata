@@ -4454,6 +4454,9 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
     using namespace strata::kernels;
     const OnDevice on_device(device_);
     const ModelGeometry& g = *g_;
+    // remote-stage, batch windows (protocol 8): the layers between the previous stage and this one run in the worker;
+    // its rows land in hand_in_ rows [0, S) before this stage's graph reads them
+    if (remote_slot_run_ && !remote_slot_run_(rows, S, tokens, pos, err)) return false;
     if (pre_launch_ && !pre_launch_(cs_, err)) return false;
     if (!stage_batch(rows, S, 0, tokens, pos, err)) return false;
     const cudaError_t le = cudaGraphLaunch(exec_bm_[bkey(rows, S, 0)], cs_);
@@ -4481,7 +4484,8 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
         cudaStreamSynchronize(copy_);
         if (prof_on_) collect_profile();
         ++windows;
-        if (le_ < g.n_layers) return next_ == nullptr || next_->run_slot_rows(rows, S, tokens, pos, pool, next_user_, out, err);
+        // (a remote worker's last stage has no head either: its rows went to the hand-off)
+        if (writes_handoff()) return next_ == nullptr || next_->run_slot_rows(rows, S, tokens, pos, pool, next_user_, out, err);
         if (!sample_rows(S, err)) return false;
         for (int t = 0; t < S; ++t) out[t] = ((volatile int32_t*) h_out_)[t];
         note_nonfinite(S, last_pos_b_);
@@ -4546,7 +4550,8 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
     cudaStreamSynchronize(copy_);
     if (prof_on_) collect_profile();
     ++windows;
-    if (le_ < g.n_layers) return next_ == nullptr || next_->run_slot_rows(rows, S, tokens, pos, pool, next_user_, out, err);
+    // (a remote worker's last stage has no head either: its rows went to the hand-off)
+    if (writes_handoff()) return next_ == nullptr || next_->run_slot_rows(rows, S, tokens, pos, pool, next_user_, out, err);
     if (!sample_rows(S, err)) return false;
     for (int t = 0; t < S; ++t) out[t] = ((volatile int32_t*) h_out_)[t];
     note_nonfinite(S, last_pos_b_);
@@ -4564,6 +4569,8 @@ bool Verifier::commit_slots(std::string& err) {
 bool Verifier::commit_slot_prefixes(const int* keep, std::string& err) {
     const OnDevice on_device(device_);
     if (!last_batch_ || last_t_ < 1) { err = "verify: commit_slots without a batch window"; return false; }
+    // remote-stage, batch windows (protocol 8): the worker's part (one way), as commit() sends the accepted count
+    if (remote_slot_commit_ && !remote_slot_commit_(keep, (int) slots_.size(), err)) return false;
     const int S = last_t_;
     const Clock::time_point t0 = Clock::now();
     const int64_t CB = 2 + max_t_;

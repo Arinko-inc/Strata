@@ -223,6 +223,16 @@ public:
         remote_abort_ = std::move(remote_abort);
     }
     bool remote() const { return (bool) remote_run_; }
+    /// REMOTE STAGE, the main side, batch windows (protocol 8, strata-mesh IMPL-PLAN-remote-batch.md): as set_remote
+    /// for run() / commit().  run_slot_rows first calls `slot_run(rows, S, tokens, pos, err)`, which must leave the
+    /// worker's S rows in this stage's handoff_in (rows [0, S)); commit_slot_prefixes first calls
+    /// `slot_commit(keep, n_slots(), err)` (one way).  Unset (the default): nothing is called.  Before the first window.
+    void set_remote_slots(std::function<bool(const int* rows, int S, const int32_t* tokens, const int64_t* pos,
+                                             std::string& err)> slot_run,
+                          std::function<bool(const int* keep, int n, std::string& err)> slot_commit) {
+        remote_slot_run_ = std::move(slot_run);
+        remote_slot_commit_ = std::move(slot_commit);
+    }
 
     /// Keep the first `n_keep` (1..T) tokens of the last window; advances `ss.ple_prev` by them.
     bool commit(int n_keep, std::string& err);
@@ -596,6 +606,8 @@ private:
     std::function<bool(int, const int32_t*, int64_t, std::string&)> remote_run_;   ///< set_remote
     std::function<bool(int, std::string&)> remote_commit_;
     std::function<void()> remote_abort_;
+    std::function<bool(const int*, int, const int32_t*, const int64_t*, std::string&)> remote_slot_run_;   ///< set_remote_slots
+    std::function<bool(const int*, int, std::string&)> remote_slot_commit_;
     bool writes_handoff() const { return le_ < g_->n_layers || no_head_; }   ///< no head here: the residual goes on
     bool ple_stage() const { return lb_ <= 1 && 1 < le_; }   ///< holds layer 1, where the PLE block runs
     void stage_inputs(int T, const int32_t* tokens, int64_t pos0);

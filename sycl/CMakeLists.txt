@@ -284,6 +284,13 @@ target_link_libraries(stage_link_test PRIVATE Threads::Threads)
 enable_testing()
 add_test(NAME stage_link_test COMMAND stage_link_test)
 set_tests_properties(stage_link_test PROPERTIES TIMEOUT 60)
+# protocol 8's batch slots over the link (strata-mesh remote-batch), the same test as the top-level build's
+strata_resolve(_stage_link_batch_test src/net/stage_link_batch_test.cpp src/net/stage_link.cpp)
+add_executable(stage_link_batch_test ${_stage_link_batch_test})
+target_include_directories(stage_link_batch_test PRIVATE ${STRATA_ROOT}/include)
+target_link_libraries(stage_link_batch_test PRIVATE Threads::Threads)
+add_test(NAME stage_link_batch_test COMMAND stage_link_batch_test)
+set_tests_properties(stage_link_batch_test PROPERTIES TIMEOUT 60)
 
 # --- the kernel parity self-tests (each runs on the card and compares against a CPU reference) ---------------------
 option(STRATA_SYCL_PARITY "Build the kernel parity tests" ON)

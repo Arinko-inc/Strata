@@ -523,7 +523,8 @@ int main() {
     // 1. the hello
     StageHello old_side = hello_of();
     old_side.protocol = 4;
-    check(!greet(old_side) && contains(err, "the worker refused:") && contains(err, "protocol 4/7"),
+    check(!greet(old_side) && contains(err, "the worker refused:") &&
+              contains(err, ("protocol 4/" + std::to_string(kStageProtocol)).c_str()),
           "a protocol 4 main process is refused for its protocol");
     StageHello greedy = hello_of();
     greedy.ckpt_max = kStageCkptMax + 1;

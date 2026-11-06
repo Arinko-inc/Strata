@@ -2229,8 +2229,12 @@ int main(int argc, char **argv) try {
             why = "a --stage-worker does not take --mtp (the draft layer runs in the main process, with the head)";
         else if (o.pipeline_windows > 0)   // the main process's flag: the worker runs no speculative window
             why = "--pipeline-windows is the main process's (--remote-stage), not a worker's";
-        else if (o.batch > 0 || o.peer_device >= 0)
-            why = "it does not support --batch or --peer-device";
+        else if (o.peer_device >= 0)
+            why = "it does not support --peer-device";
+        // remote-batch (protocol 8, strata-mesh IMPL-PLAN-remote-batch.md): a worker's --batch N carves N slot sessions
+        // for its layers.  SKELETON: refused until the SYCL worker's part is in (担当C removes this line)
+        else if (o.batch > 0)
+            why = "--batch on the SYCL stage worker is not in this build yet (remote-batch: the worker)";
         else if (!o.cvec_files.empty())
             why = "it does not carry --control-vector (or a speed projection) to the worker's layers";
         else if (o.expert_cache_remote[0] > 0 || o.expert_cache_remote[1] > 0 || o.expert_cache_remote[2] > 0)
@@ -4232,8 +4236,10 @@ int main(int argc, char **argv) try {
         uint64_t bytes0 = 0;
         for (size_t k = 0; k < bslot_ss.size(); ++k) {
             const int dev = k == 0 ? 0 : stages[k - 1]->dev;
-            const int64_t lo = k == 0 ? 0 : stages[k - 1]->lb;
-            const int64_t hi = k == 0 ? (multi_gpu ? split_at[0] : -1) : stages[k - 1]->le;
+            // (stage 0 is carved like the main session: a worker its own layers; own_lo 0 and own_hi -1 otherwise -
+            // remote-batch)
+            const int64_t lo = k == 0 ? own_lo : stages[k - 1]->lb;
+            const int64_t hi = k == 0 ? (multi_gpu ? split_at[0] : own_hi) : stages[k - 1]->le;
             const strata::core::OnDevice on_k(dev);
             const uint64_t bytes = strata::core::session_bytes(g, o.max_context, K, lo, hi);
             if (k == 0) bytes0 = bytes;
@@ -9151,6 +9157,9 @@ int main(int argc, char **argv) try {
             me.vision = 0;
             // conversation checkpoints (docs/remote-stage/CHECKPOINTS.md): a worker's own hello carries its limit
             me.ckpt_max = strata::net::kStageCkptMax;
+            // protocol 8: the slot sessions this worker carved at its start (--batch; 0: none)
+            me.batch_slots = o.batch > 0 ? (int32_t) o.batch : 0;
+            me.batch_flags = o.batch > 0 ? strata::net::kStageBatchKeepAll : 0u;
             std::snprintf(me.build, sizeof me.build, "strata remote-stage worker (sycl)");
             // the model pack's fingerprint: its tensor index and expert table (the same model on both PCs)
             for (const char* f : {"/index.txt", "/native_experts.txt"}) {
@@ -9437,6 +9446,38 @@ int main(int argc, char **argv) try {
                 ckpt_store.clear();   // a new main process is a new id space
                 (void) ver.wait_commit(e);
             };
+            // ==== REMOTE-BATCH WORKER (C) ====  protocol 8's batch slots on this worker: strata-mesh
+            // IMPL-PLAN-remote-batch.md sections 3 and 6.  Only with --batch (the slot sessions carved at the start,
+            // bslot_ss[0]); without it the handlers stay unset and a slot message gets an error.  担当C writes everything
+            // between these two marks (it may wrap hs.hello and hs.disconnected here).
+            if (o.batch > 0) {
+                hs.slot_run = [&](int S, const int32_t* slots, const int32_t* tokens, const int64_t* pos, int64_t flags,
+                                  std::string& e) -> bool {
+                    // TODO(remote-batch C): IMPL-PLAN section 6.2 (as B-5, no relay)
+                    (void) S; (void) slots; (void) tokens; (void) pos; (void) flags;
+                    e = "stage worker: batch slots are not in this build yet (remote-batch skeleton)";
+                    return false;
+                };
+                hs.slot_commit = [&](const int32_t* keep, int n, std::string& e) -> bool {
+                    // TODO(remote-batch C): as B-6
+                    (void) keep; (void) n;
+                    e = "stage worker: batch slots are not in this build yet (remote-batch skeleton)";
+                    return false;
+                };
+                hs.slot_save = [&](int slot, int64_t L, std::string& e) -> bool {
+                    // TODO(remote-batch C): as B-7
+                    (void) slot; (void) L;
+                    e = "stage worker: batch slots are not in this build yet (remote-batch skeleton)";
+                    return false;
+                };
+                hs.slot_load = [&](int slot, int64_t L, int64_t ckpt_id, std::string& e) -> bool {
+                    // TODO(remote-batch C): as B-8
+                    (void) slot; (void) L; (void) ckpt_id;
+                    e = "stage worker: batch slots are not in this build yet (remote-batch skeleton)";
+                    return false;
+                };
+            }
+            // ==== end REMOTE-BATCH WORKER (C) ====
             strata::net::StageBuffers bufs;
             bufs.run_in = wk_in;
             bufs.run_out = wk_out;

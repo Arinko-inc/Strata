@@ -3190,7 +3190,8 @@ bool Verifier::run_slot_rows(const int *rows, int S, const int32_t *tokens,
         copy_->wait();
         if (prof_on_) collect_profile();
         ++windows;
-        if (le_ < g.n_layers) return next_ == nullptr || next_->run_slot_rows(rows, S, tokens, pos, pool, next_user_, out, err);
+        // (a remote worker's last stage has no head either: its rows went to the hand-off)
+        if (writes_handoff()) return next_ == nullptr || next_->run_slot_rows(rows, S, tokens, pos, pool, next_user_, out, err);
         if (!sample_rows(S, err)) return false;
         for (int t = 0; t < S; ++t) out[t] = ((volatile int32_t*) h_out_)[t];
         progress_at("decode");
@@ -3273,7 +3274,8 @@ bool Verifier::run_slot_rows(const int *rows, int S, const int32_t *tokens,
     copy_->wait();
     if (prof_on_) collect_profile();
     ++windows;
-    if (le_ < g.n_layers) return next_ == nullptr || next_->run_slot_rows(rows, S, tokens, pos, pool, next_user_, out, err);
+    // (a remote worker's last stage has no head either: its rows went to the hand-off)
+    if (writes_handoff()) return next_ == nullptr || next_->run_slot_rows(rows, S, tokens, pos, pool, next_user_, out, err);
     if (!sample_rows(S, err)) return false;
     for (int t = 0; t < S; ++t) out[t] = ((volatile int32_t*) h_out_)[t];
     progress_at("decode");

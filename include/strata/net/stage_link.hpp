@@ -33,13 +33,23 @@
 namespace strata::net {
 
 inline constexpr uint32_t kStageMagic = 0x4d525453u;   // "STRM"
-inline constexpr uint32_t kStageProtocol = 7;
+inline constexpr uint32_t kStageProtocol = 8;   // 8: the batch slots (SlotRun ... SlotLoadOk, the hello's batch_*)
 /// Conversation checkpoints (docs/remote-stage/CHECKPOINTS.md): the most parts a worker keeps; a main process whose
 /// hello asks for more is refused
 inline constexpr int32_t kStageCkptMax = 64;
 /// the start of the worker's CkptRestore error for an id it does not hold - the one restore error the main process
 /// recovers from (it reads the prompt from token 0); every other error means the worker's session is lost
 inline constexpr char kStageCkptMissing[] = "checkpoint not held: ";
+/// Batch slots over the link (protocol 8, `--batch N` on every stage; strata-mesh IMPL-PLAN-remote-batch.md): the most
+/// slots a SlotCommit lists, and the bound of a slot number
+inline constexpr int32_t kStageSlotMax = 64;
+/// SlotRun's flags (header b), bit 0: keep every row - the worker commits the window right behind it and no SlotCommit
+/// follows for it.  Every other bit must be 0 (a side that sends a later bit checks the peer's hello first).
+inline constexpr int64_t kStageSlotKeepAll = 1;
+/// StageHello::batch_flags: bit 0, this side takes SlotRun's kStageSlotKeepAll (every protocol 8 side with batch slots);
+/// bit 1 (stage 2, informational), this side starts the next SlotRun while an earlier one is with its next worker
+inline constexpr uint32_t kStageBatchKeepAll = 1u << 0;
+inline constexpr uint32_t kStageBatchOverlap = 1u << 1;
 
 // (rows[n * w]: n rows of w floats in the link's row format, StageRows)
 enum class StageMsg : uint32_t {
@@ -61,6 +71,21 @@ enum class StageMsg : uint32_t {
     CkptSaveOk = 13,     // a = 1 stored, 0 not stored (the worker's store is as it was)
     CkptRestore = 14,    // a = id, b = L; payload: int64 keep[]
     CkptRestoreOk = 15,
+    // ---- protocol 8: batch slots (--batch on every stage).  The worker keeps a session per slot for its layers; the
+    // main process decides what each slot holds.  Replies keep the order of the messages (a SlotRun may be sent before
+    // the previous one's reply is read: the replies come back in the order sent, each with its tag).
+    SlotRun = 16,     // a = S rows, b = flags (kStageSlotKeepAll), c = tag; payload: int32 slot[S] (row t is slot slot[t],
+                      // a slot's rows contiguous), int32 tokens[S], int64 pos[S], rows[S * handoff_floats]
+    SlotRunOk = 17,   // a = the worker's time (us), c = the SlotRun's tag; payload: rows[S * handoff_floats]
+    SlotCommit = 18,  // a = n, c = the tag of the window it commits (the last SlotRun, sent without kStageSlotKeepAll);
+                      // payload: int32 keep[n] (keep[s]: the rows of slot s the window keeps, 0: not in it).  No reply:
+                      // a failure comes back on the next SlotRun's, SlotSave's or SlotLoad's (a Reset does not drop it)
+    SlotSave = 19,    // a = slot, b = L (the worker's session must be at L): the session's running state and its K/V
+                      // cells [0, L) into the slot (a batch admission, a read that gave way)
+    SlotSaveOk = 20,  // a = the worker's time (us)
+    SlotLoad = 21,    // a = slot, b = L, c = checkpoint id (0: the slot's own state, L its length; else that checkpoint
+                      // part's state, saved at L, with the slot's K/V cells [0, L)) into the session, which is at L after
+    SlotLoadOk = 22,  // a = the worker's time (us)
 };
 
 #pragma pack(push, 1)
@@ -88,12 +113,21 @@ struct StageHello {
     /// the row formats this side sends and reads (bit 1 << StageRows); the link uses the narrowest both list.  A main
     /// process lists fp32 and the one it asks for (STRATA_REMOTE_ROWS), a worker every one it has
     uint32_t row_formats = 1u << 0;
-    char build[48] = {};          ///< engine build id (informational)
+    char build[40] = {};          ///< engine build id (informational; 48 bytes up to protocol 7)
+    /// protocol 8: the batch slots this side runs (a main process: its --batch after its own carve; a worker: the slot
+    /// sessions it carved at its start, a relay the fewer of its own and its next worker's; 0: none).  No side refuses
+    /// for it: the main process runs the fewest (strata-mesh IMPL-PLAN-remote-batch.md section 3.7)
+    int32_t batch_slots = 0;
+    uint32_t batch_flags = 0;     ///< kStageBatchKeepAll / kStageBatchOverlap
     char token[64] = {};          ///< the shared secret (STRATA_STAGE_TOKEN); the worker refuses a wrong one
 };
 #pragma pack(pop)
 // one size across protocols: an older peer's hello is read whole and refused for its protocol, not as malformed
 static_assert(sizeof(StageHello) == 192, "the hello's size");
+// protocol 8 took its two fields out of the end of `build`: the token stays where every protocol has it
+static_assert(offsetof(StageHello, build) == 80 && offsetof(StageHello, batch_slots) == 120 &&
+                  offsetof(StageHello, batch_flags) == 124 && offsetof(StageHello, token) == 128,
+              "the hello's layout");
 
 /// How a message's rows (a window's, a prompt chunk's, both ways) travel.  fp32 is the engine's own and the default;
 /// bf16 halves the bytes and rounds each value to 8 significant bits (round to nearest even, as the GPU kernels do).
@@ -142,6 +176,8 @@ struct StageStats {
     double ms_run_worker = 0;            ///< main side: the worker's own share of ms_run
     double ms_encode = 0, ms_decode = 0; ///< the rows' conversion to and from the link's format (fp32: none); a
                                          ///< worker's chunk replies are added as each one is out
+    uint64_t slot_runs = 0, slot_commits = 0, slot_saves = 0, slot_loads = 0;   ///< protocol 8's batch slot messages
+    double ms_slot_run = 0;              ///< the SlotRuns' round trips (main side) / their work (worker side)
 };
 
 /// The main process's end: one connection.  Windows, commits and resets are whole round trips (one thread at a
@@ -193,6 +229,25 @@ public:
     /// The worker puts checkpoint `id` (saved at L) back and keeps only `keep`; `missing` (with false): it does not
     /// hold `id` and nothing changed there.  Any other error: the worker's session is lost.
     bool ckpt_restore(int64_t id, int64_t L, const std::vector<int64_t>& keep, bool& missing, std::string& err);
+
+    // ---- protocol 8: batch slots (strata-mesh IMPL-PLAN-remote-batch.md section 3)
+    /// One batch window over S rows (row t: slot slots[t], token tokens[t] at pos[t]): send S rows of in_floats / S
+    /// floats each, receive S rows back - slot_run_send and slot_run_recv in one.  `flags`: kStageSlotKeepAll or 0.
+    bool slot_run(int S, const int32_t* slots, const int32_t* tokens, const int64_t* pos, int64_t flags, int64_t tag,
+                  const float* rows_in, size_t in_floats, float* rows_out, size_t out_floats, std::string& err);
+    /// The window out, its reply not read: the replies come back in the order the windows were sent (stage 2 sends the
+    /// next group's window before this one's reply is read).
+    bool slot_run_send(int S, const int32_t* slots, const int32_t* tokens, const int64_t* pos, int64_t flags,
+                       int64_t tag, const float* rows_in, size_t in_floats, std::string& err);
+    /// The oldest window's reply: S rows into rows_out.  Its tag must be `tag` (else the link is out of step: failed).
+    bool slot_run_recv(int64_t tag, int S, float* rows_out, size_t out_floats, std::string& err);
+    /// The rows each slot keeps of window `tag` (keep[s], s < n; 0: not in it).  One way.
+    bool slot_commit(const int32_t* keep, int n, int64_t tag, std::string& err);
+    /// The worker's session (at L) into slot `slot`: its running state and its K/V cells [0, L).
+    bool slot_save(int slot, int64_t L, std::string& err);
+    /// Slot `slot`'s cells [0, L) back into the worker's session, with the slot's own running state (ckpt_id 0) or that
+    /// checkpoint part's (saved at L).  `missing` (with false): the worker does not hold ckpt_id, nothing changed there.
+    bool slot_load(int slot, int64_t L, int64_t ckpt_id, bool& missing, std::string& err);
 
     const StageStats& stats() const { return stats_; }
     std::string peer_name() const { return peer_; }
@@ -272,6 +327,20 @@ struct StageHandlers {
     std::function<int(int64_t id, int64_t L, const std::vector<int64_t>& keep, std::string& err)> ckpt_save;
     std::function<bool(int64_t id, int64_t L, const std::vector<int64_t>& keep, std::string& err)> ckpt_restore;
     std::function<void()> disconnected;   ///< the main process went away (the session is stale)
+    // ---- protocol 8: batch slots (optional: a worker started without --batch leaves them unset, and a slot message
+    // gets "this worker has no batch slots (start it with --batch N)").  strata-mesh IMPL-PLAN-remote-batch.md section 3.
+    /// One batch window: rows in StageBuffers::run_in (S of them), rows out run_out.  Row t is slot slots[t] (the
+    /// handler checks the slot numbers), token tokens[t] at pos[t].  `flags` & kStageSlotKeepAll: commit every row
+    /// right behind the window (no SlotCommit follows).
+    std::function<bool(int S, const int32_t* slots, const int32_t* tokens, const int64_t* pos, int64_t flags,
+                       std::string& err)> slot_run;
+    /// The last window's rows to keep per slot (keep[s], s < n).  A failure is reported on the next slot message's reply.
+    std::function<bool(const int32_t* keep, int n, std::string& err)> slot_commit;
+    /// The session (serve_stage has checked it is at L) into `slot`.
+    std::function<bool(int slot, int64_t L, std::string& err)> slot_save;
+    /// `slot` (and checkpoint part `ckpt_id`, 0: none) into the session; a part not held: an error starting with
+    /// kStageCkptMissing.
+    std::function<bool(int slot, int64_t L, int64_t ckpt_id, std::string& err)> slot_load;
     /// optional (a relay worker): about once a second while the served main process is idle (no message read or being
     /// read, no reply going out), on the serving thread.  False ends that connection with `err`, as a closed one ends:
     /// its main process finds the link lost at its next request and connects again.

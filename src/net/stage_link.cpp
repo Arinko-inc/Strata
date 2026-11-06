@@ -584,6 +584,17 @@ constexpr const char* kLost[] = {"remote stage: cannot resolve ", "remote stage:
 
 bool hello_matches(const StageHello& a, const StageHello& b, std::string& err) {
     char buf[512];
+    // another protocol first, with its reason (the rest of an older peer's hello may sit elsewhere): protocol 8 carries
+    // the batch slots, and every stage of a split runs the same build
+    if (a.protocol != b.protocol) {
+        std::snprintf(buf, sizeof buf,
+                      "remote stage: the two sides differ (protocol %u/%u: every stage needs the same Strata build; "
+                      "protocol 8 added the batch slots over the link - SlotRun, SlotCommit, SlotSave, SlotLoad - and "
+                      "the hello's batch_slots)",
+                      a.protocol, b.protocol);
+        err = buf;
+        return false;
+    }
     if (a.protocol != b.protocol || a.n_embd != b.n_embd || a.hc != b.hc || a.n_layers != b.n_layers ||
         a.n_expert != b.n_expert || a.layer_begin != b.layer_begin || a.handoff_floats != b.handoff_floats ||
         a.kv_type != b.kv_type || a.pack_hash != b.pack_hash) {
@@ -980,6 +991,56 @@ bool StageClient::ckpt_restore(int64_t id, int64_t L, const std::vector<int64_t>
     // the worker's own text (read_reply_'s prefix, then the fixed start) - a relay's forwarded error is not this
     missing = connected() && err.rfind(std::string("remote stage (worker): ") + kStageCkptMissing, 0) == 0;
     return false;
+}
+
+// ---- protocol 8: batch slots.  SKELETON (strata-mesh IMPL-PLAN-remote-batch.md section 4, 担当A): the wire format is
+// section 3.3; serve_stage answers these messages as unknown until then.
+namespace {
+bool slot_skeleton(const char* what, std::string& err) {
+    err = std::string("remote stage: ") + what + " is not in this build yet (remote-batch skeleton)";
+    return false;
+}
+}  // namespace
+
+bool StageClient::slot_run(int S, const int32_t* slots, const int32_t* tokens, const int64_t* pos, int64_t flags,
+                           int64_t tag, const float* rows_in, size_t in_floats, float* rows_out, size_t out_floats,
+                           std::string& err) {
+    // TODO(remote-batch A): slot_run_send, then slot_run_recv
+    (void) S; (void) slots; (void) tokens; (void) pos; (void) flags; (void) tag; (void) rows_in; (void) in_floats;
+    (void) rows_out; (void) out_floats;
+    return slot_skeleton("SlotRun", err);
+}
+
+bool StageClient::slot_run_send(int S, const int32_t* slots, const int32_t* tokens, const int64_t* pos, int64_t flags,
+                                int64_t tag, const float* rows_in, size_t in_floats, std::string& err) {
+    // TODO(remote-batch A)
+    (void) S; (void) slots; (void) tokens; (void) pos; (void) flags; (void) tag; (void) rows_in; (void) in_floats;
+    return slot_skeleton("SlotRun", err);
+}
+
+bool StageClient::slot_run_recv(int64_t tag, int S, float* rows_out, size_t out_floats, std::string& err) {
+    // TODO(remote-batch A)
+    (void) tag; (void) S; (void) rows_out; (void) out_floats;
+    return slot_skeleton("SlotRunOk", err);
+}
+
+bool StageClient::slot_commit(const int32_t* keep, int n, int64_t tag, std::string& err) {
+    // TODO(remote-batch A)
+    (void) keep; (void) n; (void) tag;
+    return slot_skeleton("SlotCommit", err);
+}
+
+bool StageClient::slot_save(int slot, int64_t L, std::string& err) {
+    // TODO(remote-batch A)
+    (void) slot; (void) L;
+    return slot_skeleton("SlotSave", err);
+}
+
+bool StageClient::slot_load(int slot, int64_t L, int64_t ckpt_id, bool& missing, std::string& err) {
+    // TODO(remote-batch A)
+    (void) slot; (void) L; (void) ckpt_id;
+    missing = false;
+    return slot_skeleton("SlotLoad", err);
 }
 
 bool StageClient::positions(const int32_t* table, int64_t cells, std::string& err) {

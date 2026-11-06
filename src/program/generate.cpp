@@ -3642,20 +3642,28 @@ int main(int argc, char** argv) {
         else if (!o.serve) why = "it needs --serve";
         else if (remote_main && (!split_same || split_at.size() != 1))
             why = "--remote-stage needs --layer-split K --split-device 0 (layers K.. run in the worker)";
+        // remote-batch (protocol 8, strata-mesh IMPL-PLAN-remote-batch.md): --batch over the link.  SKELETON: refused
+        // until the main process's part is in (担当D removes this line)
+        else if (remote_main && o.batch > 0)
+            why = "--batch over a remote stage is not in this build yet (remote-batch: the main process)";
         else if (stage_worker && (!o.layer_split.empty() || o.stage_begin < 2 ||
                                   o.stage_begin >= strata::core::ModelGeometry{}.n_layers))
             why = "--stage-worker needs --stage-begin K (2 <= K < the layer count: the main process's --layer-split K) "
                   "and no --layer-split";
         else if (stage_worker && !o.mtp.empty())
             why = "a --stage-worker does not take --mtp (the draft layer runs in the main process, with the head)";
+        // remote-batch (protocol 8): a worker's --batch N carves N slot sessions for its layers.  SKELETON: refused until
+        // the worker's part is in (担当B removes this line)
+        else if (stage_worker && o.batch > 0)
+            why = "--batch on a stage worker is not in this build yet (remote-batch: the worker)";
         else if (!stage_worker && (o.stage_end >= 0 || !o.stage_next.empty()))
             why = "--stage-end and --stage-next are for a relay --stage-worker";
         else if (stage_worker && ((o.stage_end >= 0) != !o.stage_next.empty() ||
                                   (o.stage_end >= 0 && (o.stage_end <= o.stage_begin ||
                                                         o.stage_end >= strata::core::ModelGeometry{}.n_layers))))
             why = "a relay worker needs both --stage-end K2 (--stage-begin < K2 < the layer count) and --stage-next HOST:PORT";
-        else if (o.batch > 0 || o.peer_device >= 0)
-            why = "it does not support --batch or --peer-device";
+        else if (o.peer_device >= 0)
+            why = "it does not support --peer-device";
         // 0.1.44: the output head's VRAM as prompt workspace (one GPU only); a worker has no head, and the main
         // process's loan region is laid out for a whole-model prompt path
         else if (o.prefill_head_alias)
@@ -6191,7 +6199,7 @@ int main(int argc, char** argv) {
     if (o.batch != 0) {
         const int cap = strata::kernels::kVerifyMaxT;
         const char* off = !o.serve ? "it needs --serve" : o.batch < 2 ? "it needs 2 or more slots"
-                        : split_same ? "it needs each stage of a layer split on its own GPU" : nullptr;
+                        : split_same && !remote_main ? "it needs each stage of a layer split on its own GPU" : nullptr;
         if (off != nullptr) {
             std::fprintf(stderr, "strata generate: WARNING: --batch %d is off: %s\n", o.batch, off);
             o.batch = 0;
@@ -6239,8 +6247,10 @@ int main(int argc, char** argv) {
         uint64_t bytes0 = 0;
         for (size_t k = 0; k < bslot_ss.size(); ++k) {
             const int dev = k == 0 ? 0 : stages[k - 1]->dev;
-            const int64_t lo = k == 0 ? 0 : stages[k - 1]->lb;
-            const int64_t hi = k == 0 ? (multi_gpu ? split_at[0] : -1) : stages[k - 1]->le;
+            // (stage 0 is carved like the main session: a remote stage's main process [0, K), a worker its own layers;
+            // own_lo 0 and own_hi -1 otherwise - remote-batch)
+            const int64_t lo = k == 0 ? own_lo : stages[k - 1]->lb;
+            const int64_t hi = k == 0 ? (multi_gpu ? split_at[0] : own_hi) : stages[k - 1]->le;
             const strata::core::OnDevice on_k(dev);
             const uint64_t bytes = strata::core::session_bytes(g, o.max_context, K, lo, hi);
             if (k == 0) bytes0 = bytes;
@@ -10241,6 +10251,8 @@ int main(int argc, char** argv) {
                 ver_same.set_remote(remote_run_of(out0, rx),
                                     [&remote_link](int n_keep, std::string& e) { return remote_link.commit(n_keep, e); },
                                     [&remote_link] { remote_link.abort(); });
+                // TODO(remote-batch D): with --batch, ver_same.set_remote_slots(...): SlotRun with out0's rows [0, S)
+                // into rx, SlotCommit (IMPL-PLAN-remote-batch.md section 7.2 D-4)
             }
             for (int st = 1; st < n_stages; ++st) {
                 bool ok_s = false;
@@ -10430,6 +10442,8 @@ int main(int argc, char** argv) {
             }
         }
         // each stage's verifier gets its stage's slot sessions
+        // TODO(remote-batch D): a remote stage's main process gives ver_same (the head on the worker's rows) the slot
+        // sessions of stage 0 too (D-3)
         if (o.batch > 0) {
             for (size_t k = 0; k < bslot_ss.size(); ++k) {
                 std::vector<strata::core::SessionState*> ptrs;
@@ -12888,6 +12902,12 @@ int main(int argc, char** argv) {
             // conversation checkpoints: the parts the main process may have the worker keep (the chain and the one
             // being saved); a worker's own hello: its limit
             me.ckpt_max = stage_worker ? strata::net::kStageCkptMax : o.prompt_cache > 0 ? o.prompt_cache + 1 : 0;
+            // TODO(remote-batch D): with --batch the main process's ckpt_max covers the slots' checkpoints too
+            // (IMPL-PLAN-remote-batch.md section 3.8)
+            // protocol 8: the batch slots this process runs - a main process its --batch after its own carve, a worker
+            // the slot sessions it carved (a relay's hello takes the fewer of its own and its next worker's)
+            me.batch_slots = o.batch > 0 ? (int32_t) o.batch : 0;
+            me.batch_flags = o.batch > 0 ? strata::net::kStageBatchKeepAll : 0u;
             std::snprintf(me.build, sizeof me.build, "strata remote-stage %s", stage_worker ? "worker" : "main");
             // the model pack's fingerprint: its tensor index and expert table (the same model on both PCs)
             for (const char* f : {"/index.txt", "/native_experts.txt"}) {
@@ -13195,6 +13215,8 @@ int main(int argc, char** argv) {
                         e = "relay: the next worker's link was lost while idle (" + le + ")";
                         return false;
                     };
+                // remote-batch: the batch slots the next worker carved (its hello), for this relay's hello (担当B)
+                int32_t next_batch_slots = 0;
                 // a relay worker's link to the next worker (it must be listening; tried for a minute)
                 auto connect_next = [&](std::string& e) -> bool {
                     strata::net::StageHello mine_next = me, peer_next;
@@ -13219,6 +13241,7 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata serve: relay: layers %d-%d on %s (rows %s)\n", peer_next.layer_begin,
                                  peer_next.n_layers - 1, o.stage_next.c_str(),
                                  strata::net::stage_rows_name(next_link.rows()));
+                    next_batch_slots = peer_next.batch_slots;
                     return true;
                 };
                 if (stage_relay && !connect_next(err)) {
@@ -13375,6 +13398,39 @@ int main(int argc, char** argv) {
                         next_link.close();
                     }
                 };
+                // ==== REMOTE-BATCH WORKER (B) ====  protocol 8's batch slots on this worker (and a relay's forwarding):
+                // strata-mesh IMPL-PLAN-remote-batch.md sections 3 and 5.  Only with --batch (the slot sessions carved
+                // at the start, bslot_ss[0]); without it the handlers stay unset and a slot message gets an error.
+                // 担当B writes everything between these two marks (it may wrap hs.hello and hs.disconnected here).
+                if (o.batch > 0) {
+                    hs.slot_run = [&](int S, const int32_t* slots, const int32_t* tokens, const int64_t* pos,
+                                      int64_t flags, std::string& e) -> bool {
+                        // TODO(remote-batch B): IMPL-PLAN section 5.2 B-5
+                        (void) S; (void) slots; (void) tokens; (void) pos; (void) flags;
+                        e = "stage worker: batch slots are not in this build yet (remote-batch skeleton)";
+                        return false;
+                    };
+                    hs.slot_commit = [&](const int32_t* keep, int n, std::string& e) -> bool {
+                        // TODO(remote-batch B): B-6
+                        (void) keep; (void) n;
+                        e = "stage worker: batch slots are not in this build yet (remote-batch skeleton)";
+                        return false;
+                    };
+                    hs.slot_save = [&](int slot, int64_t L, std::string& e) -> bool {
+                        // TODO(remote-batch B): B-7
+                        (void) slot; (void) L;
+                        e = "stage worker: batch slots are not in this build yet (remote-batch skeleton)";
+                        return false;
+                    };
+                    hs.slot_load = [&](int slot, int64_t L, int64_t ckpt_id, std::string& e) -> bool {
+                        // TODO(remote-batch B): B-8
+                        (void) slot; (void) L; (void) ckpt_id;
+                        e = "stage worker: batch slots are not in this build yet (remote-batch skeleton)";
+                        return false;
+                    };
+                    (void) next_batch_slots;   // TODO(remote-batch B): B-3, a relay's hello
+                }
+                // ==== end REMOTE-BATCH WORKER (B) ====
                 strata::net::StageBuffers bufs;
                 bufs.run_in = wk_in;
                 bufs.run_out = wk_out;
@@ -15697,6 +15753,7 @@ int main(int argc, char** argv) {
             }
             int64_t reread_to = -1;   // STRATA_CKPT_REREAD only: read [0, reread_to) again instead of restoring
             // remote-stage: the worker's parts of the checkpoints kept here (a Reset or CkptRestore keeps only those)
+            // TODO(remote-batch D): and the ones the batch slots hold (bs[b].checks, section 3.8)
             auto remote_keep = [&] {
                 std::vector<int64_t> v;
                 for (const ConvCheckpoint& k : checks)
