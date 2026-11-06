@@ -590,7 +590,10 @@ counter-based draw (Philox(seed, position)).
   the slots used are the fewest any stage carved, the groups are one unless `--batch-groups G` is given (then the
   groups' windows are pipelined over the link, and a relay overlaps them; the windows carry the busy slots only, so a
   pipelined slot stays a conversation cache and the main process says `INFO batch_pad=0`), and `--vision` is refused
-  with `--batch` (built 2026-11-07, not yet measured on GPUs).
+  with `--batch`. One group was run on GPUs on 2026-11-07 over three stages (RTX 5070 Ti main -> RX 7900 XT relay ->
+  Arc B70, `--batch 4`): the batch windows matched the solo path (`batch_test` with 2 and 4 slots,
+  `batch_interleave_test` 10/10), and `http_check` and `serve_load` passed. The pipelined groups (`--batch-groups 2`
+  and up) are built and covered over loopback only, not yet run on GPUs.
 
 ## Measured
 
