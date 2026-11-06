@@ -425,6 +425,12 @@ class RemoteStageLost(ValueError):
     so a stream that has started reports it as an error event."""
 
 
+def is_remote_stage_error(text: str) -> bool:
+    """The engine's ERR text is a remote stage's (RemoteStageLost): its link (`remote stage: ...`) or its worker
+    (`remote stage (worker): ...`)."""
+    return text.startswith(("remote stage:", "remote stage (worker):"))
+
+
 class SessionRefused(ValueError):
     """Disk sessions: the engine refused or failed a SAVE / RESTORE and is still in step (`SERR <kind> <published>
     <reason>`).  `kind` is the engine's category - invalid (400), storage (507), memory (503), io (500); `published`:
@@ -1576,7 +1582,10 @@ class StrataEngine:
                     self._yielded = (int(f[1]), int(f[2]))
             elif line.startswith("ERR"):
                 self._ctl_erred = True                   # #1059: the engine refused it and is idle: no DONE follows
-                raise ValueError(line[4:].strip())
+                text = line[4:].strip()
+                # a remote stage's link or worker (a batch admission's SlotSave, a window's SlotRun): not the
+                # request's fault - a 503 with Retry-After, as on the solo path (generate)
+                raise (RemoteStageLost if is_remote_stage_error(text) else ValueError)(text)
             if line.startswith("DONE") and self._ctl_mode == "solo":
                 self._ctl_result = ("done", None)
                 return
@@ -2070,6 +2079,10 @@ class StrataEngine:
                         continue
                     if line is None:
                         phase = "none"
+                        # a batch window over a remote stage failed: the engine said why on its control lines
+                        # (no request reads them now) and ended - a 503 with Retry-After, as on the solo path
+                        if is_remote_stage_error(self.last_err or ""):
+                            raise RemoteStageLost(self.last_err)
                         raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})")
                     if line.startswith("BT "):
                         t = int(line.split()[2])
@@ -2357,8 +2370,7 @@ class StrataEngine:
                 elif line.startswith("ERR"):
                     done = True
                     text = line[4:].strip()
-                    remote = text.startswith(("remote stage:", "remote stage (worker):"))
-                    raise (RemoteStageLost if remote else ValueError)(text)
+                    raise (RemoteStageLost if is_remote_stage_error(text) else ValueError)(text)
         finally:
             if not done:                                  # the consumer stopped early: stop the engine, drain to DONE
                 if self.can_stop:

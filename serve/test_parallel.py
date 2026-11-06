@@ -66,6 +66,9 @@ def window():        # one batch window: every active slot one token
     if fail and len(active) >= 2:     # as the engine: the reason on stdout, then exit code 1
         print("ERR verify batch: layer 34 never rang (graph finished)", flush=True)
         sys.exit(1)
+    if "--fail-remote" in args and len(active) >= 2:   # a remote stage's worker failed the window's SlotRun
+        print("ERR remote stage (worker): SlotRun: a test error", flush=True)
+        sys.exit(1)
     processed = len(active)
     for b in sorted(active):
         left, max_new, produced = active[b]
@@ -117,6 +120,10 @@ while True:
         if bytes(int(x) & 255 for x in ids).find(b"REFUSEME") >= 0:   # #1059: refused up front, then idle (no DONE)
             print("ERR refused: images are not enabled", flush=True)
             continue
+        if slot is not None and bytes(int(x) & 255 for x in ids).find(b"REMOTEADMIT") >= 0:
+            # a remote stage: the admission's SlotSave lost the worker - the engine says so and ends
+            print("ERR remote stage: the peer closed the connection (SlotSave)", flush=True)
+            sys.exit(1)
         # #1994: the engine's own view of its slots differs: BUSYSLOT is refused once, BUSYALL always
         pbx = bytes(int(x) & 255 for x in ids)
         if slot is not None and (b"BUSYALL" in pbx or (b"BUSYSLOT" in pbx and "busyslot" not in fired)):
@@ -431,6 +438,29 @@ class ParallelService(FakeEngineCase):
         time.sleep(0.5)
         self.assertEqual(self.engine.slot_busy, [False, False])
         self.assertEqual(self.chat("fine again")["choices"][0]["message"]["content"], "ok, done.")
+
+    def test_a_remote_stage_error_in_the_batch_path_is_a_503_not_a_400(self):
+        """remote-batch: over a remote stage the engine's ERR about the link or the worker is not the request's fault
+        on the batch path either - on the control lines (a batch admission's SlotSave) and in a slot (a window's
+        SlotRun, whose ERR no request reads: the engine's last words) - a 503 with Retry-After, as on the solo path
+        (the next request starts the engine again: the server's restart, not tested here)."""
+        self.start(2)
+        out = self._two_at_once("REMOTEADMIT hello")
+        self.assertEqual(out["b"][0], "http", out["b"])
+        self.assertEqual(out["b"][1], 503, out["b"])
+        self.assertIn("remote stage: the peer closed the connection", out["b"][2])
+        self.assertIn("Retry-After", out["b"][3])
+        self.assertEqual(out["a"][0], "http", out["a"])          # (its slot: the engine ended behind it)
+        self.assertEqual(out["a"][1], 503, out["a"])
+        self.tearDown()
+        self.start(2, more=["--fail-remote"])
+        out = self._two_at_once("second question")
+        for k in ("a", "b"):
+            self.assertEqual(out[k][0], "http", out[k])
+            self.assertEqual(out[k][1], 503, out[k])
+            self.assertIn("remote stage (worker): SlotRun: a test error", out[k][2])
+            self.assertIn("Retry-After", out[k][3])
+        self.assertIn("remote stage (worker): SlotRun: a test error", self.engine.death_note())
 
     def test_engine_reports_fewer_slots(self):
         self.start(4, fit=2)
