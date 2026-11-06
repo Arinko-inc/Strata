@@ -4453,7 +4453,6 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
                              void* user, int32_t* out, std::string& err) {
     using namespace strata::kernels;
     const OnDevice on_device(device_);
-    const ModelGeometry& g = *g_;
     // remote-stage, batch windows (protocol 8): the layers between the previous stage and this one run in the worker;
     // its rows land in hand_in_ rows [0, S) before this stage's graph reads them
     if (remote_slot_run_ && !remote_slot_run_(rows, S, tokens, pos, err)) return false;
