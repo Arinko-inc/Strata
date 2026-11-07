@@ -16698,6 +16698,11 @@ int main(int argc, char** argv) {
                         std::fprintf(stderr, "strata batch: slot %d: its shorter checkpoints were not all copied (out of "
                                              "memory); the rest are skipped\n", slot_source);
                     }
+                    // shortest first, so the chain's root is its first item (eviction_victim pins index 0); the one
+                    // continued from went in first above.  (slot_ck is looked up again below)
+                    std::stable_sort(checks.begin(), checks.end(), [](const ConvCheckpoint& a, const ConvCheckpoint& b) {
+                        return a.ids.size() < b.ids.size();
+                    });
                     if (slot_ck != nullptr) {
                         for (ConvCheckpoint& c : checks)   // the main session's chain has it now
                             if ((int64_t) c.ids.size() == ck_len) {
@@ -19517,11 +19522,21 @@ int main(int argc, char** argv) {
                     }();
                     if (slot_ckpt_shorter && !slot_ckpt_move_env() && best != nullptr && !sl.img) {
                         const size_t deepest = sl.checks.empty() ? 0 : sl.checks.back().ids.size();
+                        // (the RAM gate of a parked conversation: a copy that does not fit beside the floor is skipped,
+                        // as an allocation that succeeds can still be killed when its pages are written)
+                        const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib * 1024 * 1024;
                         try {
                             for (const ConvCheckpoint& c : checks) {
                                 if (&c == best || c.ids.size() >= deepest || !c.imgs.empty() ||
                                     !std::equal(c.ids.begin(), c.ids.end(), live.begin()))
                                     continue;
+                                const auto mem = strata::core::sample_host_memory();
+                                if (!strata::core::conversation_memory_admit(
+                                        mem ? std::optional<uint64_t>(mem->available) : std::nullopt, c.bytes(), floor)) {
+                                    std::fprintf(stderr, "strata batch: slot %d: a shorter checkpoint (%zu tokens) not "
+                                                         "copied in (physical RAM admission)\n", admit_slot, c.ids.size());
+                                    continue;
+                                }
                                 if (ckpt_pool.on()) {
                                     ConvCheckpoint k = ckpt_pool.take();
                                     k = c;
@@ -19534,6 +19549,12 @@ int main(int argc, char** argv) {
                             std::fprintf(stderr, "strata batch: slot %d: its shorter checkpoints were not all copied in (out "
                                                  "of memory); the rest are skipped\n", admit_slot);
                         }
+                        // shortest first: a chain's root is its first item (conv_cache::eviction_victim pins index 0),
+                        // and a give-back of all the slot holds hands them on in this order
+                        std::stable_sort(sl.checks.begin(), sl.checks.end(),
+                                         [](const ConvCheckpoint& a, const ConvCheckpoint& b) {
+                                             return a.ids.size() < b.ids.size();
+                                         });
                     }
                     const auto tc4 = Clock::now();
                     std::fprintf(stderr, "strata batch: slot %d takes %lld tokens (copied in %.1f ms)\n", admit_slot,
