@@ -17723,17 +17723,27 @@ int main(int argc, char** argv) {
                 // three PCs took 86 s instead of 39 s).  A BYIELD that comes meanwhile ends the run before its next
                 // chunk (Prefill::stop_at_chunk: the run still takes the rows of every chunk it sent), and the part
                 // read gives way there as between two pieces; a BYIELD give_way does not take leaves the rest to be
-                // read the same way.  Beside decoding slots a remote read still goes a chunk at a time (they decode
-                // between the chunks).  STRATA_REMOTE_READ_ONE_RUN=0 keeps the run per chunk (an A/B).
+                // read the same way.  STRATA_REMOTE_READ_ONE_RUN=0 keeps the run per chunk (an A/B).
+                // Beside decoding slots a remote read goes in runs of STRATA_REMOTE_READ_RUN_CHUNKS chunks (default 4;
+                // 0 or 1 = a chunk at a time, as before), so those chunks too go through the workers as a pipeline, and
+                // the slots decode between the runs for the same share of the run's time.  A chunk at a time waited for
+                // the last worker after every chunk: 3.2 s a chunk where the pipeline takes 1.43 s, and a 50K-token
+                // prompt beside one decoding slot took 138 s instead of 50 s.  Whether the slots decode is looked at
+                // before each run: once they are done the rest is read in one run.
                 static const bool remote_one_run_env = [] {
                     const char* v = std::getenv("STRATA_REMOTE_READ_ONE_RUN");
                     return v == nullptr || std::atoi(v) != 0;
                 }();
-                const bool remote_one_run = remote_main && remote_one_run_env && !batch_on();
+                static const int64_t remote_run_chunks = [] {
+                    const char* v = std::getenv("STRATA_REMOTE_READ_RUN_CHUNKS");
+                    return v != nullptr ? (int64_t) std::max(0, std::atoi(v)) : (int64_t) 4;
+                }();
                 for (int64_t q = a0; q < b0;) {
-                    int64_t r = remote_one_run ? b0 : std::min(b0, q + piece);
+                    const bool remote_one_run = remote_main && remote_one_run_env && !batch_on();
+                    const bool remote_runs = remote_main && remote_one_run_env && remote_run_chunks > 1 && batch_on();
+                    int64_t r = remote_one_run ? b0 : std::min(b0, q + (remote_runs ? piece * remote_run_chunks : piece));
                     const auto tq = Clock::now();
-                    if (remote_one_run) {
+                    if (remote_one_run || remote_runs) {
                         sp.stop_at_chunk = [&] {   // a BYIELD is waiting (the look below takes it off the queue)
                             std::lock_guard<std::mutex> lk(in_mu);
                             return std::any_of(in_lines.begin(), in_lines.end(),
