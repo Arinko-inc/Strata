@@ -19505,6 +19505,36 @@ int main(int argc, char** argv) {
                             sl.checks.push_back(*best);
                         }
                     }
+                    // the main chain's shorter checkpoints on this prompt's path come along too (copies: the main session
+                    // keeps its own), so a give-back (copy_from_slot, which leaves the main session only the slot's) keeps
+                    // them: with only the deepest one - this request's turn, past the common start of the next prompts -
+                    // the next prompt that shared only that start read 56K tokens from 0 after a give-back (2026-11-07).
+                    // Their cells are below the copied ones, read in the main session as the deepest one's were.
+                    // STRATA_SLOT_CKPT_SHORTER=0: the deepest one only, as before
+                    static const bool slot_ckpt_shorter = [] {
+                        const char* v = std::getenv("STRATA_SLOT_CKPT_SHORTER");
+                        return v == nullptr || std::atoi(v) != 0;
+                    }();
+                    if (slot_ckpt_shorter && !slot_ckpt_move_env() && best != nullptr && !sl.img) {
+                        const size_t deepest = sl.checks.empty() ? 0 : sl.checks.back().ids.size();
+                        try {
+                            for (const ConvCheckpoint& c : checks) {
+                                if (&c == best || c.ids.size() >= deepest || !c.imgs.empty() ||
+                                    !std::equal(c.ids.begin(), c.ids.end(), live.begin()))
+                                    continue;
+                                if (ckpt_pool.on()) {
+                                    ConvCheckpoint k = ckpt_pool.take();
+                                    k = c;
+                                    sl.checks.push_back(std::move(k));
+                                } else {
+                                    sl.checks.push_back(c);
+                                }
+                            }
+                        } catch (const std::bad_alloc&) {   // an optimization: a host allocation that fails skips the rest
+                            std::fprintf(stderr, "strata batch: slot %d: its shorter checkpoints were not all copied in (out "
+                                                 "of memory); the rest are skipped\n", admit_slot);
+                        }
+                    }
                     const auto tc4 = Clock::now();
                     std::fprintf(stderr, "strata batch: slot %d takes %lld tokens (copied in %.1f ms)\n", admit_slot,
                                  (long long) live.size(), std::chrono::duration<double, std::milli>(tc4 - tc0).count());
