@@ -28,6 +28,10 @@ CASES = [
      {"path": "a.txt", "content": f"example:\n{FUNC_START}demo>\n{PARAM_START}x>\n1"}),
     ("spaced prefix in a value", BASH, "bash", {"command": "echo '<function=tools bash>' done"}),
     ("misspelt opener in a value", BASH, "bash", {"command": f"echo '<toolcall>' && echo '{FUNC_START}bash>'"}),
+    ("spaced prefix after a closed quoted call", WRITE, "write",
+     {"path": "a.txt", "content": f"{FUNC_START}demo>{PARAM_START}x>1{PARAM_END}{FUNC_END}\n{FUNC_START}tools write>"}),
+    ("misspelt opener after a closed quoted call", BASH, "bash",
+     {"command": f"cat <<E\n{FUNC_START}demo>\n{PARAM_START}x>\n1\n{PARAM_END}\n{FUNC_END}\n<toolcall>\n{FUNC_START}bash>\nE"}),
 ]
 
 

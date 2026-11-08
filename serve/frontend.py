@@ -785,6 +785,7 @@ _PREFIX_SPACED = re.compile(r"(<function=\s*(?:tools|functions|default_api)[ \t]
 # where a `<function=...>` is a call's opener (_prefixed): right after the wrapper's opener, after the previous call of a batch,
 # or at the start of a line (a bare call, recover)
 _AFTER_CALL_START = re.compile(r"(?:<tool_call>|</function>)\s*$|(?:^|\n)[ \t]*$")
+_PARAM_OPEN_AT = re.compile(r"\s*<parameter=([^<>]*)>")   # a parameter's opener where the walk stands (OutputParser._in_value)
 _PREFIX_PART = re.compile(r"<function=\s*(?:tools|functions|default_api)[ \t]+[^<>\s]{0,80}\s*$")
 _PREFIX_BARE = re.compile(r"(<tool_call>\s*)<function=\s*(tools|functions|default_api)\s*>(.*?)</function>", re.S)
 _PREFIX_BARE_OPEN = re.compile(r"<tool_call>\s*<function=\s*(tools|functions|default_api)\s*>(?!.*</function>)", re.S)
@@ -1639,13 +1640,31 @@ class OutputParser:
         return best
 
     def _in_value(self, pos: int) -> bool:
-        """self.buf[pos] is inside a parameter value (the last of `<parameter=`, `</parameter>`, `</function>` before it opens one)
-        or a JSON call: _prefixed and _opener leave it as written, so a value that quotes `<function=tools NAME>` or `<toolcall>`
-        stays exact."""
+        """self.buf[pos] is inside a parameter value, or a JSON call: _prefixed and _opener leave it as written, so a value that
+        quotes `<function=tools NAME>` or `<toolcall>` stays exact.  The calls in the buffer are walked from their openers with
+        param_end, so a call the value itself quotes does not end it."""
         if self.state == "json":
             return True
         b = self.buf
-        return b.rfind(PARAM_START, 0, pos) > max(b.rfind(PARAM_END, 0, pos), b.rfind(FUNC_END, 0, pos))
+        i = b.find(FUNC_START)
+        while 0 <= i < pos:
+            gt = b.find(">", i)
+            if gt < 0 or gt >= pos:
+                return False
+            j = gt + 1
+            while True:
+                m = _PARAM_OPEN_AT.match(b, j)
+                if not m:
+                    break
+                v = m.end()
+                if v > pos:
+                    return False
+                e = param_end(b[v:], name=m.group(1).strip())
+                if e < 0 or pos < v + e:                 # the value is still open, or pos lies before its close
+                    return True
+                j = v + e + len(PARAM_END)
+            i = b.find(FUNC_START, j)
+        return False
 
     def _prefixed(self, fresh: int) -> str:
         """#5409: a call written `<function=tools NAME>` (a space for the dot of `tools.NAME`) is the call NAME, and one written
