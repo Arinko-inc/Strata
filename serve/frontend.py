@@ -782,6 +782,7 @@ _LOOSE_OPEN = re.compile(r"<\s*(?:function\s*[=:]\s*|=\s*)?([A-Za-z0-9_.\-]+)\s*
 _PREFIX_LOOKBACK = 256     # how far before a new delta a prefixed name or a misspelt opener can start (see OutputParser._prefixed)
 # #5409: `<function=tools actio>` / `<function=tools>`; the prefixes are the ones of #4751
 _PREFIX_SPACED = re.compile(r"(<function=\s*(?:tools|functions|default_api)[ \t]+)([^<>\s]+)\s*>")
+_AFTER_CALL_START = re.compile(r"<tool_call>\s*$")   # a `<function=...>` right after the wrapper's opener (_prefixed)
 _PREFIX_PART = re.compile(r"<function=\s*(?:tools|functions|default_api)[ \t]+[^<>\s]{0,80}\s*$")
 _PREFIX_BARE = re.compile(r"(<tool_call>\s*)<function=\s*(tools|functions|default_api)\s*>(.*?)</function>", re.S)
 _PREFIX_BARE_OPEN = re.compile(r"<tool_call>\s*<function=\s*(tools|functions|default_api)\s*>(?!.*</function>)", re.S)
@@ -837,7 +838,14 @@ def param_end(text: str, final: bool = False, name: str | None = None, hold: boo
     -1: none yet; -2: a candidate whose follower has not arrived (streaming; `final` accepts it)."""
     at = text.find(PARAM_END)
     while at >= 0:
-        if len(_QUOTED_OPEN.findall(text, 0, at)) <= text.count(FUNC_END, 0, at):
+        open_quotes = len(_QUOTED_OPEN.findall(text, 0, at)) - text.count(FUNC_END, 0, at)
+        # a quoted call that never closes (no `</function>` of its own after this close, beside the call's) does not hold the
+        # close: streaming waits for what follows, `final` takes it as the call's own
+        if open_quotes > 0 and text.count(FUNC_END, at) <= open_quotes:
+            if not final:
+                return -2
+            open_quotes = 0
+        if open_quotes <= 0:
             after = text[at + len(PARAM_END):].lstrip()
             if after.startswith(PARAM_START):
                 gt = after.find(">")
@@ -1620,6 +1628,17 @@ class OutputParser:
                 start = text.find(tag[0], start + 1)
         return best
 
+    def _values_from(self) -> int:
+        """Where the values of the call being read start in self.buf: _prefixed and _opener rewrite only text before it, so a value
+        that quotes `<function=tools NAME>` or `<toolcall>` stays exact.  A JSON call is all value (0); outside a call, no limit."""
+        if self.state == "json":
+            return 0
+        if self.state not in ("call", "rcall"):
+            return len(self.buf) + 1
+        at = self.buf.find(FUNC_START)
+        gt = self.buf.find(">", at) if at >= 0 else -1
+        return gt + 1 if gt >= 0 else len(self.buf) + 1
+
     def _prefixed(self, fresh: int) -> str:
         """#5409: a call written `<function=tools NAME>` (a space for the dot of `tools.NAME`) is the call NAME, and one written
         `<function=tools>` (the bare prefix) is the one declared tool that takes the call's parameters.  Rewrites the complete
@@ -1629,11 +1648,14 @@ class OutputParser:
         so a long call is not scanned again with every token."""
         held = self._opener(fresh)
         start = max(0, len(self.buf) - fresh - _PREFIX_LOOKBACK)
+        values = self._values_from() - start            # a match from here on is inside a value: left as written
         buf = self.buf[start:]
         if "<function=" in buf:
             def spaced(m):
                 name = m.group(2).strip()
-                return f"<function={name}>" if name in self.schemas else m.group(0)
+                at = start + m.start()
+                opener = _AFTER_CALL_START.search(self.buf, max(0, at - 64), at)    # only a call's opener, never a value's text
+                return f"<function={name}>" if name in self.schemas and m.start() < values and opener else m.group(0)
             buf = _PREFIX_SPACED.sub(spaced, buf)
             m = _PREFIX_PART.search(buf)
             if m and not held:
@@ -1642,7 +1664,7 @@ class OutputParser:
                 def bare(m):
                     body = m.group(3)
                     names = re.findall(r"<parameter=\s*([^<>\s]+?)\s*>", body)
-                    tool = None if m.group(2) in self.schemas else self._tool_by_params(names)
+                    tool = None if m.group(2) in self.schemas or m.start() >= values else self._tool_by_params(names)
                     return f"{m.group(1)}<function={tool}>{body}</function>" if tool else m.group(0)
                 buf = _PREFIX_BARE.sub(bare, buf)
                 m = _PREFIX_BARE_OPEN.search(buf)
@@ -1662,10 +1684,11 @@ class OutputParser:
             return ""
         buf = self.buf
         pos, out = start, []
+        values = self._values_from()
         for m in _MISSPELT_OPEN.finditer(buf, start):
             name = m.group(2).strip()
             name = self.aliases.get(name, name)
-            if name in self.schemas and self._opens_at(m.start()):
+            if name in self.schemas and m.start() < values and self._opens_at(m.start()):
                 out.append(buf[pos:m.start()] + CALL_START + m.group(1) + FUNC_START + m.group(2) + ">")
                 pos = m.end()
         buf = buf[:start] + "".join(out) + buf[pos:] if out else buf
