@@ -828,40 +828,16 @@ def _close_verdict(after: str, final: bool) -> str:
 
 
 
-def param_end(text: str, final: bool = False, name: str | None = None, hold: bool = True,
-              quoted_end: bool | None = None) -> int:
+def param_end(text: str, final: bool = False, name: str | None = None, hold: bool = True) -> int:
     """Where a parameter value in `text` ends: the first PARAM_END followed (after whitespace) by the next
     PARAM_START or FUNC_END, or by the wrapper's CALL_END when the call's `</function>` was left out (#4427) - the
     same text inside a value (a file that documents the call format, #210) is
     part of the value.  #4078: a close inside a call the value itself quotes (more _QUOTED_OPEN than FUNC_END before
     it), or one followed by the same parameter `name` again, is part of the value too.  `text` starts at the value.
-    -1: none yet; -2: a candidate whose follower has not arrived (streaming; `final` accepts it).
-    `quoted_end` (default: `final`): a close that only a quoted call that never closes stands before is the call's own.  A
-    parser passes it only for a turn that ended naturally: a turn cut by max tokens may have stopped inside a quoted call."""
-    if quoted_end is None:
-        quoted_end = final
+    -1: none yet; -2: a candidate whose follower has not arrived (streaming; `final` accepts it)."""
     at = text.find(PARAM_END)
-    crossed = False                                      # a skipped close was followed by another parameter
     while at >= 0:
-        open_quotes = len(_QUOTED_OPEN.findall(text, 0, at)) - text.count(FUNC_END, 0, at)
-        # a quoted call that never closes (no `</function>` of its own after this close, beside the call's) does not hold a
-        # close the call's own `</function>` or `</tool_call>` follows: streaming waits for what follows, `final` takes it.  Not
-        # once a skipped close was followed by another parameter (the value's end is not known: the call stays text, as before)
-        if open_quotes > 0 and not crossed and text.count(FUNC_END, at) <= open_quotes:
-            tail = text[at + len(PARAM_END):].lstrip()
-            closer = FUNC_END if tail.startswith(FUNC_END) else CALL_END
-            if tail.startswith((FUNC_END, CALL_END)) and PARAM_END not in tail[len(closer):]:
-                # (a `</parameter>` after that close: the close was the quoted call's, as when the call's own
-                # `</function>` is left out)
-                if not final:
-                    return -2
-                if quoted_end:
-                    open_quotes = 0
-            elif not final and (not tail or FUNC_END.startswith(tail) or CALL_END.startswith(tail)):
-                return -2                                # its follower is still arriving
-        if open_quotes > 0 and text[at + len(PARAM_END):].lstrip().startswith(PARAM_START):
-            crossed = True
-        if open_quotes <= 0:
+        if len(_QUOTED_OPEN.findall(text, 0, at)) <= text.count(FUNC_END, 0, at):
             after = text[at + len(PARAM_END):].lstrip()
             if after.startswith(PARAM_START):
                 gt = after.find(">")
@@ -881,14 +857,7 @@ def param_end(text: str, final: bool = False, name: str | None = None, hold: boo
     return -1
 
 
-def repeats_a_parameter(text: str) -> bool:
-    """Some parameter name is opened twice in `text` (a call's body, quoted calls included).  param_end's guess for an unclosed
-    quoted call is then not made: the value's end could put another value in the place of a parameter (a second `path`)."""
-    names = re.findall(r"<parameter=\s*([^<>\s]+?)\s*>", text)
-    return len(names) != len(set(names))
-
-
-def call_end(text: str, final: bool = False, hold: bool = True, quoted_end: bool | None = None) -> int:
+def call_end(text: str, final: bool = False, hold: bool = True) -> int:
     """Where a tool call's body ends (#210): the `</tool_call>` after the call's own `</function>`, found by walking
     its parameters with param_end, so a value may contain either tag.  -1: not complete yet.  A body that is not in
     the call format ends at the first `</tool_call>`, as before."""
@@ -908,7 +877,7 @@ def call_end(text: str, final: bool = False, hold: bool = True, quoted_end: bool
             gt = text.find(">", pos)
             if gt < 0:
                 return -1
-            end = param_end(text[gt + 1:], final, text[pos:gt].split("=", 1)[1].strip(), hold, quoted_end)
+            end = param_end(text[gt + 1:], final, text[pos:gt].split("=", 1)[1].strip(), hold)
             if end < 0:
                 return -1
             pos = gt + 1 + end + len(PARAM_END)
@@ -1277,7 +1246,6 @@ class OutputParser:
         self.bare = False            # the call being read opened with <function= alone (no <tool_call> around it)
         self.batch = False           # the call being finished is followed by another in the same wrapper
         self._final = False          # #4701: the turn has ended: a call held for what might follow it is decided now
-        self._natural = False        # the turn ended naturally (finish with "stop"): param_end's quoted_end may decide a call
         self._held = ""              # #5276/#5409: the end of a misspelt opener or a prefixed name still arriving (see _prefixed)
         self._reset_scan()
 
@@ -1525,11 +1493,7 @@ class OutputParser:
                 self._call_end_checked = len(self.buf)
                 return -1
             self._call_end_checked = -1
-        return call_end(self.buf, self._final, quoted_end=self._quoted_end())
-
-    def _quoted_end(self) -> bool:
-        """param_end's guess for an unclosed quoted call: only at a natural end, and not in a call that opens a parameter twice."""
-        return self._final and self._natural and not repeats_a_parameter(self.buf)
+        return call_end(self.buf, self._final)
 
     def _scan(self) -> list[Event]:
         """Advance the streaming view of the call body in self.buf (see stream_tools)."""
@@ -1589,8 +1553,7 @@ class OutputParser:
                     self.sval_started = True
                     self.svstart = self.sp
                 # the walk starts at the value (a quoted call's opener counts); only a close in the new text can end it
-                end = (param_end(self.buf[self.svstart:], self._final, name=self.spname, quoted_end=self._quoted_end())
-                       if PARAM_END in rest else -1)
+                end = param_end(self.buf[self.svstart:], self._final, name=self.spname) if PARAM_END in rest else -1
                 end = end - (self.sp - self.svstart) if end >= 0 else end
                 if end >= 0:
                     value = rest[:end]
@@ -1609,7 +1572,7 @@ class OutputParser:
                     self.sp += safe
                 return out
             elif self.ss == "raw":
-                end = param_end(rest, self._final, name=self.spname, quoted_end=self._quoted_end())
+                end = param_end(rest, self._final, name=self.spname)
                 if end < 0:
                     return out
                 value = rest[:end]
@@ -2033,7 +1996,6 @@ class OutputParser:
         out = []
         if self._held:
             self.buf, self._held = self.buf + self._held, ""
-        self._natural = reason in (None, "stop")
         if self.buf and self.state in ("call", "rcall"):
             self._final = True                  # #4701: a call held after its closing tags (could a file's text go on?) is whole now
             out += self.feed("")
