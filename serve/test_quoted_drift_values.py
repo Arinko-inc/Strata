@@ -35,6 +35,12 @@ CASES = [
 ]
 
 
+def stray_call():
+    # text between a close and the next parameter: parse_tool_call reads on to that parameter, and so does _in_value
+    return (f"{CALL_START}\n{FUNC_START}write>\n{PARAM_START}path>\na.txt\n{PARAM_END}\n{FUNC_END} stray note\n"
+            f"{PARAM_START}content>\nplain text\n{FUNC_START}tools write>\nmore\n{PARAM_END}\n{FUNC_END}\n{CALL_END}")
+
+
 class QuotedDriftValues(unittest.TestCase):
     def test_values_are_exact_whole_streamed_and_chunked(self):
         for label, tool, name, args in CASES:
@@ -57,6 +63,15 @@ class QuotedDriftValues(unittest.TestCase):
         for i in range(0, len(text), size):
             events += p.feed(text[i:i + size])
         return events + p.finish()
+
+    def test_value_after_stray_text_stays_exact(self):
+        text = stray_call()
+        for stream in (False, True):
+            for size in (1, 7, len(text)):
+                with self.subTest(stream=stream, size=size):
+                    for e in self.parse(text, [WRITE], stream, size):
+                        if e.kind == "tool_call":
+                            self.assertIn(f"{FUNC_START}tools write>", e.call.arguments.get("content", ""))
 
     def test_second_spaced_call_of_a_batch_is_the_declared_tool(self):
         actio = {"name": "actio", "parameters": {"properties": {"command": {"type": "string"}}}}

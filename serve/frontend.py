@@ -785,7 +785,6 @@ _PREFIX_SPACED = re.compile(r"(<function=\s*(?:tools|functions|default_api)[ \t]
 # where a `<function=...>` is a call's opener (_prefixed): right after the wrapper's opener, after the previous call of a batch,
 # or at the start of a line (a bare call, recover)
 _AFTER_CALL_START = re.compile(r"(?:<tool_call>|</function>)\s*$|(?:^|\n)[ \t]*$")
-_PARAM_OPEN_AT = re.compile(r"\s*<parameter=([^<>]*)>")   # a parameter's opener where the walk stands (OutputParser._in_value)
 _PREFIX_PART = re.compile(r"<function=\s*(?:tools|functions|default_api)[ \t]+[^<>\s]{0,80}\s*$")
 _PREFIX_BARE = re.compile(r"(<tool_call>\s*)<function=\s*(tools|functions|default_api)\s*>(.*?)</function>", re.S)
 _PREFIX_BARE_OPEN = re.compile(r"<tool_call>\s*<function=\s*(tools|functions|default_api)\s*>(?!.*</function>)", re.S)
@@ -1652,14 +1651,15 @@ class OutputParser:
             if gt < 0 or gt >= pos:
                 return False
             j = gt + 1
-            while True:
-                m = _PARAM_OPEN_AT.match(b, j)
-                if not m:
+            while True:                                  # the next parameter, past any text between, as parse_tool_call reads it
+                at, nxt = b.find(PARAM_START, j), b.find(FUNC_START, j)
+                if at < 0 or (0 <= nxt < at):
                     break
-                v = m.end()
-                if v > pos:
+                close = b.find(">", at)
+                if close < 0 or close >= pos:
                     return False
-                e = param_end(b[v:], name=m.group(1).strip())
+                v = close + 1
+                e = param_end(b[v:], name=b[at + len(PARAM_START):close].strip())
                 if e < 0 or pos < v + e:                 # the value is still open, or pos lies before its close
                     return True
                 j = v + e + len(PARAM_END)
