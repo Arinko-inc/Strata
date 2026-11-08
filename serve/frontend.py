@@ -881,6 +881,13 @@ def param_end(text: str, final: bool = False, name: str | None = None, hold: boo
     return -1
 
 
+def repeats_a_parameter(text: str) -> bool:
+    """Some parameter name is opened twice in `text` (a call's body, quoted calls included).  param_end's guess for an unclosed
+    quoted call is then not made: the value's end could put another value in the place of a parameter (a second `path`)."""
+    names = re.findall(r"<parameter=\s*([^<>\s]+?)\s*>", text)
+    return len(names) != len(set(names))
+
+
 def call_end(text: str, final: bool = False, hold: bool = True, quoted_end: bool | None = None) -> int:
     """Where a tool call's body ends (#210): the `</tool_call>` after the call's own `</function>`, found by walking
     its parameters with param_end, so a value may contain either tag.  -1: not complete yet.  A body that is not in
@@ -1518,7 +1525,11 @@ class OutputParser:
                 self._call_end_checked = len(self.buf)
                 return -1
             self._call_end_checked = -1
-        return call_end(self.buf, self._final, quoted_end=self._final and self._natural)
+        return call_end(self.buf, self._final, quoted_end=self._quoted_end())
+
+    def _quoted_end(self) -> bool:
+        """param_end's guess for an unclosed quoted call: only at a natural end, and not in a call that opens a parameter twice."""
+        return self._final and self._natural and not repeats_a_parameter(self.buf)
 
     def _scan(self) -> list[Event]:
         """Advance the streaming view of the call body in self.buf (see stream_tools)."""
@@ -1578,7 +1589,7 @@ class OutputParser:
                     self.sval_started = True
                     self.svstart = self.sp
                 # the walk starts at the value (a quoted call's opener counts); only a close in the new text can end it
-                end = (param_end(self.buf[self.svstart:], self._final, name=self.spname, quoted_end=self._final and self._natural)
+                end = (param_end(self.buf[self.svstart:], self._final, name=self.spname, quoted_end=self._quoted_end())
                        if PARAM_END in rest else -1)
                 end = end - (self.sp - self.svstart) if end >= 0 else end
                 if end >= 0:
@@ -1598,7 +1609,7 @@ class OutputParser:
                     self.sp += safe
                 return out
             elif self.ss == "raw":
-                end = param_end(rest, self._final, name=self.spname, quoted_end=self._final and self._natural)
+                end = param_end(rest, self._final, name=self.spname, quoted_end=self._quoted_end())
                 if end < 0:
                     return out
                 value = rest[:end]
