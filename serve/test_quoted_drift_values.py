@@ -56,6 +56,25 @@ class QuotedDriftValues(unittest.TestCase):
                     calls = [e.call.arguments for e in self.parse(text, [WRITE], stream, size) if e.kind == "tool_call"]
                     self.assertEqual(calls, [args])
 
+    def test_a_turn_cut_by_max_tokens_never_guesses_the_end(self):
+        # cut inside a value that quotes a whole call: the quoted close must not become the call's own (Codex review)
+        text = (f"{CALL_START}\n{FUNC_START}write>\n{PARAM_START}path>\na.txt\n{PARAM_END}\n{PARAM_START}content>\n"
+                f"{CALL_START}{FUNC_START}demo>{PARAM_START}x>1{PARAM_END}{FUNC_END}{CALL_END}")
+        for reason in ("length", "cancel"):
+            for stream in (False, True):
+                for size in (1, 7, len(text)):
+                    with self.subTest(reason=reason, stream=stream, size=size):
+                        p = OutputParser(thinking=False, tools=[WRITE], stream_tools=stream, recover=True)
+                        events = []
+                        for i in range(0, len(text), size):
+                            events += p.feed(text[i:i + size])
+                        events += p.finish(reason)
+                        self.assertEqual([e for e in events if e.kind == "tool_call"], [])
+        # the same unclosed-quote call that ends naturally is read
+        args = CASES[0][1]
+        events = self.parse(call("write", args), [WRITE], False, 7)
+        self.assertEqual([e.call.arguments for e in events if e.kind == "tool_call"], [args])
+
     def test_unclosed_quote_across_parameters_never_makes_wrong_arguments(self):
         cases = [
             call("write", {"path": "a.txt", "content": f"docs {FUNC_START}demo>\n{PARAM_START}x>\n1\n{PARAM_END}\n{PARAM_START}y>\n2"}),
