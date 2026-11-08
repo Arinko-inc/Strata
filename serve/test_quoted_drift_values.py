@@ -47,6 +47,48 @@ class QuotedDriftValues(unittest.TestCase):
                         if stream:
                             self.assertEqual(json.loads("".join(e.text for e in events if e.kind == "tool_args")), args)
 
+    def parse(self, text, tools, stream, size):
+        p = OutputParser(thinking=False, tools=tools, stream_tools=stream, recover=True)
+        events = []
+        for i in range(0, len(text), size):
+            events += p.feed(text[i:i + size])
+        return events + p.finish()
+
+    def test_second_spaced_call_of_a_batch_is_the_declared_tool(self):
+        actio = {"name": "actio", "parameters": {"properties": {"command": {"type": "string"}}}}
+        read = {"name": "read", "parameters": {"properties": {"path": {"type": "string"}}}}
+        text = (f"{CALL_START}\n{FUNC_START}actio>\n{PARAM_START}command>\nls\n{PARAM_END}\n{FUNC_END}\n"
+                f"{FUNC_START}tools read>\n{PARAM_START}path>\n/x\n{PARAM_END}\n{FUNC_END}\n{CALL_END}")
+        for stream in (False, True):
+            for size in (1, 7, len(text)):
+                with self.subTest(stream=stream, size=size):
+                    events = self.parse(text, [actio, read], stream, size)
+                    self.assertEqual([e.call.name for e in events if e.kind == "tool_call"], ["actio", "read"])
+
+    def test_bare_spaced_call_at_a_line_start(self):
+        actio = {"name": "actio", "parameters": {"properties": {"command": {"type": "string"}}}}
+        text = f"Let me look.\n{FUNC_START}tools actio>\n{PARAM_START}command>\nls\n{PARAM_END}\n{FUNC_END}"
+        for size in (1, 7, len(text)):
+            with self.subTest(size=size):
+                events = self.parse(text, [actio], False, size)
+                self.assertEqual([(e.call.name, e.call.arguments) for e in events if e.kind == "tool_call"],
+                                 [("actio", {"command": "ls"})])
+
+    def test_unclosed_quote_across_parameters_never_makes_wrong_arguments(self):
+        cases = [
+            call("write", {"path": "a.txt", "content": f"docs {FUNC_START}demo>\n{PARAM_START}x>\n1\n{PARAM_END}\n{PARAM_START}y>\n2"}),
+            call("write", {"path": f"a {FUNC_START}demo>\n{PARAM_START}x>\n1", "content": f"doc {FUNC_START}foo>{FUNC_END}"}),
+        ]
+        for n, text in enumerate(cases):
+            for stream in (False, True):
+                for size in (1, 7, len(text)):
+                    with self.subTest(case=n, stream=stream, size=size):
+                        calls = [e.call.arguments for e in self.parse(text, [WRITE], stream, size) if e.kind == "tool_call"]
+                        # either the call as written, or (as before these picks) no call: never a call with other arguments
+                        for args in calls:
+                            self.assertEqual(set(args), {"path", "content"})
+                            self.assertTrue(args["content"].endswith(("2", f"{FUNC_START}foo>{FUNC_END}")), args)
+
 
 if __name__ == "__main__":
     unittest.main()
