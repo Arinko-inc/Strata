@@ -44,7 +44,6 @@ class StopOnAClosedPipe(unittest.TestCase):
         e = engine()
         e.lines.put("T 7")
         with mock.patch.object(server.bias_api, "validate_request", lambda *a, **k: None), \
-                mock.patch.object(server, "refuse_for_split", lambda *a, **k: None), \
                 mock.patch.object(server, "ENGINE_STALL_S", 0):
             gen = e.generate([1, 2, 3], 8, {}, threading.Event())
             self.assertEqual(next(gen), 7)
@@ -71,7 +70,6 @@ class StopOnAClosedPipe(unittest.TestCase):
         e = engine()
         e.lines.put("T 7")
         with mock.patch.object(server.bias_api, "validate_request", lambda *a, **k: None), \
-                mock.patch.object(server, "refuse_for_split", lambda *a, **k: None), \
                 mock.patch.object(server, "ENGINE_STALL_S", 0):
             gen = e.generate([1, 2, 3], 8, {}, threading.Event())
             self.assertEqual(next(gen), 7)
