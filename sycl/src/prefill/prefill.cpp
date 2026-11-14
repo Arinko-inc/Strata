@@ -268,9 +268,10 @@ inline int ring_slots(size_t T) {
 // that many more slots for the lookahead to keep copying (the slots are only reused once the group's event is in)
 // 151-b70: the fused int8 DPAS expert products (prefill/esimd_moe.dp.cpp, Battlemage).  Unset STRATA_PREFILL_MMQ (alias STRATA_PF_I8) is
 // auto on a Battlemage GPU (bmg-g21 / bmg-g31 by architecture id) whose kernels are in the binary, the FP16 chain on every other GPU
-// (Alchemist included); =0 forces the FP16 chain, =1 the int8 chain everywhere it applies (IQ3_S / IQ3_XXS / IQ2_S gate/up with IQ4_NL /
-// Q2_0 down, the 640 x 2560 expert), =auto the per-group choice from the crossover measured on this GPU.  The activations are quantized,
-// so the bits differ from the FP16 path (docs/INTEL_INT8_EXPERTS.md: KL 0.0002 nats, top-1 99.7%).
+// (Alchemist included); =0 forces the FP16 chain, =1 the int8 chain everywhere it applies (IQ3_S / IQ3_XXS / IQ2_S / Q4_K gate/up with
+// IQ4_NL / Q2_0 / Q5_0 down, the 640 x 2560 expert), =auto the per-group choice from the crossover measured on this GPU.  STRATA_I8_KQ=0
+// keeps the Q4_K / Q5_0 layers (the Q4_K_S packs) on the FP16 chain whatever the mode.  The activations are quantized, so the bits
+// differ from the FP16 path (docs/INTEL_INT8_EXPERTS.md: KL 0.0002 nats, top-1 99.7%).
 static_assert(strata::kernels::kXmxGroupMax <= strata::prefill::i8::kMaxGroup, "the int8 path holds the grouped XMX path's experts: its Layout must be at least as big");
 inline const char* i8_env() {
     const char* e = std::getenv("STRATA_PREFILL_MMQ");
@@ -284,6 +285,11 @@ inline int i8_mode(void* cs) {
     const char* e = i8_env();
     if (e != nullptr) return strata::prefill::i8::choose_mode(e, false, false);
     return strata::prefill::i8::choose_mode(nullptr, strata::prefill::i8::battlemage(cs), strata::prefill::i8::available(cs));
+}
+// A layer's expert formats take the int8 chain (STRATA_I8_KQ=0: not the Q4_K / Q5_0 ones).
+inline bool i8_formats(int gu_type, int d_type) {
+    static const bool kq = strata::prefill::i8::kq_on(std::getenv("STRATA_I8_KQ"));
+    return strata::prefill::i8::formats_ok(gu_type, d_type, kq);
 }
 // ring sizing happens before any queue is at hand: room for the int8 groups whenever the choice could be on
 inline int stage_slots() {
@@ -945,9 +951,13 @@ I8Cross i8_calibrate(M& m, const strata::kernels::cpu::NativeFmt& f) {
         uint32_t s = 12345;
         auto rnd = [&] { s = s * 1664525u + 1013904223u; return s >> 8; };
         for (size_t i = 0; i < hb.size(); ++i) hb[i] = (uint8_t) rnd();
-        const int gb = f.gu_type == 21 ? 110 : f.gu_type == 18 ? 98 : 82;
-        for (size_t o = 0; o + 2 <= f.up_off * 2 && o < hb.size(); o += gb) { hb[o] = 0x00; hb[o + 1] = 0x2C; }
-        for (size_t o = f.down_off; o + 2 <= f.bytes; o += 18) { hb[o] = 0x00; hb[o + 1] = 0x2C; }
+        const int gb = i8::block_bytes(f.gu_type), db = i8::block_bytes(f.d_type);
+        if (gb <= 0 || db <= 0) throw std::runtime_error("a format the int8 kernels do not handle");
+        for (size_t o = 0; o + 2 <= f.up_off * 2 && o < hb.size(); o += gb) {
+            hb[o] = 0x00; hb[o + 1] = 0x2C;
+            if (f.gu_type == i8::kTypeQ4K) { hb[o + 2] = 0x00; hb[o + 3] = 0x2C; }   // its dmin
+        }
+        for (size_t o = f.down_off; o + 2 <= f.bytes; o += db) { hb[o] = 0x00; hb[o + 1] = 0x2C; }
         for (int i = 0; i < E; ++i) q.memcpy(blobs[i], hb.data(), f.bytes);
         std::vector<uint16_t> hx(rmax * N);
         for (auto& x : hx) x = (uint16_t) (0x3400 + (rnd() & 0x3ff));   // ~0.25..0.5, no zeros
@@ -977,8 +987,9 @@ I8Cross i8_calibrate(M& m, const strata::kernels::cpu::NativeFmt& f) {
             for (int i = 0; i < E; ++i) pb[i] = blobs[i];
             bool refused = false;
             t8[ri] = timeit([&] {
-                i8::quantize_rows(X, lo, N, ws.xq, ws.dx, &q);
-                if (!i8::gate_up(f.gu_type, pb.data(), f.up_off, NF, lo, N, ws.xq, ws.dx, GU, &q)) refused = true;
+                float* sx = f.gu_type == i8::kTypeQ4K ? ws.sx : nullptr;   // the activation sums only Q4_K's minimum needs
+                i8::quantize_rows(X, lo, N, ws.xq, ws.dx, &q, sx);
+                if (!i8::gate_up(f.gu_type, pb.data(), f.up_off, NF, lo, N, ws.xq, ws.dx, GU, &q, sx)) refused = true;
                 i8::swiglu_quantize(GU, lo, NF, ws.hq, ws.dh, &q);
                 if (!i8::down(f.d_type, pb.data(), f.down_off, N, lo, NF, ws.hq, ws.dh, Dm, &q)) refused = true;
             }) / E;
@@ -4231,12 +4242,11 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                             return (gt == 18 || gt == 21 || gt == 22 || gt == 23) && (dt == 20 || dt == 42);
                         };
                         const bool xmx2_only = strata::prefill::xmx::mode() == 2 && !use_mmq && xmx2_fmt();
-                        // 151-b70: the fused int8 DPAS products (IQ3_S gate/up, IQ4_NL down, the 640 x 2560 expert), the same
-                        // held group of staged experts as above
+                        // 151-b70: the fused int8 DPAS products (IQ3_S / IQ3_XXS / IQ2_S / Q4_K gate/up, IQ4_NL / Q2_0 / Q5_0 down,
+                        // the 640 x 2560 expert), the same held group of staged experts as above
                         const int i8m = i8_mode(m.cs);
                         const bool i8on = !xmx2_only && i8m != 0 && !use_mmq && lay.native && !had_gu && !had_d &&
-                                          (lay.fmt[(size_t) l].gu_type == 21 || lay.fmt[(size_t) l].gu_type == 18 || lay.fmt[(size_t) l].gu_type == 22) &&
-                                          (lay.fmt[(size_t) l].d_type == 20 || lay.fmt[(size_t) l].d_type == 42) &&
+                                          i8_formats(lay.fmt[(size_t) l].gu_type, lay.fmt[(size_t) l].d_type) &&
                                           lay.fmt[(size_t) l].n_ff == 640 && lay.fmt[(size_t) l].n_embd == 2560 &&
                                           strata::prefill::i8::available(m.cs);
                         const bool xmx2 = xmx2_only || i8on;
@@ -4299,8 +4309,9 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                                     i8::Workspace ws8;
                                     pt.mark(kPfGemmGU, cs);
                                     if (i8::workspace(lo8, (int) N, f.n_ff, ws8, m.cs)) {
-                                        i8::quantize_rows(m.Xs + xg_r0 * N, lo8, (int) N, ws8.xq, ws8.dx, m.cs);
-                                        if (i8::gate_up(f.gu_type, xg_g, f.up_off, f.n_ff, lo8, (int) N, ws8.xq, ws8.dx, m.GU + xg_r0 * 1280, m.cs)) {
+                                        float* sx8 = f.gu_type == i8::kTypeQ4K ? ws8.sx : nullptr;   // the activation sums only Q4_K's minimum needs
+                                        i8::quantize_rows(m.Xs + xg_r0 * N, lo8, (int) N, ws8.xq, ws8.dx, m.cs, sx8);
+                                        if (i8::gate_up(f.gu_type, xg_g, f.up_off, f.n_ff, lo8, (int) N, ws8.xq, ws8.dx, m.GU + xg_r0 * 1280, m.cs, sx8)) {
                                             i8::swiglu_quantize(m.GU + xg_r0 * 1280, lo8, f.n_ff, ws8.hq, ws8.dh, m.cs);
                                             pt.mark(kPfGemmD, cs);
                                             done8 = i8::down(f.d_type, xg_g, f.down_off, (int) N, lo8, f.n_ff, ws8.hq, ws8.dh, m.Dm + xg_r0 * N, m.cs);

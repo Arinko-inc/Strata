@@ -1,6 +1,7 @@
 // 151-b70: the default choice of the prompt-expert chain (strata::prefill::i8::choose_mode), no GPU needed.
 //   unset            : auto on a Battlemage device whose kernels are available, else the FP16 chain
 //   STRATA_PREFILL_MMQ=0 / 1 / auto : off / forced / auto, whatever the device
+// and the expert formats a layer needs to take it (formats_ok, STRATA_I8_KQ).
 #include <cstdio>
 #include "strata/prefill/esimd_moe.hpp"
 
@@ -25,6 +26,17 @@ int main() {
     CHECK(choose_mode("00", true, true) == 0, "=00 is 0");
     CHECK(choose_mode("2", true, true) == 1, "any other number forces int8");
     CHECK(choose_mode("off", true, true) == 0, "an unparsable word is 0, as atoi had it");
+    // the formats a layer needs (STRATA_I8_KQ: the Q4_K gate/up and Q5_0 down of the Q4_K_S packs)
+    using strata::prefill::i8::formats_ok;
+    using strata::prefill::i8::kq_on;
+    CHECK(kq_on(nullptr) && kq_on("") && kq_on("1"), "STRATA_I8_KQ unset / empty / 1 -> on");
+    CHECK(!kq_on("0") && !kq_on("00"), "STRATA_I8_KQ=0 -> off");
+    CHECK(formats_ok(21, 20, true) && formats_ok(18, 42, true) && formats_ok(22, 20, false), "IQ pairs, either way");
+    CHECK(formats_ok(12, 6, true), "Q4_K / Q5_0 with the switch on");
+    CHECK(!formats_ok(12, 6, false), "Q4_K / Q5_0 with STRATA_I8_KQ=0 -> the FP16 chain");
+    CHECK(formats_ok(21, 6, true) && !formats_ok(21, 6, false) && !formats_ok(12, 20, false), "a mixed pair follows the switch");
+    CHECK(!formats_ok(12, 7, true), "Q5_1 down is not handled");
+    CHECK(!formats_ok(23, 20, true) && !formats_ok(14, 6, true), "IQ4_XS / Q6_K gate/up are not handled");
     if (bad == 0) std::printf("esimd_moe_mode_test: all OK\n");
     return bad == 0 ? 0 : 1;
 }
