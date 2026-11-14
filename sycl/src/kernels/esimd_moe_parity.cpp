@@ -201,8 +201,10 @@ static Result run_case(sycl::queue* q, dpct::blas::descriptor_ptr hd, int gt, in
     for (int i = 0; i < n; ++i) {
         hb[i].resize(blob_b);
         if (real) {
-            // ids spread over the layer, shifted by the seed
-            ids[i] = ((int64_t) i * real->n_expert / n + seed * 7) % real->n_expert;
+            // ids spread over the layer, shifted by the seed (in 64 bits, and into [0, n_expert) for a negative seed)
+            const int64_t ne = real->n_expert;
+            ids[i] = ((int64_t) i * ne / n + (int64_t) seed * 7) % ne;
+            if (ids[i] < 0) ids[i] += ne;
             std::memcpy(hb[i].data(), real->t[0] + (size_t) ids[i] * gate_b, gate_b);
             std::memcpy(hb[i].data() + gate_b, real->t[1] + (size_t) ids[i] * gate_b, gate_b);
             std::memcpy(hb[i].data() + 2 * gate_b, real->t[2] + (size_t) ids[i] * down_b, down_b);
