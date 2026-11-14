@@ -933,20 +933,31 @@ int dbg_flags() {
     static const int v = [] { const char* s = std::getenv("STRATA_I8_DBG"); return s ? std::atoi(s) : 0; }();
     return v;
 }
-int mt_for(const Layout& lo) {
+int mt_env() {   // STRATA_I8_MT: 0 (unset) picks per group
     static const int mo = [] { const char* s = std::getenv("STRATA_I8_MT"); return s ? std::atoi(s) : 0; }();
-    return mo ? mo : pick_mt(lo);
+    return mo;
 }
+int mt_for(const Layout& lo) { return mt_env() ? mt_env() : pick_mt(lo); }
+// The K-quant pair has its own picks (esimd_moe_parity --sweep on the Q4_K_S pack's experts, B70): Q4_K gate/up is fastest at
+// MT 2 up to 2.5 tiles per expert and MT 4 above, up to 256 rows (MT 8: 15-30% slower, its decoded pair spills); Q5_0 down at MT
+// 8 from 4 rows per expert up (MT 4: 1.1-1.5x the time).
+int mt_q4k(const Layout& lo) {
+    if (mt_env()) return mt_env();
+    const double mean = lo.n ? (double) lo.tile0[lo.n] / lo.n : 0;
+    return mean <= 2.5 ? 2 : 4;
+}
+int mt_q5_0(const Layout&) { return mt_env() ? mt_env() : 8; }
 
 // register mode per tile height: STRATA_I8_GRF=128 (more threads per EU, spills at MT 8) or 256; default 256
 int wg_for() {
     static const int v = [] { const char* s = std::getenv("STRATA_I8_WG"); return s ? std::atoi(s) : 1; }();
     return v;
 }
-// Q4_K gate/up: STRATA_I8_Q4K_PAIR=0 decodes each step from its own read (NP 1), else a nibble pair from one read (NP 2)
-int q4k_pair() {
-    static const int v = [] { const char* s = std::getenv("STRATA_I8_Q4K_PAIR"); return s ? std::atoi(s) : 1; }();
-    return v;
+// Q4_K gate/up: a nibble pair decoded from one read (NP 2) at MT 2 / 4, each step from its own read (NP 1) at MT 8, where the pair
+// spills (1664 against 1216 bytes) and ran 5-10% slower; STRATA_I8_Q4K_PAIR=0 / 1 forces NP 1 / 2
+bool q4k_pair(int mt) {
+    static const int v = [] { const char* s = std::getenv("STRATA_I8_Q4K_PAIR"); return s ? std::atoi(s) : -1; }();
+    return v < 0 ? mt < 8 : v != 0;
 }
 int grf_for(int mt) {
     static const int g = [] { const char* s = std::getenv("STRATA_I8_GRF"); return s ? std::atoi(s) : 256; }();
@@ -1188,12 +1199,12 @@ bool gate_up(int gu_type, const uint8_t* const* blob, size_t up_off, int n_ff, c
     a.rowb = (K / 256) * block_bytes_of(gu_type);
     a.ldy = 2 * n_ff;
     a.dbg = dbg_flags();
-    const int mt = mt_for(lo);
+    const int mt = gu_type == T_Q4K ? mt_q4k(lo) : mt_for(lo);
     const int rb = fill_args_mt(a, lo, mt);
     return dispatch_mt(mt, [&](auto mtc) {
         constexpr int MT = decltype(mtc)::value;
         if (gu_type == T_Q4K) {
-            if (q4k_pair()) launch_gu_q4k_wg<MT, 256, 2>(q, a, rb);
+            if (q4k_pair(MT)) launch_gu_q4k_wg<MT, 256, 2>(q, a, rb);
             else launch_gu_q4k_wg<MT, 256, 1>(q, a, rb);
         } else if (wg_for() && gu_type != T_IQ2S && a.nkb % 4 == 0 && a.ntiles % WGT == 0) {   // IQ2_S: its 8 KB codebook copied into local memory by every group costs more than it saves (35 vs 16 us)
             if (gu_type == T_IQ3S) launch_gu_wg<T_IQ3S, MT, 256>(q, a, rb);
@@ -1230,7 +1241,7 @@ bool down(int d_type, const uint8_t* const* blob, size_t down_off, int n_embd, c
     a.lim = (uint32_t) (down_off + (size_t) n_embd * (size_t) a.rowb) - 4u;
     a.ldy = n_embd;
     a.dbg = dbg_flags();
-    const int mt = mt_for(lo);
+    const int mt = d_type == T_Q5_0 ? mt_q5_0(lo) : mt_for(lo);
     const int rb = fill_args_mt(a, lo, mt);
     return dispatch_mt(mt, [&](auto mtc) {
         constexpr int MT = decltype(mtc)::value;
