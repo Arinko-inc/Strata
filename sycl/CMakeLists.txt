@@ -453,8 +453,9 @@ if(STRATA_SYCL_PARITY)
   add_executable(xmx_group_parity ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/xmx_group_parity.cpp)   # A770: fused grouped XMX
   target_link_libraries(xmx_group_parity PRIVATE strata_kernels strata_prefill)
   add_executable(esimd_moe_parity ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/esimd_moe_parity.cpp)   # 151-b70: fused int8 expert products vs dequant+oneMKL and FP64
-  target_link_libraries(esimd_moe_parity PRIVATE strata_kernels strata_prefill)
+  target_link_libraries(esimd_moe_parity PRIVATE strata_kernels strata_prefill)   # (with STRATA_NATIVE_EXPERTS: ggml's to_float checks the host decoder)
   add_test(NAME esimd_moe_parity COMMAND esimd_moe_parity 60 8 2)   # 151-b70: skips (exit 0) on a device without the s8 8x16x32 DPAS
+  # on real experts: esimd_moe_parity --gguf <shard>[,<shard>...] [--mean R] [--experts N] [--sweep R,R,...] layer ...
   add_executable(esimd_moe_mode_test ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/esimd_moe_mode_test.cpp)   # 151-b70: the default choice of the expert chain (no GPU)
   target_include_directories(esimd_moe_mode_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
   add_test(NAME esimd_moe_mode_test COMMAND esimd_moe_mode_test)
