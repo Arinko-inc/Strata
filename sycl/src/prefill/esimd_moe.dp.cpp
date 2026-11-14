@@ -11,11 +11,13 @@
 //    8 KB register file (256 GRF of 32 bytes): MT 12, or two output tiles per thread, spilled (3-15 KB) and ran 2-5x slower.
 //  * Scales.  Activations: q8_1 as llama.cpp (d = amax / 127, q = round half away from zero), one float per row and 32 of K.
 //    Weights: IQ3_S d (1 + 2 s), IQ3_XXS d (2 s + 1) / 4, IQ2_S d (2 s + 1) / 8 per 16 (two DPAS per 32 with the other half
-//    zeroed), IQ4_NL d per 32, Q2_0 d per 64; the int8 values are the codebook entries with their signs, never rounded.  The int32
-//    dot product of a 32-block is exact and exactly convertible to float.  The float accumulation order is fixed (K ascending).
+//    zeroed), IQ4_NL d per 32, Q2_0 d per 64, Q5_0 d per 32, Q4_K d sc per 32 with the minimum dmin m times the activations'
+//    scaled sum (q8_1's s) taken off; the int8 values are the codebook entries with their signs (Q4_K: the nibble 0..15, Q5_0:
+//    -16..15), never rounded.  The int32 dot product of a 32-block is exact and exactly convertible to float.  The float
+//    accumulation order is fixed (K ascending).
 //  * Edge cases.  Rows are padded to tiles of 8 with zeros (stores are masked to the real rows); a group of up to 16 experts per
-//    launch; K a multiple of 256 (IQ3_S / IQ3_XXS / IQ2_S) / 64 (Q2_0) / 32 (IQ4_NL); output rows a multiple of 16.  Blob reads
-//    never go past a matrix end.
+//    launch; K a multiple of 256 (IQ3_S / IQ3_XXS / IQ2_S / Q4_K) / 64 (Q2_0, Q5_0) / 32 (IQ4_NL); output rows a multiple of 16.
+//    Blob reads never go past a matrix end.  Q4_K has the work-group kernel only.
 //  * Fallback.  available() is false without the s8 8x16x32 DPAS (a non-Battlemage device) and the caller keeps the dequantize +
 //    oneMKL path; gate_up()/down() return false for a type / shape they do not handle.
 //  * ESIMD on this compiler (oneAPI 2026.1, bmg-g31): a dynamic index into the kernel-argument arrays, and `/` or `%` by a run-time
@@ -53,8 +55,8 @@ bool any_battlemage() { return false; }
 size_t xq_bytes(const Layout& lo, int K) { return (size_t) lo.tile0[lo.n] * 8 * K; }
 size_t dx_bytes(const Layout& lo, int K) { return (size_t) lo.tile0[lo.n] * (K / 32) * 8 * sizeof(float); }
 bool workspace(const Layout&, int, int, Workspace&, void*) { return false; }
-void quantize_rows(const uint16_t*, const Layout&, int, int8_t*, float*, void*) {}
-bool gate_up(int, const uint8_t* const*, size_t, int, const Layout&, int, const int8_t*, const float*, float*, void*) { return false; }
+void quantize_rows(const uint16_t*, const Layout&, int, int8_t*, float*, void*, float*) {}
+bool gate_up(int, const uint8_t* const*, size_t, int, const Layout&, int, const int8_t*, const float*, float*, void*, const float*) { return false; }
 void swiglu_quantize(const float*, const Layout&, int, int8_t*, float*, void*) {}
 bool down(int, const uint8_t* const*, size_t, int, const Layout&, int, const int8_t*, const float*, float*, void*) { return false; }
 }  // namespace strata::prefill::i8
@@ -72,10 +74,10 @@ namespace xmx = sycl::ext::intel::esimd::xmx;
 using half = sycl::half;
 
 // ggml types handled
-constexpr int T_IQ3XXS = 18, T_IQ4NL = 20, T_IQ3S = 21, T_IQ2S = 22, T_Q2_0 = 42;
-template <int F> constexpr int blk_bytes() { return F == T_IQ3S ? 110 : F == T_IQ3XXS ? 98 : F == T_IQ2S ? 82 : F == T_IQ4NL ? 18 : 18; }
-constexpr int block_bytes_of(int f) { return f == T_IQ3S ? 110 : f == T_IQ3XXS ? 98 : f == T_IQ2S ? 82 : 18; }
-constexpr int block_vals_of(int f) { return (f == T_IQ3S || f == T_IQ3XXS || f == T_IQ2S) ? 256 : f == T_Q2_0 ? 64 : 32; }
+constexpr int T_IQ3XXS = 18, T_IQ4NL = 20, T_IQ3S = 21, T_IQ2S = 22, T_Q2_0 = 42, T_Q4K = kTypeQ4K, T_Q5_0 = kTypeQ5_0;
+template <int F> constexpr int blk_bytes() { return F == T_IQ3S ? 110 : F == T_IQ3XXS ? 98 : F == T_IQ2S ? 82 : F == T_Q4K ? 144 : F == T_Q5_0 ? 22 : 18; }
+constexpr int block_bytes_of(int f) { return f == T_IQ3S ? 110 : f == T_IQ3XXS ? 98 : f == T_IQ2S ? 82 : f == T_Q4K ? 144 : f == T_Q5_0 ? 22 : 18; }
+constexpr int block_vals_of(int f) { return (f == T_IQ3S || f == T_IQ3XXS || f == T_IQ2S || f == T_Q4K) ? 256 : f == T_Q2_0 ? 64 : 32; }
 
 // One device table buffer (uint32 units): the codebooks the decoders gather from.
 constexpr int O_IQ3S = 0;        // iq3s_grid[512]
@@ -151,6 +153,47 @@ SYCL_ESIMD_FUNCTION inline simd<uint32_t, 16> apply_signs(simd<uint32_t, 16> g, 
     simd<uint32_t, 16> mask = m * 255u;
     return (g ^ mask) + m;
 }
+// four bits -> bit 0 of four bytes (bit i of n into byte i)
+SYCL_ESIMD_FUNCTION inline simd<uint32_t, 16> spread4(simd<uint32_t, 16> n) { return (n * 0x00204081u) & 0x01010101u; }
+// the dword at byte 2 of the pair (lo, hi): lo's high half and hi's low half, by word moves.  Not (lo >> 16) | (hi << 16): LLVM
+// turns that into a funnel shift, which the SPIR-V translator emits as an exported helper function (spirv.llvm_fshl_v16i32), and
+// the AOT build of an ESIMD kernel that has one fails ("VLD: ... more than one module with an entry point").
+SYCL_ESIMD_FUNCTION inline simd<uint32_t, 16> mid32(simd<uint32_t, 16> lo, simd<uint32_t, 16> hi) {
+    simd<uint32_t, 16> r;
+    auto rw = r.template bit_cast_view<uint16_t>();
+    rw.template select<16, 2>(0) = lo.template bit_cast_view<uint16_t>().template select<16, 2>(1);
+    rw.template select<16, 2>(1) = hi.template bit_cast_view<uint16_t>().template select<16, 2>(0);
+    return r;
+}
+
+// Q5_0 (ggml dequantize_row_q5_0): 22-byte blocks of 32, {d, qh[4], qs[16]}, value j = ((qs[j % 16] nibble j / 16) | (qh bit j) << 4)
+// - 16.  The rows start dword aligned (n_ff a multiple of 64), so block kb starts dword aligned when kb is even and 2 bytes in when
+// it is odd: six aligned dword gathers cover it either way (an even block's last two bytes read are the next block's d, inside the
+// row).  The int8 value is built bytewise: the nibble, with 0xF0 ORed in where the high bit is clear (v - 16 < 0).
+SYCL_ESIMD_FUNCTION inline void dec_q5_0(const uint8_t* We, simd<uint32_t, 16> ro, int kb, simd<uint32_t, 128>& fr, simd<float, 16>& d) {
+    const uint32_t* W = reinterpret_cast<const uint32_t*>(We);
+    const simd<uint32_t, 16> A = ro + (uint32_t) (kb * 22 - (kb & 1) * 2);
+    simd<uint32_t, 16> a0 = gather<uint32_t, 16>(W, A);
+    simd<uint32_t, 16> a1 = gather<uint32_t, 16>(W, A + 4u);
+    simd<uint32_t, 16> a2 = gather<uint32_t, 16>(W, A + 8u);
+    simd<uint32_t, 16> a3 = gather<uint32_t, 16>(W, A + 12u);
+    simd<uint32_t, 16> a4 = gather<uint32_t, 16>(W, A + 16u);
+    simd<uint32_t, 16> a5 = gather<uint32_t, 16>(W, A + 20u);
+    simd<uint32_t, 16> dh, qh, q0, q1, q2, q3;
+    if (kb & 1) {
+        dh = a0 >> 16; qh = a1; q0 = a2; q1 = a3; q2 = a4; q3 = a5;
+    } else {
+        dh = a0; qh = mid32(a0, a1);
+        q0 = mid32(a1, a2); q1 = mid32(a2, a3); q2 = mid32(a3, a4); q3 = mid32(a4, a5);
+    }
+    d = half_of(dh);
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const simd<uint32_t, 16> qd = j == 0 ? q0 : j == 1 ? q1 : j == 2 ? q2 : q3;
+        fr.template select<16, 1>(16 * j) = (qd & 0x0F0F0F0Fu) | ((spread4((qh >> (4 * j)) & 0xfu) ^ 0x01010101u) * 0xF0u);
+        fr.template select<16, 1>(16 * (j + 4)) = ((qd >> 4) & 0x0F0F0F0Fu) | ((spread4((qh >> (16 + 4 * j)) & 0xfu) ^ 0x01010101u) * 0xF0u);
+    }
+}
 
 struct GArgs {
     const uint8_t* blob[kMaxGroup];
@@ -161,6 +204,7 @@ struct GArgs {
     int rb0[kMaxGroup + 1];           // first row block of expert i
     const int8_t* Xq;
     const float* dx;
+    const float* sx;                  // Q4_K gate/up: the activation scale times the sum of the 32 int8 values, per row and 32 of K
     float* Y;
     const uint32_t* tab;
     int ntiles;                       // output tiles of 16
@@ -380,6 +424,8 @@ void launch_dn(sycl::queue& q, const GArgs a, int nrowblocks) {
                             fr0.template select<16, 1>(16 * (j + 4)) =
                                 ((t0 >> 8) & 0xffu) | (t1 & 0xff00u) | ((t2 & 0xff00u) << 8) | ((t3 & 0xff00u) << 16);
                         }
+                    } else if constexpr (F == T_Q5_0) {
+                        dec_q5_0(We, ro, kb, fr0, sw0);
                     } else {   // T_Q2_0: 64 values per block (2 + 16 bytes), two 32-blocks per block, one table lookup per byte
                         const uint32_t P = (uint32_t) (kb >> 1) * 18;
                         const int hb = kb & 1;
@@ -437,7 +483,7 @@ constexpr auto kAl16 = sycl::ext::oneapi::experimental::properties{sycl::ext::on
 
 // bytes of the tables a format gathers from (local memory), and the segments copied from the global table buffer
 template <int F> constexpr int tab_bytes() {
-    return F == T_IQ3S ? 2048 : F == T_IQ3XXS ? 1536 : F == T_IQ2S ? 8192 : 1024;   // IQ3XXS: grid 1024 + ksigns 512
+    return F == T_IQ3S ? 2048 : F == T_IQ3XXS ? 1536 : F == T_IQ2S ? 8192 : (F == T_Q4K || F == T_Q5_0) ? 0 : 1024;   // IQ3XXS: grid 1024 + ksigns 512; Q4_K / Q5_0 decode without a table
 }
 
 template <int F, int MT>
@@ -445,7 +491,8 @@ struct WgLayout {
     static constexpr int TB = tab_bytes<F>();
     static constexpr int ASZ = MT * 1024;   // activation tiles of one stage: MT tiles x 4 steps x 256 bytes
     static constexpr int DSZ = MT * 128;    // their scales: MT tiles x 4 steps x 32 bytes
-    static constexpr int STAGE = ASZ + DSZ;
+    static constexpr int SSZ = F == T_Q4K ? DSZ : 0;   // Q4_K: their scaled sums (sx), laid out as the scales, after them
+    static constexpr int STAGE = ASZ + DSZ + SSZ;
     static constexpr int TOTAL = TB + 2 * STAGE;
     static constexpr int SPLIT = 8 / MT;    // threads per tile in the staging load
     static constexpr int PART = 1024 / SPLIT;   // bytes of one tile's activations a thread stages
@@ -468,6 +515,13 @@ struct WgLayout {
             slm_block_store<int, 64>(base_ + s_tile * 1024 + s_part * L::PART + 256 * k, stg.template select<64, 1>(64 * k), kAl16); \
         if (s_part == 0) slm_block_store<float, 32>(base_ + L::ASZ + s_tile * 128, stg_dx, kAl16);                             \
     }
+// Q4_K: the chunk's scaled activation sums (sx) too, by the last thread of each tile (the first one stages dx)
+#define LOAD_SX(CC)                                                                                                            \
+    if (s_tile < nvalid && s_part == L::SPLIT - 1)                                                                             \
+        stg_sx = block_load<float, 32>(a.sx + ((size_t) (tbase + s_tile) * a.nkb + (CC) * 4) * 8, kAl16);
+#define STORE_SX(SS)                                                                                                           \
+    if (s_tile < nvalid && s_part == L::SPLIT - 1)                                                                             \
+        slm_block_store<float, 32>(L::TB + (SS) * L::STAGE + L::ASZ + L::DSZ + s_tile * 128, stg_sx, kAl16);
 
 template <int F, int MT, int G> struct TagGuW;
 template <int F, int MT, int G> struct TagDnW;
@@ -641,6 +695,128 @@ void launch_gu_wg(sycl::queue& q, const GArgs a, int nrowblocks) {
     });
 }
 
+// Q4_K gate/up (ggml dequantize_row_q4_K, get_scale_min_k4): 144-byte superblocks of 256, {d, dmin, scales[12], qs[128]}; sub-block j
+// (32 values) has a 6-bit scale sc_j and min m_j, and its values are the low (j even) or high (j odd) nibbles of qs[32 (j / 2) ..],
+// w = d sc_j q - dmin m_j.  The B operand is q (0..15) itself, d sc_j scales the int32 dot product as for the other formats, and the
+// minimum's share, dmin m_j x (activation scale x sum of the 32 int8 activations), comes off with the scaled sums sx that
+// quantize_rows wrote (staged beside the scales).  Every field is dword aligned (144-byte blocks): plain gathers, no table.
+// NP 2: the two sub-blocks of a nibble pair are decoded from one read of their 32 bytes (8 gathers per 2 steps, 16 more registers
+// live); NP 1: each step reads them again (8 gathers per step, the second read from the cache).
+template <int MT, int G, int NP> struct TagGuQ4K;
+template <int MT, int G, int NP>
+void launch_gu_q4k_wg(sycl::queue& q, const GArgs a, int nrowblocks) {
+    using L = WgLayout<T_Q4K, MT>;
+    auto props = sycl::ext::oneapi::experimental::properties{sycl::ext::intel::experimental::grf_size<G>};
+    q.submit([&](sycl::handler& h) {
+        h.parallel_for<TagGuQ4K<MT, G, NP>>(sycl::nd_range<2>(sycl::range<2>((size_t) nrowblocks, (size_t) a.ntiles), sycl::range<2>(1, WGT)), props,
+                                        [=](sycl::nd_item<2> it) SYCL_ESIMD_KERNEL {
+            slm_init<L::TOTAL>();
+            const int rbg = (int) it.get_group(0), lt = (int) it.get_local_id(1), nt = (int) it.get_global_id(1);
+            const Pick pk = pick_expert(a, rbg);
+            const int cnt = pk.cnt;
+            const int ntl = (cnt + 7) >> 3;
+            const int tl0 = (rbg - pk.rb0) * MT;
+            const int nvalid = (ntl - tl0) < MT ? (ntl - tl0) : MT;
+            const int tbase = pk.tile0 + tl0;
+            const uint32_t* W = reinterpret_cast<const uint32_t*>(pk.blob);
+            const int* Xi = reinterpret_cast<const int*>(a.Xq);
+            const int s_tile = lt / L::SPLIT, s_part = lt % L::SPLIT;
+            simd<int, L::PART / 4> stg;
+            simd<float, 32> stg_dx, stg_sx;
+            simd<uint32_t, 16> lane(0, 1);
+            simd<uint32_t, 16> ro = (lane & 1u) * a.sec_off + ((lane >> 1) + (uint32_t) (8 * nt)) * (uint32_t) a.rowb;
+            simd<float, 128 * MT> acc = 0.f;
+            const int nchunks = (a.dbg & 8) ? 0 : (a.nkb >> 2);
+            if (nchunks > 0) { LOAD_CHUNK(0); LOAD_SX(0); STORE_CHUNK(0); STORE_SX(0); }
+            barrier();   // chunk 0 is in local memory
+            simd<float, 16> d = 0.f, dmin = 0.f;
+            simd<uint32_t, 16> s0 = 0, s1 = 0, s2 = 0;   // the superblock's 12 scale bytes
+            for (int c = 0; c < nchunks; ++c) {
+                const int sb = c >> 1;   // a superblock is 8 steps of 32: two chunks
+                const int stage_off = L::TB + (c & 1) * L::STAGE;
+                if (c + 1 < nchunks) { LOAD_CHUNK(c + 1); LOAD_SX(c + 1); }
+                const uint32_t P = (uint32_t) sb * 144;
+                if ((c & 1) == 0) {
+                    const simd<uint32_t, 16> dd = gather<uint32_t, 16>(W, ro + P);
+                    d = half_of(dd);
+                    dmin = half_of(dd >> 16);
+                    s0 = gather<uint32_t, 16>(W, ro + (P + 4));
+                    s1 = gather<uint32_t, 16>(W, ro + (P + 8));
+                    s2 = gather<uint32_t, 16>(W, ro + (P + 12));
+                }
+#pragma unroll 1
+                for (int ib0 = 0; ib0 < 4; ib0 += NP) {
+                    simd<uint32_t, 128> raw = 0x01010101u;
+                    if constexpr (NP == 2) {
+                        if (!(a.dbg & 1)) {
+                            const uint32_t Q = P + 16 + 32 * ((((c & 1) << 2) + ib0) >> 1);
+#pragma unroll
+                            for (int r = 0; r < 8; ++r) raw.template select<16, 1>(16 * r) = gather<uint32_t, 16>(W, ro + (Q + 4 * r));
+                        }
+                    }
+#pragma unroll
+                    for (int hh = 0; hh < NP; ++hh) {
+                        const int ib4 = ib0 + hh;
+                        const int j = ((c & 1) << 2) + ib4;   // sub-block of the superblock
+                        simd<uint32_t, 128> fr0 = 0x01010101u;
+                        simd<uint32_t, 16> sc, mn;
+                        if (j < 4) {
+                            sc = (s0 >> (8 * j)) & 63u;
+                            mn = (s1 >> (8 * j)) & 63u;
+                        } else {
+                            const int jj = 8 * (j - 4);
+                            sc = ((s2 >> jj) & 0xfu) | (((s0 >> (jj + 6)) & 3u) << 4);
+                            mn = ((s2 >> (jj + 4)) & 0xfu) | (((s1 >> (jj + 6)) & 3u) << 4);
+                        }
+                        const simd<float, 16> sw0 = d * simd<float, 16>(simd<int, 16>(sc));
+                        const simd<float, 16> mw0 = dmin * simd<float, 16>(simd<int, 16>(mn));
+                        if constexpr (NP == 2) {
+                            if (!(a.dbg & 1)) fr0 = (raw >> (4 * hh)) & 0x0F0F0F0Fu;
+                        } else if (!(a.dbg & 1)) {
+                            const uint32_t Q = P + 16 + 32 * (j >> 1);
+                            const uint32_t sh = 4 * (j & 1);
+#pragma unroll
+                            for (int r = 0; r < 8; ++r)
+                                fr0.template select<16, 1>(16 * r) = (gather<uint32_t, 16>(W, ro + (Q + 4 * r)) >> sh) & 0x0F0F0F0Fu;
+                        }
+#pragma unroll
+                        for (int i = 0; i < MT; ++i) {
+                            if (i < nvalid) {
+                                simd<int, 64> av = 0x01010101;
+                                simd<float, 8> dxv = 1.f, sxv = 0.f;
+                                if (!(a.dbg & 2)) {
+                                    av = slm_block_load<int, 64>(stage_off + i * 1024 + ib4 * 256, kAl16);
+                                    dxv = slm_block_load<float, 8>(stage_off + L::ASZ + i * 128 + ib4 * 32, kAl16);
+                                    sxv = slm_block_load<float, 8>(stage_off + L::ASZ + L::DSZ + i * 128 + ib4 * 32, kAl16);
+                                }
+                                simd<float, 128> tf = dpas_s8(fr0, av);
+#pragma unroll
+                                for (int r = 0; r < 8; ++r) {
+                                    const float dxr = dxv[r], sxr = sxv[r];
+                                    acc.template select<16, 1>(128 * i + 16 * r) += tf.template select<16, 1>(16 * r) * (sw0 * dxr) - mw0 * sxr;
+                                }
+                            }
+                        }
+                    }
+                }
+                if (c + 1 < nchunks) { STORE_CHUNK((c + 1) & 1); STORE_SX((c + 1) & 1); }
+                barrier();
+            }
+#pragma unroll
+            for (int i = 0; i < MT; ++i) {
+                if (i < nvalid) {
+#pragma unroll
+                    for (int r = 0; r < 8; ++r) {
+                        const int rl = (tl0 + i) * 8 + r;
+                        if (rl < cnt && !(a.dbg & 4))
+                            block_store<float, 16>(a.Y + ((size_t) (pk.row0 + rl)) * a.ldy + 16 * nt, acc.template select<16, 1>(128 * i + 16 * r));
+                    }
+                }
+            }
+        });
+    });
+}
+
 template <int F, int MT, int G>
 void launch_dn_wg(sycl::queue& q, const GArgs a, int nrowblocks) {
     using L = WgLayout<F, MT>;
@@ -695,6 +871,8 @@ void launch_dn_wg(sycl::queue& q, const GArgs a, int nrowblocks) {
                                 fr0.template select<16, 1>(16 * (j + 4)) =
                                     ((t0 >> 8) & 0xffu) | (t1 & 0xff00u) | ((t2 & 0xff00u) << 8) | ((t3 & 0xff00u) << 16);
                             }
+                        } else if constexpr (F == T_Q5_0) {
+                            dec_q5_0(We, ro, kb, fr0, sw0);
                         } else {   // T_Q2_0
                             const uint32_t P = (uint32_t) (kb >> 1) * 18;
                             const int hb = kb & 1;
@@ -755,15 +933,31 @@ int dbg_flags() {
     static const int v = [] { const char* s = std::getenv("STRATA_I8_DBG"); return s ? std::atoi(s) : 0; }();
     return v;
 }
-int mt_for(const Layout& lo) {
+int mt_env() {   // STRATA_I8_MT: 0 (unset) picks per group
     static const int mo = [] { const char* s = std::getenv("STRATA_I8_MT"); return s ? std::atoi(s) : 0; }();
-    return mo ? mo : pick_mt(lo);
+    return mo;
 }
+int mt_for(const Layout& lo) { return mt_env() ? mt_env() : pick_mt(lo); }
+// The K-quant pair has its own picks (esimd_moe_parity --sweep on the Q4_K_S pack's experts, B70): Q4_K gate/up is fastest at
+// MT 2 up to 2.5 tiles per expert and MT 4 above, up to 256 rows (MT 8: 15-30% slower, its decoded pair spills); Q5_0 down at MT
+// 8 from 4 rows per expert up (MT 4: 1.1-1.5x the time).
+int mt_q4k(const Layout& lo) {
+    if (mt_env()) return mt_env();
+    const double mean = lo.n ? (double) lo.tile0[lo.n] / lo.n : 0;
+    return mean <= 2.5 ? 2 : 4;
+}
+int mt_q5_0(const Layout&) { return mt_env() ? mt_env() : 8; }
 
 // register mode per tile height: STRATA_I8_GRF=128 (more threads per EU, spills at MT 8) or 256; default 256
 int wg_for() {
     static const int v = [] { const char* s = std::getenv("STRATA_I8_WG"); return s ? std::atoi(s) : 1; }();
     return v;
+}
+// Q4_K gate/up: a nibble pair decoded from one read (NP 2) at MT 2 / 4, each step from its own read (NP 1) at MT 8, where the pair
+// spills (1664 against 1216 bytes) and ran 5-10% slower; STRATA_I8_Q4K_PAIR=0 / 1 forces NP 1 / 2
+bool q4k_pair(int mt) {
+    static const int v = [] { const char* s = std::getenv("STRATA_I8_Q4K_PAIR"); return s ? std::atoi(s) : -1; }();
+    return v < 0 ? mt < 8 : v != 0;
 }
 int grf_for(int mt) {
     static const int g = [] { const char* s = std::getenv("STRATA_I8_GRF"); return s ? std::atoi(s) : 256; }();
@@ -859,7 +1053,7 @@ size_t dx_bytes(const Layout& lo, int K) { return (size_t) lo.tile0[lo.n] * (K /
 bool workspace(const Layout& lo, int K, int n_ff, Workspace& ws, void* stream) {
     sycl::queue& q = *strata::q_of(stream);
     static std::mutex mu;
-    struct St { Workspace cur; size_t cap_x = 0, cap_h = 0; };
+    struct St { Workspace cur; size_t cap_x = 0, cap_h = 0; };   // sx is the size of dx
     static std::unordered_map<sycl::device, St> per_dev;
     std::lock_guard<std::mutex> lk(mu);
     St& st = per_dev[q.get_device()];
@@ -869,20 +1063,24 @@ bool workspace(const Layout& lo, int K, int n_ff, Workspace& ws, void* stream) {
     const size_t nx = xq_bytes(lo, K), nh = xq_bytes(lo, n_ff);
     if (nx > cap_x || nh > cap_h) {
         q.wait();
-        if (cur.xq) { sycl::free(cur.xq, q); sycl::free(cur.dx, q); sycl::free(cur.hq, q); sycl::free(cur.dh, q); }
+        if (cur.xq) { sycl::free(cur.xq, q); sycl::free(cur.dx, q); sycl::free(cur.hq, q); sycl::free(cur.dh, q); sycl::free(cur.sx, q); }
         cap_x = std::max(nx, cap_x + cap_x / 4);
         cap_h = std::max(nh, cap_h + cap_h / 4);
         cur.xq = sycl::malloc_device<int8_t>(cap_x, q);
         cur.dx = sycl::malloc_device<float>(cap_x / 32 / 8 * 8 + 64, q);   // rows * K/32 floats = bytes / 32
         cur.hq = sycl::malloc_device<int8_t>(cap_h, q);
         cur.dh = sycl::malloc_device<float>(cap_h / 32 + 64, q);
-        if (!cur.xq || !cur.dx || !cur.hq || !cur.dh) { cap_x = cap_h = 0; cur = Workspace{}; ws = Workspace{}; return false; }
+        cur.sx = sycl::malloc_device<float>(cap_x / 32 / 8 * 8 + 64, q);
+        if (!cur.xq || !cur.dx || !cur.hq || !cur.dh || !cur.sx) {
+            for (void* p : {(void*) cur.xq, (void*) cur.dx, (void*) cur.hq, (void*) cur.dh, (void*) cur.sx}) if (p) sycl::free(p, q);
+            cap_x = cap_h = 0; cur = Workspace{}; ws = Workspace{}; return false;
+        }
     }
     ws = cur;
     return true;
 }
 
-void quantize_rows(const uint16_t* X, const Layout& lo, int K, int8_t* Xq, float* dx, void* stream) {
+void quantize_rows(const uint16_t* X, const Layout& lo, int K, int8_t* Xq, float* dx, void* stream, float* sx) {
     if (lo.tile0[lo.n] == 0) return;
     sycl::queue& q = *strata::q_of(stream);
     QArgs a{};
@@ -902,7 +1100,7 @@ void quantize_rows(const uint16_t* X, const Layout& lo, int K, int8_t* Xq, float
             for (int i = 1; i < kMaxGroup; ++i)
                 if (i < a.n && T >= a.tile0[i]) { t0e = a.tile0[i]; r0e = a.row0[i]; r1e = a.row0[i + 1]; }
             const int cnt = r1e - r0e;
-            simd<float, 8> dxv = 0.f;
+            simd<float, 8> dxv = 0.f, sxv = 0.f;
 #pragma unroll
             for (int r = 0; r < 8; ++r) {
                 const int rl = (T - t0e) * 8 + r;
@@ -920,10 +1118,17 @@ void quantize_rows(const uint16_t* X, const Layout& lo, int K, int8_t* Xq, float
                     simd<int8_t, 32> q8 = convert<int8_t>(qi);
                     qd = q8.template bit_cast_view<uint32_t>();
                     dxv[r] = dd;
+                    if (sx != nullptr) {   // q8_1's s: the scale times the sum of the int8 values (exact as an int)
+                        simd<int, 16> s16 = qi.template select<16, 1>(0) + qi.template select<16, 1>(16);
+                        simd<int, 8> s8 = s16.template select<8, 1>(0) + s16.template select<8, 1>(8);
+                        simd<int, 4> s4 = s8.template select<4, 1>(0) + s8.template select<4, 1>(4);
+                        sxv[r] = dd * (float) (s4[0] + s4[1] + s4[2] + s4[3]);
+                    }
                 }
                 block_store<uint32_t, 8>(Xd + ((size_t) T * a.nkb + kb) * 64 + r * 8, qd);
             }
             block_store<float, 8>(dx + ((size_t) T * a.nkb + kb) * 8, dxv);
+            if (sx != nullptr) block_store<float, 8>(sx + ((size_t) T * a.nkb + kb) * 8, sxv);
         });
     });
 }
@@ -976,27 +1181,32 @@ void swiglu_quantize(const float* GU, const Layout& lo, int n_ff, int8_t* Hq, fl
 }
 
 bool gate_up(int gu_type, const uint8_t* const* blob, size_t up_off, int n_ff, const Layout& lo, int K, const int8_t* Xq,
-             const float* dx, float* GU, void* stream) {
+             const float* dx, float* GU, void* stream, const float* sx) {
     if (lo.n == 0 || lo.tile0[lo.n] == 0) return true;
-    if ((gu_type != T_IQ3S && gu_type != T_IQ3XXS && gu_type != T_IQ2S) || K % 256 != 0 || (2 * n_ff) % 16 != 0 ||
+    if ((gu_type != T_IQ3S && gu_type != T_IQ3XXS && gu_type != T_IQ2S && gu_type != T_Q4K) || K % 256 != 0 || (2 * n_ff) % 16 != 0 ||
         (up_off & 3) != 0 || lo.n > kMaxGroup)
         return false;
+    // Q4_K: the work-group kernel only (its sums are staged with the activations), and it needs the sums
+    if (gu_type == T_Q4K && (sx == nullptr || !wg_for() || (K / 32) % 4 != 0 || (2 * n_ff / 16) % WGT != 0)) return false;
     sycl::queue& q = *strata::q_of(stream);
     GArgs a{};
     for (int i = 0; i < lo.n; ++i) a.blob[i] = blob[i];
     a.sec_off = (uint32_t) up_off;
-    a.Xq = Xq; a.dx = dx; a.Y = GU;
+    a.Xq = Xq; a.dx = dx; a.sx = sx; a.Y = GU;
     a.tab = tables(q);
     a.ntiles = 2 * n_ff / 16;
     a.nkb = K / 32;
     a.rowb = (K / 256) * block_bytes_of(gu_type);
     a.ldy = 2 * n_ff;
     a.dbg = dbg_flags();
-    const int mt = mt_for(lo);
+    const int mt = gu_type == T_Q4K ? mt_q4k(lo) : mt_for(lo);
     const int rb = fill_args_mt(a, lo, mt);
     return dispatch_mt(mt, [&](auto mtc) {
         constexpr int MT = decltype(mtc)::value;
-        if (wg_for() && gu_type != T_IQ2S && a.nkb % 4 == 0 && a.ntiles % WGT == 0) {   // IQ2_S: its 8 KB codebook copied into local memory by every group costs more than it saves (35 vs 16 us)
+        if (gu_type == T_Q4K) {
+            if (q4k_pair(MT)) launch_gu_q4k_wg<MT, 256, 2>(q, a, rb);
+            else launch_gu_q4k_wg<MT, 256, 1>(q, a, rb);
+        } else if (wg_for() && gu_type != T_IQ2S && a.nkb % 4 == 0 && a.ntiles % WGT == 0) {   // IQ2_S: its 8 KB codebook copied into local memory by every group costs more than it saves (35 vs 16 us)
             if (gu_type == T_IQ3S) launch_gu_wg<T_IQ3S, MT, 256>(q, a, rb);
             else if (gu_type == T_IQ3XXS) launch_gu_wg<T_IQ3XXS, MT, 256>(q, a, rb);
             else launch_gu_wg<T_IQ2S, MT, 256>(q, a, rb);
@@ -1015,9 +1225,10 @@ bool gate_up(int gu_type, const uint8_t* const* blob, size_t up_off, int n_ff, c
 bool down(int d_type, const uint8_t* const* blob, size_t down_off, int n_embd, const Layout& lo, int n_ff, const int8_t* Hq,
           const float* dh, float* Dm, void* stream) {
     if (lo.n == 0 || lo.tile0[lo.n] == 0) return true;
-    if ((d_type != T_IQ4NL && d_type != T_Q2_0) || n_ff % block_vals_of(d_type) != 0 || n_embd % 16 != 0 || (down_off & 3) != 0 ||
-        lo.n > kMaxGroup)
+    if ((d_type != T_IQ4NL && d_type != T_Q2_0 && d_type != T_Q5_0) || n_ff % block_vals_of(d_type) != 0 || n_embd % 16 != 0 ||
+        (down_off & 3) != 0 || lo.n > kMaxGroup)
         return false;
+    if (d_type == T_Q5_0 && n_ff % 64 != 0) return false;   // its rows must start dword aligned (dec_q5_0)
     sycl::queue& q = *strata::q_of(stream);
     GArgs a{};
     for (int i = 0; i < lo.n; ++i) a.blob[i] = blob[i];
@@ -1030,18 +1241,21 @@ bool down(int d_type, const uint8_t* const* blob, size_t down_off, int n_embd, c
     a.lim = (uint32_t) (down_off + (size_t) n_embd * (size_t) a.rowb) - 4u;
     a.ldy = n_embd;
     a.dbg = dbg_flags();
-    const int mt = mt_for(lo);
+    const int mt = d_type == T_Q5_0 ? mt_q5_0(lo) : mt_for(lo);
     const int rb = fill_args_mt(a, lo, mt);
     return dispatch_mt(mt, [&](auto mtc) {
         constexpr int MT = decltype(mtc)::value;
         if (wg_for() && a.nkb % 4 == 0 && a.ntiles % WGT == 0) {
             if (d_type == T_IQ4NL) launch_dn_wg<T_IQ4NL, MT, 256>(q, a, rb);
+            else if (d_type == T_Q5_0) launch_dn_wg<T_Q5_0, MT, 256>(q, a, rb);
             else launch_dn_wg<T_Q2_0, MT, 256>(q, a, rb);
         } else         if (grf_for(MT) == 128) {
             if (d_type == T_IQ4NL) launch_dn<T_IQ4NL, MT, 128>(q, a, rb);
+            else if (d_type == T_Q5_0) launch_dn<T_Q5_0, MT, 128>(q, a, rb);
             else launch_dn<T_Q2_0, MT, 128>(q, a, rb);
         } else {
             if (d_type == T_IQ4NL) launch_dn<T_IQ4NL, MT, 256>(q, a, rb);
+            else if (d_type == T_Q5_0) launch_dn<T_Q5_0, MT, 256>(q, a, rb);
             else launch_dn<T_Q2_0, MT, 256>(q, a, rb);
         }
     });

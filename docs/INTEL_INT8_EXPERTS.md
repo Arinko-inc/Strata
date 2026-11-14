@@ -22,8 +22,14 @@ never exists and the weights are read once, compressed (2.1 MB per expert instea
   1, and keeps it in `~/.cache/strata/i8-crossover.txt` (`STRATA_CACHE_DIR` moves it) keyed by device name, driver version, the two
   ggml types and the shape. A matching key is read back instead of measured. The measurement costs ~1.2 s once, during the first
   prompt. A measurement that fails (no VRAM) falls back to 64 rows.
+* `STRATA_I8_KQ=0`: the layers whose experts are Q4_K (gate/up) or Q5_0 (down), the Q4_K_S packs', take the FP16 chain whatever
+  `STRATA_PREFILL_MMQ` says (the A/B and the rollback for those formats alone). Unset: they follow `STRATA_PREFILL_MMQ` like the
+  IQ formats.
 * `STRATA_I8_FORCE=0` hides the device from the kernels, `STRATA_I8_MT=2|4|8` forces the tile height, `STRATA_I8_WG=0` the
   non-work-group kernels, `STRATA_I8_GRF=128` the 128-register mode, `STRATA_I8_DBG` bring-up switches (skip decode / loads / stores).
+  `STRATA_I8_Q4K_PAIR=0|1` forces how the Q4_K gate/up kernel reads its nibbles (unset: a pair of 32-steps from one read at MT 2 / 4,
+  each step from its own read at MT 8, where the pair spills). `STRATA_I8_WG=0` makes the Q4_K layers take the FP16 chain (Q4_K has
+  the work-group kernel only).
 * Default (unset): `auto` on a Battlemage GPU (bmg-g21 or bmg-g31 by the SYCL architecture id, not by name; the kernels must be in the binary and pass `available()`), the FP16 path on every other GPU. The engine prints one line at load ("int8 prompt experts are on ... STRATA_PREFILL_MMQ=0 turns them off"). If the kernels are not in the binary for the device (an AOT build for other devices) or a launch throws, the group and the rest of the process take the FP16 chain with one log line. The activations are quantized, so the bits differ from the FP16 path (see "Quality").
 
 ## Tiles and thresholds
@@ -36,6 +42,8 @@ never exists and the weights are read once, compressed (2.1 MB per expert instea
   are read from global memory once per group, in chunks of 4 steps of 32 (128 of K), into double-buffered local memory (one barrier per
   chunk), and every thread reads them from there; the group also copies the codebook the decoders gather from into local memory.
   IQ2_S gate/up keeps the plain kernel: its 8 KB codebook costs more to copy per group than the gathers save (35 against 16 us).
+* The K-quant pair picks its own `MT` (measured on the B70 with the Q4_K_S pack's experts): Q4_K gate/up MT 2 up to 2.5 tiles per
+  expert, MT 4 above (MT 8 was 15-30% slower up to 256 rows), and Q5_0 down MT 8 from 4 rows per expert up (MT 4: 1.1-1.5x the time).
 * K step 32 (one s8 DPAS 8x16x32): decode the 16 rows' 32 values (lanes = rows, one weight decode per tile, applied to all MT row
   tiles), one DPAS into a zeroed int32 tile, float epilogue. Group of up to 16 experts per launch (the same group the FP16 grouped path
   holds in the prompt walk), 4 launches per group (quantize, gate/up, SwiGLU + quantize, down) against 4 per expert.
@@ -50,8 +58,11 @@ never exists and the weights are read once, compressed (2.1 MB per expert instea
   DPAS A-operand order (`[8-row tile][K/32][8 rows x 32 bytes]`, experts padded to 8 rows with zeros), the 8 row scales of a tile
   contiguous.
 * Weights: IQ3_S `d (1 + 2 s)` per 32, IQ3_XXS `d (2 s + 1) / 4`, IQ2_S `d (2 s + 1) / 8` per 16 (two DPAS per 32, the other half
-  zeroed), IQ4_NL `d` per 32, Q2_0 `d` per 64; the int8 values are the codebook entries with their signs (IQ3_S/IQ3_XXS/IQ2_S: 1..62,
-  IQ4_NL: -127..113, Q2_0: -1..2), never rounded.
+  zeroed), IQ4_NL `d` per 32, Q2_0 `d` per 64, Q5_0 `d` per 32, Q4_K `d sc` per 32; the int8 values are the codebook entries with
+  their signs (IQ3_S/IQ3_XXS/IQ2_S: 1..62, IQ4_NL: -127..113, Q2_0: -1..2, Q5_0: -16..15, Q4_K: the nibble 0..15), never rounded.
+* Q4_K's minimum (`w = d sc q - dmin m` per 32): the quantize kernel also writes, per row and 32 of K, the activation scale times
+  the sum of the 32 int8 values (q8_1's `s`, the int sum is exact), and the gate/up kernel takes `dmin m` times it off the
+  accumulator. Those sums are staged into local memory beside the scales, so Q4_K has the work-group kernel only.
 * Each 32-block's int32 dot product (<= 32 * 127 * 127) is exact and exactly convertible to float; it is scaled by the weight scale of the
   column and the activation scale of the row and added to a float accumulator, K ascending (the float multiply and add are the only
   roundings besides the activation quantization). After gate/up, `silu(gate) * up` (the FP16 path's formula, in float, not rounded
@@ -64,9 +75,10 @@ never exists and the weights are read once, compressed (2.1 MB per expert instea
   gathers and a funnel shift when not dword aligned. The down matrix ends the expert blob, so its reads clamp the second dword of an unaligned read to the
   matrix's last dword (`ld32c`); the gate/up reads stay inside the blob (the down matrix follows them). The first version read up to 3 bytes
   past the end of a test allocation and faulted the GPU (an xe CAT error and an engine reset; nothing else was affected).
-* Supported: gate/up IQ3_S (21), IQ3_XXS (18), IQ2_S (22) with K a multiple of 256; down IQ4_NL (20) with K a multiple of 32 and Q2_0
-  (42) with K a multiple of 64; 640 FF x 2560 embedding; output rows a multiple of 16; a held group of at most 16 experts. Any other type or
-  shape makes the layer take the FP16 path (IQ4_XS gate/up, 1 of 48 layers of the IQ3_S pack). A group the kernels cannot run (no VRAM for
+* Supported: gate/up IQ3_S (21), IQ3_XXS (18), IQ2_S (22), Q4_K (12) with K a multiple of 256; down IQ4_NL (20) with K a multiple of
+  32, Q2_0 (42) and Q5_0 (6) with K a multiple of 64 (Q5_0's 22-byte blocks: a multiple of 64 makes every row start dword aligned, so
+  six aligned dword reads cover a block, the odd blocks 2 bytes in); 640 FF x 2560 embedding; output rows a multiple of 16; a held group of at most 16 experts. Any other type or
+  shape makes the layer take the FP16 path (IQ4_XS gate/up, 1 of 48 layers of the IQ3_S pack; Q5_1 down, layers 0-5 of the Q4_K_S pack). A group the kernels cannot run (no VRAM for
   the int8 scratch, a format they refuse) takes the FP16 chain for that group.
 * Multi-GPU: the codebooks, the scratch and the availability are kept per device.
 
@@ -77,6 +89,10 @@ never exists and the weights are read once, compressed (2.1 MB per expert instea
   (`pick_expert`, the unrolled expert lookup in the quantize kernels).
 * `t % n` and `t / n` with a run-time `n` gave `t % n == t`: the kernels use 2-D grids.
 * `gather<T, N, VS>` with VS > 1 is not available on Battlemage; a lambda capturing a simd by reference puts it in private memory.
+* `(lo >> 16) | (hi << 16)` on two dwords: LLVM makes it a funnel shift, the SPIR-V translator emits that as an exported helper
+  function (`spirv.llvm_fshl_v16i32`), and the AOT link of every kernel that has one fails ("VLD: Failed to compile SPIR-V ... more
+  than one module with an entry point!"). The Q5_0 decoder builds that dword by word moves (`mid32`); `ld32` shifts by a run-time
+  amount, which LLVM leaves alone.
 
 ## Quality
 
@@ -86,4 +102,25 @@ itself KL exactly 0; int8 against reference KL mean 0.0002 nats (p99 0.006, max 
 KL 0.0005. For comparison a chunk-size change (`--prefill 8192` against 4096) moves the first-token distribution by 0.01-0.03 nats.
 The kernel arithmetic itself matches an exact host reference on the same int8 activations to 3e-7 relative; against FP64 with the
 unquantized activations each product carries ~1% rms (the q8_1 grid; synthetic data with 1% outliers), the chain 1.7% against
-dequantize + oneMKL. `esimd_moe_parity` runs all six gate/up x down type pairs.
+dequantize + oneMKL. `esimd_moe_parity` runs the six IQ / Q2_0 gate/up x down type pairs and three with Q4_K or Q5_0 on
+synthetic blobs; `--gguf` takes real experts from a model's shards.
+
+## Q4_K / Q5_0 (the Q4_K_S pack), measured 2026-11-14
+
+`esimd_moe_parity --gguf <the three shards> 30 40 47` on the Arc Pro B70 (16 experts of each layer, mean 31 rows, synthetic
+activations with 1% outliers): the kernel arithmetic against the exact host reference on the same int8 activations 3e-7 (gate/up) and
+1e-7 (down) of the largest value; against FP64 with the unquantized activations 1.0% rms (gate/up) and 0.86% (down); the whole expert
+against FP64 1.60-1.66% (`sum |got - ref| / sum |ref|`; CUDA's int8 path on the same pack measures 2.1-2.8%; the FP16 chain 0.04%).
+The host decoders match ggml's `to_float` exactly on the blobs used.
+
+Time per expert, layer 40, `--sweep` (the crossover measurement's uneven row counts; the FP16 chain is dequantize + two oneMKL GEMMs):
+
+| mean rows per expert | 4 | 8 | 16 | 24 | 32 | 48 | 64 | 96 | 128 | 192 | 256 | 384 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| FP16 chain (us) | 44.2 | 44.0 | 44.6 | 45.1 | 46.7 | 49.4 | 53.3 | 58.7 | 64.5 | 73.3 | 82.1 | 94.1 |
+| int8 chain (us) | 11.4 | 12.0 | 12.6 | 14.6 | 16.1 | 20.7 | 26.1 | 30.9 | 40.0 | 53.3 | 71.7 | 101.1 |
+
+The int8 chain is faster up to about 340 rows per expert (a 2,048-token chunk has 40 on average). At 32 rows: quantize 0.5, gate/up
+8.4, SwiGLU + quantize 0.3, down 4.8 us. Before the per-format `MT` picks (the shared rule) the int8 chain was 18.1 us at 32 rows and
+78.0 at 256.
+

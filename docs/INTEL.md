@@ -261,9 +261,10 @@ default (4, 0.5) stays. A `--prefill 8192` chunk is not bit-identical to 4096 (f
 
 **Fused int8 expert path (Battlemage default).** On a Battlemage GPU (B70, B580, B570, detected by device architecture) the
 engine computes the prompt's routed experts with ESIMD kernels that decode the quantized weights in registers into the s8 DPAS B
-operand and multiply them by q8_1 activations. Covered: gate/up IQ3_S, IQ3_XXS, IQ2_S and down IQ4_NL, Q2_0. Other formats keep
-the FP16 path, as does every other GPU. `STRATA_PREFILL_MMQ` unset is `auto`, which times both chains at the first layer of each
-format and takes int8 below the measured crossover (130-250 rows per expert); `=0` turns it off, `=1` forces it. Activations are
+operand and multiply them by q8_1 activations. Covered: gate/up IQ3_S, IQ3_XXS, IQ2_S, Q4_K and down IQ4_NL, Q2_0, Q5_0
+(`STRATA_I8_KQ=0` keeps the Q4_K / Q5_0 layers on the FP16 path). Other formats keep the FP16 path, as does every other GPU.
+`STRATA_PREFILL_MMQ` unset is `auto`, which times both chains at the first layer of each format and takes int8 below the measured
+crossover (130-250 rows per expert); `=0` turns it off, `=1` forces it. Activations are
 quantized, so bits differ from the FP16 path (KL 2e-4 nats mean over 6,002 positions, top-1 99.7%). Details:
 [INTEL_INT8_EXPERTS.md](INTEL_INT8_EXPERTS.md).
 
@@ -424,6 +425,7 @@ All are environment variables for the engine. Put them in the config's `"env"` b
 | `STRATA_GDN_XE` | On for Alchemist | Sub-group GDN recurrence |
 | `STRATA_COPY_ENGINE` | On for Battlemage | Expert copies on the copy engine |
 | `STRATA_PREFILL_MMQ` | `auto` on Battlemage | Fused int8 prompt experts |
+| `STRATA_I8_KQ` | on | `0`: the Q4_K / Q5_0 expert layers keep the FP16 prompt path |
 | `STRATA_PREFILL_STREAM_ALL` | On when VRAM holds more than 90% of the (layer, expert) pairs | Copy every expert the cache does not hold, layer by layer; `=0` / `=1` force it |
 | `STRATA_PREFILL_FIRST` | 256 if the cache holds every expert, else 0 | Tokens in the short first prompt chunk |
 | `STRATA_LEND_MIRROR` | On | Mirror the experts in the last 10% of cache slots; `=0` off |
