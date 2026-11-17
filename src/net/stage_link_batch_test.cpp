@@ -5,6 +5,8 @@
 // has it), the message numbers - and then, against a worker on loopback whose handlers record what they get:
 //   1. a protocol 7 hello refused both ways, the reason naming both protocols;
 //   2. the hello's batch_slots and batch_flags arrive, both ways (a worker without slot handlers answers 0);
+//      bit 2 (kStageBatchSlotPositions, IMPL-PLAN-remote-batch-vision.md 4.6) too, and a worker without slot
+//      handlers answers 0 whatever its hello handler wrote (bit 2 included);
 //   3. SlotRun round trips: S = 1..8, fp32 and bf16 rows, slots / tokens / positions / flags / tag arrive, the rows
 //      come back (the handler changes them by a fixed rule);
 //   4. three SlotRuns sent back to back (slot_run_send x 3): the replies come back in the order sent, with their tags;
@@ -373,6 +375,7 @@ int main() {
           "the batch slot messages are 16..22");
     check(kStageSlotKeepAll == 1 && kStageBatchKeepAll == 1u && kStageBatchOverlap == 2u && kStageSlotMax == 64,
           "the flags and the slot bound");
+    check(kStageBatchSlotPositions == 4u, "the hello's bit 2: a position table per batch slot (remote-batch-vision)");
 
     float run_in[kMaxT * kHbf] = {}, run_out[kMaxT * kHbf] = {};
     float pf_in0[kChunk * kD] = {}, pf_in1[kChunk * kD] = {}, pf_out0[kChunk * kD] = {}, pf_out1[kChunk * kD] = {};
@@ -390,13 +393,14 @@ int main() {
 
     Seen seen;
     std::atomic<int32_t> worker_protocol{(int32_t) kStageProtocol};
+    std::atomic<uint32_t> worker_flags{kStageBatchKeepAll};   // the batch_flags the worker's hello handler writes
     std::atomic<bool> fail_commit{false};
     StageHandlers h;
     h.hello = [&](const StageHello& main_hello, StageHello& mine, std::string&) {
         mine = hello_of();
         mine.protocol = (uint32_t) worker_protocol.load();
         mine.batch_slots = 3;
-        mine.batch_flags = kStageBatchKeepAll;
+        mine.batch_flags = worker_flags.load();
         std::lock_guard<std::mutex> lk(seen.mu);
         seen.main_hello = main_hello;
         return true;
@@ -503,6 +507,30 @@ int main() {
     }
     check(peer.batch_slots == 3 && peer.batch_flags == kStageBatchKeepAll,
           "2. the main process gets the worker's batch_slots and batch_flags");
+    // ---- 2b. kStageBatchSlotPositions (bit 2, strata-mesh IMPL-PLAN-remote-batch-vision.md 4.6) arrives both ways
+    // beside bit 0: the link passes the field whole (the main process and a relay decide on it, not the link)
+    c.close();
+    worker_flags = kStageBatchKeepAll | kStageBatchSlotPositions;
+    {
+        StageClient c2;
+        StageHello p2, m2 = hello_of();
+        std::string e2;
+        m2.batch_slots = 4;
+        m2.batch_flags = kStageBatchKeepAll | kStageBatchSlotPositions;
+        check(c2.connect(where, m2, p2, e2), "2b. a main process with bit 2 is served");
+        {
+            std::lock_guard<std::mutex> lk(seen.mu);
+            check(seen.main_hello.batch_flags == (kStageBatchKeepAll | kStageBatchSlotPositions),
+                  "2b. the worker's hello handler gets the main process's bit 2");
+        }
+        check(p2.batch_slots == 3 && p2.batch_flags == (kStageBatchKeepAll | kStageBatchSlotPositions),
+              "2b. the main process gets the worker's bit 2");
+        c2.close();
+    }
+    worker_flags = kStageBatchKeepAll;
+    err.clear();
+    check(c.connect(where, mine, peer, err) && peer.batch_flags == kStageBatchKeepAll,
+          "2b. (the main process connects again: the worker's hello without bit 2)");
 
     // ---- 3. SlotRun round trips, fp32 and bf16, S = 1..8
     auto window = [&](StageClient& cl, int S, int64_t flags, int64_t tag, float base) -> bool {
@@ -746,8 +774,10 @@ int main() {
         StageClient c0;
         StageHello p0;
         std::string e;
+        worker_flags = kStageBatchKeepAll | kStageBatchSlotPositions;   // (what its hello handler writes)
         const bool hello0 = c0.connect(w0.where, mine, p0, e) && p0.batch_slots == 0 && p0.batch_flags == 0;
-        check(hello0, "9. its hello says 0 batch slots, whatever its hello handler wrote");
+        worker_flags = kStageBatchKeepAll;
+        check(hello0, "9. its hello says 0 batch slots and no flags (bit 2 too), whatever its hello handler wrote");
         std::vector<int32_t> sl(1, 0), tk(1, 0);
         std::vector<int64_t> ps(1, 0);
         std::vector<float> in((size_t) kHbf, 1.0f), out((size_t) kHbf);
