@@ -3134,14 +3134,36 @@ int main(int argc, char **argv) try {
     // the identity until an image request, and it is set here, before any CUDA graph captures a rope kernel.
     int32_t* d_mrope = nullptr;
     std::vector<int32_t> mrope_host;
+    // remote-batch-vision (strata-mesh IMPL-PLAN-remote-batch-vision.md 4.5, 4.7): a stage worker with --vision and
+    // --batch keeps a position table per batch slot - the table holds 1 + N regions `mrope_stride` cells apart (region 0
+    // the main session's, region b + 1 slot b's), a SlotSave copies region 0 into the slot's and the slot's windows
+    // rotate by it (Verifier::set_slot_positions).  STRATA_SLOT_POSITIONS=0 (a test) keeps the table's size but turns
+    // the rest off: every slot window reads region 0, as before.  The single-machine SYCL serve keeps one table.
+    const bool slot_positions_on = [] {
+        const char* v = std::getenv("STRATA_SLOT_POSITIONS");
+        return v == nullptr || std::strcmp(v, "0") != 0;
+    }();
+    const bool slot_positions_table = o.vision && stage_worker && o.batch > 0;
+    int64_t mrope_stride = 0, mrope_table_cells = 0;   // (slot_positions_table only)
     if (o.vision) {
         const int64_t cells = o.max_context + 64;
         mrope_host.resize((size_t) cells * 3);
         for (int64_t c = 0; c < cells; ++c)
             mrope_host[(size_t) c * 3] = mrope_host[(size_t) c * 3 + 1] = mrope_host[(size_t) c * 3 + 2] = (int32_t) c;
+        // every region starts as the identity (cell c -> c), each in its own cells
+        std::vector<int32_t> regions;
+        if (slot_positions_table) {
+            mrope_stride = strata::kernels::mrope_slot_stride(cells);
+            mrope_table_cells = (1 + (int64_t) o.batch) * mrope_stride;
+            regions.resize((size_t) mrope_table_cells * 3);
+            for (int64_t r = 0; r <= (int64_t) o.batch; ++r)
+                for (int64_t c = 0; c < mrope_stride; ++c)
+                    for (int k = 0; k < 3; ++k) regions[(size_t) ((r * mrope_stride + c) * 3 + k)] = (int32_t) c;
+        }
+        const std::vector<int32_t>& init = slot_positions_table ? regions : mrope_host;
         if (DPCT_CHECK_ERROR(
                 d_mrope = sycl::malloc_device<int32_t>(
-                    mrope_host.size(), dpct::get_in_order_queue())) != 0 ||
+                    init.size(), dpct::get_in_order_queue())) != 0 ||
             /*
             DPCT1114: cudaMemcpy is migrated to asynchronization memcpy,
             assuming in the original code the source host memory is pageable
@@ -3149,12 +3171,18 @@ int main(int argc, char **argv) try {
             by memcpy API to ensure synchronization behavior.
             */
             DPCT_CHECK_ERROR(dpct::get_in_order_queue().memcpy(
-                d_mrope, mrope_host.data(),
-                mrope_host.size() * sizeof(int32_t)).wait()) != 0) {
+                d_mrope, init.data(),
+                init.size() * sizeof(int32_t)).wait()) != 0) {
             std::fprintf(stderr, "strata generate: cannot allocate the image position table\n");
             return 1;
         }
         strata::kernels::mrope_table_set(d_mrope);
+        if (slot_positions_table)
+            std::fprintf(stderr, "strata stage worker: --vision with --batch: a position table per batch slot (%d + 1 "
+                                 "regions of %lld cells, %.1f MiB)%s\n", o.batch, (long long) mrope_stride,
+                         (double) mrope_table_cells * 12.0 / 1048576.0,
+                         slot_positions_on ? "" : "; STRATA_SLOT_POSITIONS=0: the batch slots share one position table "
+                                                  "(a test: pictures in batch slots rotate wrong)");
     }
     strata::kernels::ple_set_native_postops(o.native_ple_postops);
     // before session_init: every graph captured from here on has the vector's kernels where it applies
@@ -7626,6 +7654,12 @@ int main(int argc, char **argv) try {
                     std::fprintf(stderr, "strata serve: --batch, stage %zu: %s\n", k + 1, err.c_str());
                     return 1;
                 }
+                // remote-batch-vision: a stage worker's slot windows read their own regions (one stage: k == 0)
+                if (k == 0 && slot_positions_table && slot_positions_on &&
+                    !vk.set_slot_positions(mrope_stride, mrope_table_cells, err)) {
+                    std::fprintf(stderr, "strata serve: --batch with --vision: %s\n", err.c_str());
+                    return 1;
+                }
             }
         }
         for (int st = 0; st < n_stages && n_stages > 1; ++st) {
@@ -9630,6 +9664,9 @@ int main(int argc, char **argv) try {
                 hs.hello = [&, hello_base](const strata::net::StageHello& theirs, strata::net::StageHello& mine,
                                            std::string& e) -> bool {
                     if (!hello_base(theirs, mine, e)) return false;
+                    // remote-batch-vision: this worker keeps a position table per slot (SlotSave copies it)
+                    if (slot_positions_table && slot_positions_on && wk_cap > 0)
+                        mine.batch_flags |= strata::net::kStageBatchSlotPositions;
                     slots_forget();
                     wk_slot_n = theirs.protocol == strata::net::kStageProtocol
                                     ? std::max(0, std::min({(int) theirs.batch_slots, (int) mine.batch_slots, wk_cap}))
@@ -9758,6 +9795,19 @@ int main(int argc, char **argv) try {
                     if (!ver.wait_commit(e) || !refill(e)) return false;
                     wk_slot_live[(size_t) slot] = 0;   // half written if the copy fails
                     if (!copy_session(ss, *bslot_ss[0][(size_t) slot], L, nullptr, "a slot save", e)) return false;
+                    // remote-batch-vision: the session's position table (the request this slot takes: the main
+                    // process's last Positions, or the identity) into the slot's region - its windows rotate by it
+                    if (slot_positions_table && slot_positions_on) {
+                        try {
+                            dpct::get_in_order_queue()
+                                .memcpy(d_mrope + (size_t) (slot + 1) * (size_t) mrope_stride * 3, d_mrope,
+                                        mrope_host.size() * sizeof(int32_t))
+                                .wait();
+                        } catch (const sycl::exception& x) {
+                            e = std::string("stage worker: a slot save's position table copy failed: ") + x.what();
+                            return false;
+                        }
+                    }
                     wk_slot_live[(size_t) slot] = 1;
                     wk_slot_len[(size_t) slot] = L;
                     wk_slot_fp("slot save", slot, *bslot_ss[0][(size_t) slot], L);
