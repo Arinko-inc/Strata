@@ -4721,9 +4721,10 @@ int main(int argc, char** argv) {
         for (int64_t c = 0; c < cells; ++c)
             mrope_host[(size_t) c * 3] = mrope_host[(size_t) c * 3 + 1] = mrope_host[(size_t) c * 3 + 2] = (int32_t) c;
         if (o.batch > 0) {   // (remote-batch-vision 4.1: every region the identity to start with)
-            // at most 64 regions (protocol 8 names at most 64 slots): the slot count is resolved further down (a batch
-            // window holds kVerifyMaxT rows), and set_slot_positions refuses a table with fewer regions than slots
-            mrope_slot_regions = std::min<int64_t>(o.batch, 64);
+            // over a remote stage at most 64 regions (protocol 8 names at most 64 slots; the slot count is resolved
+            // further down).  One PC keeps --batch's count (--batch-mtp may keep more than 64 slots).  set_slot_positions
+            // refuses a table with fewer regions than slots
+            mrope_slot_regions = (remote_main || stage_worker) ? std::min<int64_t>(o.batch, 64) : o.batch;
             mrope_stride = strata::kernels::mrope_slot_stride(cells);
             mrope_table_cells = (1 + mrope_slot_regions) * mrope_stride;
             std::vector<int32_t> all((size_t) mrope_table_cells * 3);
