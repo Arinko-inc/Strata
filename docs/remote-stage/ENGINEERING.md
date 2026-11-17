@@ -84,7 +84,7 @@ carve; each side takes n = the fewer of the two hellos' and uses slots [0, n) on
 count. The two fields took the last 8 bytes of the hello's `build` text (40 bytes now, 48 up to protocol 7), so the
 hello stays 192 bytes and the token stays where every protocol has it; `batch_flags` bit 0 says the side takes
 SlotRun's keep-all flag, bit 1 (stage 2, informational) that it starts the next SlotRun while an earlier one is with
-its next worker. A worker without the slot handlers (started without `--batch`) answers 0 slots, and every slot
+its next worker, bit 2 (`kStageBatchSlotPositions`, [Images](#images)) that it keeps a position table per slot. A worker without the slot handlers (started without `--batch`) answers 0 slots, and every slot
 message gets `this worker has no batch slots (start it with --batch N)`. Another protocol is refused before the
 worker's own checks look at the hello (a protocol 7 hello's `build` would sit where `batch_slots` is): `the two sides
 differ (protocol 7/8: every stage needs the same Strata build ...)`, which `stage_link_lost` does not count, so
@@ -306,6 +306,38 @@ the main process sent no Reset for a request it then refused (a prompt longer th
 `STRATA_STAGE_POSITIONS=0` on the main process (a test switch) sends no table, to show what the positions change.
 `src/net/stage_link_test.cpp` checks the table's fill, the hello, the table arriving whole, and the errors' order
 over loopback.
+
+**A table per batch slot** (`--vision` with `--batch N`; strata-mesh IMPL-PLAN-remote-batch-vision.md). One table
+per device is wrong as soon as a picture request and another request decode in slots at once: the table is built at
+each request's start (a picture's grid, or the identity again for text after a picture), and a slot's window looked
+its rows up by their cells in that one table. A text slot then rotated by the picture request's grid, and a picture
+slot by the identity once a text request came in; a key rotated wrong stays in that slot's K/V. Upstream's one-card
+engine had the same fault. Now each process allocates `(1 + N) * stride` cells (`stride` = `max_context + 64`
+rounded up to a multiple of 4, `mrope_slot_stride`): region 0 is the main session's (what `mrope_table_set` and the
+graphs hold, written as before - Positions, `stage_positions_fill`, a worker's reset to the identity all write region
+0 only), region b + 1 is slot b's. `Verifier::set_slot_positions` makes a slot's window put
+`(b + 1) * stride + cell` in the Q, K and indexer-query positions of its rows and pass `(b + 1) * stride` as the
+indexer key's `pos_base` (the window's, a slot commit's and stage 2's deferred commit's); the K/V cell, the attention
+range and the commit's positions stay the cell. No kernel changed: they already read `tab[pos * 3 + k]` and
+`tab[(pos_base + 4b) * 3 + k]`. The `pos_base` is captured per row in the batch graphs, whose keys already hold each
+row's slot. When a request enters slot b (the main process's `copy_to_slot`, a worker's SlotSave), the process
+copies region 0 to region b + 1 on the device (3.0 MiB at 262,144 cells): at that moment region 0 holds the entering
+request's table, since its Positions came first. A relay sends the SlotSave on first, and each worker copies its own.
+SlotLoad copies nothing: only a text conversation is read back from a slot, and its prefix's cells are the identity in
+every table (the main process refuses to read back a picture's slot). Positions still comes only at a request's
+start, when no slot window is in flight, and it writes region 0 only, so the other slots' windows between a picture
+request's chunks read their own regions. The hello's `batch_flags` bit 2 says a side does this; a relay sets it only
+when its next worker has it, and a main process with `--vision` and slots whose worker lacks it turns its slots off at
+the start (`--vision with --batch needs every stage to keep a position table per batch slot`) and refuses a link made
+again. The protocol stays 8 and SlotRun's bytes are the same: an older main process refuses `--vision` with `--batch`
+over a remote stage, so an older side never meets a picture in a slot. Without `--vision` there is no table and no
+copy. The cost is 12.0 MiB of VRAM a device for 4 slots at a 262,144-token context, allocated before the expert
+cache. `STRATA_SLOT_POSITIONS=0` on every process (a test switch) skips the copy, the verifier's offsets and the bit,
+which is the one-table behaviour: `tools/batch_vision_test.py --expect-differ` shows that its scenes tell the two
+apart, and without the switch that every slot matches its solo record. Not covered: a one-card `--batch-mtp`
+drafter still reads region 0 (its drafts are checked, so only their acceptance can drop); the indexer's
+`idx_block_pos` record of a slot's session holds the region's offset (the record is not read by any kernel).
+`stage_link_batch_test` checks bit 2 over loopback; on GPUs it has not been run yet.
 
 ### Windows
 
