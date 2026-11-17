@@ -196,8 +196,10 @@ class Session(socketserver.StreamRequestHandler):
                 except OSError as e:
                     self.send_line(f"ERR the remote reader's output could not be read ({e})")
                     continue
-                self.send(f"SVE {len(sve)}\n".encode() + sve)
-            self.send_line(reply_text)
+                # one write: a LOG line from the stderr thread must not come between the file and its OK line
+                self.send(f"SVE {len(sve)}\n".encode() + sve + reply_text.rstrip("\r\n").encode("utf-8", "replace") + b"\n")
+            else:
+                self.send_line(reply_text)
             for p in (img, out):
                 try:
                     os.unlink(p)
