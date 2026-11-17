@@ -167,6 +167,15 @@ public:
     bool commit_slot_prefixes(const int* keep, std::string& err);
     /// --batch-mtp: slot rotation makes many row layouts, so bound the captured batch graph pairs (LRU). 0 = unbounded.
     void set_batch_graph_limit(size_t n) { batch_graph_limit_ = n; }
+    /// --vision with batch slots (strata-mesh IMPL-PLAN-remote-batch-vision.md 4.1): the device's position table holds
+    /// the main session's region and one region per slot, `stride` cells apart (slot b at (b + 1) * stride).  A batch
+    /// window's row of slot b rotates by the table at (b + 1) * stride + its cell: its Q/K/indexer-query positions and
+    /// the indexer key's pos_base carry that offset; the step (the K/V cell, the attention's range) stays the cell.
+    /// 0 (the default): every row reads the main region, as before.  Call after init_slots, before the first window;
+    /// false + err when the stride is not a multiple of the indexer block, a slot session is longer than the stride,
+    /// the regions do not fit `table_cells`, or this device has no position table.
+    bool set_slot_positions(int64_t stride, int64_t table_cells, std::string& err);
+    int32_t slot_pos_base(int slot) const { return slot_pos_stride_ > 0 ? (int32_t) ((slot + 1) * slot_pos_stride_) : 0; }
 
     // ---- The stages of a layer split as a PIPELINE.  A batch window over the slot GROUP
     // [base, base + S) is launched on ONE stage with its commit right behind it on the stage's stream (a batch window
@@ -272,6 +281,7 @@ private:
     bool capture(int T, std::string& err);
     // batch windows (see init_slots)
     std::vector<SessionState*> slots_;
+    int64_t slot_pos_stride_ = 0;          ///< set_slot_positions (0: every batch row reads the main region)
     bool batch_rec_ = false;               ///< record_window is capturing a batch window
     int row_base_ = 0;                     ///< ... its hand-off rows start here (a pipeline group's own rows)
     int brow_[8] = {};                     ///< ... and row t is slot brow_[t]

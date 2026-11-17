@@ -3,6 +3,7 @@
 //
 //   STRATA_STAGE_TOKEN=... stage_probe HOST:PORT [--vision] [--batch] [--n N] [--decode D] [--seed S]
 //   STRATA_STAGE_TOKEN=... stage_probe HOST:PORT --expect-refusal TEXT
+//   STRATA_STAGE_TOKEN=... stage_probe HOST:PORT --slots [--expect-differ] [--windows K]
 //
 // It learns the worker's geometry from the refusal of an empty hello, then connects as a main process would and sends
 // synthetic hand-off rows (normal noise, a fixed seed): a prompt of N tokens in 2048-token chunks, the same prompt to
@@ -19,6 +20,16 @@
 // and then, on a new connection after an image table, a text run that must equal null (the table went back to the
 // identity when its main process went away).  Without --vision it runs `none` only (for the hashes) and checks that
 // a Positions message is refused.  --expect-refusal: a --vision hello must be refused with TEXT in the message.
+//
+// --slots (remote-batch-vision, strata-mesh IMPL-PLAN-remote-batch-vision.md 7): two batch slots with different
+// position tables in one window.  Slot 0 holds a prompt of L0 cells, slot 1 one of L1 (L0 + K <= L1), and K windows
+// run rows {0, 1} at cells {L0 + i, L1 + i}.  U is one table that is right for both (identity below L0, +1000 on
+// [L0, L1), +3000 from L1).  `ref`: everything under U (main and slots: a one-table worker computes the right answer
+// too).  `test`: each prompt read under U, then slot 0 saved under A (+1000 from L0: right for slot 0, wrong at slot
+// 1's cells), slot 1 under B (identity below L1, +3000 from it: right for slot 1, wrong at slot 0's cells), and the
+// windows run with the main table C (+5000 from L0: wrong for both).  With a table per slot test == ref bitwise, row
+// by row; with one table (an old worker, STRATA_SLOT_POSITIONS=0) both rows differ (--expect-differ).  The hashes
+// of `ref` compare across executables.
 #include "strata/net/stage_link.hpp"
 
 #include <algorithm>
@@ -144,6 +155,7 @@ struct Probe {
     std::string addr, token;
     Geometry g;
     bool vision = false, batch = false;
+    int batch_slots = 1;
     int decode = 32;
     StageClient link;
 
@@ -157,7 +169,7 @@ struct Probe {
         mine.vision = vision ? 1 : 0;
         mine.ckpt_max = 0;
         mine.row_formats = 1u << (uint32_t) StageRows::F32;
-        mine.batch_slots = batch ? 1 : 0;
+        mine.batch_slots = batch ? batch_slots : 0;
         mine.batch_flags = batch ? kStageBatchKeepAll : 0;
         std::memset(mine.build, 0, sizeof mine.build);
         std::snprintf(mine.build, sizeof mine.build, "stage_probe");
@@ -167,6 +179,8 @@ struct Probe {
         if (!link.connect(addr, mine, peer, err, 60)) return false;
         g.peer.max_context = peer.max_context;
         g.peer.vision = peer.vision;
+        g.peer.batch_slots = peer.batch_slots;
+        g.peer.batch_flags = peer.batch_flags;
         return true;
     }
 
@@ -261,6 +275,52 @@ struct Probe {
         std::fflush(stdout);
         return res;
     }
+
+    // --slots: see the head of this file.  Hashes per row over the K windows' output rows (and the whole windows).
+    struct SlotsResult {
+        bool ok = false;
+        std::string err;
+        uint64_t row[2] = {1469598103934665603ull, 1469598103934665603ull};
+        uint64_t all = 1469598103934665603ull;
+        std::vector<float> r0, r1;   // the last window's rows
+    };
+    SlotsResult slots_run(const Inputs& in, int64_t L0, int64_t L1, int K, const std::vector<int32_t>& U,
+                          const std::vector<int32_t>* A, const std::vector<int32_t>* B, const std::vector<int32_t>& main,
+                          const std::vector<float>& win_rows, const std::vector<int32_t>& win_tok) {
+        SlotsResult r;
+        std::string& err = r.err;
+        std::vector<float> out;
+        std::vector<uint64_t> hs;
+        auto pos_of = [&](const std::vector<int32_t>& t) { return link.positions(t.data(), (int64_t) t.size() / 3, err); };
+        // slot 0: the prompt to L0 under U, saved under A (ref: U)
+        if (!pos_of(U) || !link.reset({}, err) || !prompt(in, L0, out, hs, nullptr, err)) return r;
+        if (A != nullptr && !pos_of(*A)) return r;
+        if (!link.slot_save(0, L0, err)) return r;
+        // slot 1: the prompt to L1 under U, saved under B (ref: U)
+        if (!pos_of(U) || !link.reset({}, err) || !prompt(in, L1, out, hs, nullptr, err)) return r;
+        if (B != nullptr && !pos_of(*B)) return r;
+        if (!link.slot_save(1, L1, err)) return r;
+        // the windows with the main table `main`
+        if (!pos_of(main) || !link.reset({}, err)) return r;
+        const int32_t slots[2] = {0, 1};
+        std::vector<float> wo((size_t) (2 * g.HB));
+        for (int i = 0; i < K; ++i) {
+            const int64_t pos[2] = {L0 + i, L1 + i};
+            const float* wi = win_rows.data() + (size_t) i * 2 * g.HB;
+            if (!link.slot_run(2, slots, win_tok.data() + (size_t) i * 2, pos, kStageSlotKeepAll, 1 + i, wi,
+                               (size_t) (2 * g.HB), wo.data(), wo.size(), err))
+                return r;
+            r.row[0] = fnv(wo.data(), (size_t) g.D * 4, r.row[0]);
+            r.row[1] = fnv(wo.data() + g.D, (size_t) g.D * 4, r.row[1]);
+            r.all = fnv(wo.data(), wo.size() * 4, r.all);
+            if (i == K - 1) {
+                r.r0.assign(wo.begin(), wo.begin() + g.D);
+                r.r1.assign(wo.begin() + g.D, wo.begin() + 2 * g.D);
+            }
+        }
+        r.ok = true;
+        return r;
+    }
 };
 
 std::string hx(uint64_t v) {
@@ -299,6 +359,8 @@ int main(int argc, char** argv) {
     int64_t N = 2600;
     unsigned seed = 7;
     std::string expect_refusal;
+    bool slots = false, expect_differ = false;
+    int windows = 32;
     for (int i = 2; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&]() -> const char* {
@@ -311,6 +373,9 @@ int main(int argc, char** argv) {
         else if (a == "--decode") pr.decode = std::atoi(next());
         else if (a == "--seed") seed = (unsigned) std::atoi(next());
         else if (a == "--expect-refusal") expect_refusal = next();
+        else if (a == "--slots") slots = true;
+        else if (a == "--expect-differ") expect_differ = true;
+        else if (a == "--windows") windows = std::atoi(next());
         else { std::fprintf(stderr, "unknown option %s\n", a.c_str()); return 2; }
     }
     if (N < kChunk + 64 || N > 8000) { std::fprintf(stderr, "--n: 2112..8000 (two prompt chunks)\n"); return 2; }
@@ -331,12 +396,70 @@ int main(int argc, char** argv) {
                 "a --vision main process is refused: " + (took ? std::string("(it was taken)") : err));
         return g_bad == 0 ? 0 : 1;
     }
+    if (slots) {
+        pr.vision = pr.batch = true;
+        pr.batch_slots = 2;
+    }
     if (!pr.connect(err)) {
         std::fprintf(stderr, "stage_probe: %s\n", err.c_str());
         return 1;
     }
-    std::printf("stage_probe: connected (vision %d, batch slots %d; the worker's vision %d, context %lld)\n",
-                pr.vision ? 1 : 0, pr.batch ? 1 : 0, pr.g.peer.vision, (long long) pr.g.peer.max_context);
+    std::printf("stage_probe: connected (vision %d, batch slots %d; the worker's vision %d, context %lld, batch slots "
+                "%d, batch flags 0x%x: a position table per slot %s)\n",
+                pr.vision ? 1 : 0, pr.batch ? pr.batch_slots : 0, pr.g.peer.vision,
+                (long long) pr.g.peer.max_context, (int) pr.g.peer.batch_slots, (unsigned) pr.g.peer.batch_flags,
+                (pr.g.peer.batch_flags & kStageBatchSlotPositions) ? "yes" : "no");
+    if (slots) {
+        const int64_t L0 = 1200, L1 = 1600;   // multiples of the indexer block: each window's blocks start at L + 4j
+        const int K = windows;
+        if (K < 8 || L0 + K + 4 > L1) { std::fprintf(stderr, "--windows: 8..%lld\n", (long long) (L1 - L0 - 4)); return 2; }
+        Inputs in;
+        in.N = L1;
+        std::mt19937 rng(seed);
+        std::normal_distribution<float> nd(0.0f, 1.0f);
+        std::uniform_int_distribution<int> td(1000, 100000);
+        in.tok.resize((size_t) L1);
+        for (auto& t : in.tok) t = td(rng);
+        in.rows.resize((size_t) (L1 * pr.g.D));
+        for (float& v : in.rows) v = nd(rng);
+        std::vector<float> win_rows((size_t) K * 2 * pr.g.HB, 0.0f);   // per window: 2 R rows, then bo and inject 0
+        std::vector<int32_t> win_tok((size_t) K * 2);
+        for (int i = 0; i < K; ++i) {
+            float* w = win_rows.data() + (size_t) i * 2 * pr.g.HB;
+            for (int64_t j = 0; j < 2 * pr.g.D; ++j) w[j] = nd(rng);
+            win_tok[(size_t) i * 2] = td(rng);
+            win_tok[(size_t) i * 2 + 1] = td(rng);
+        }
+        const int64_t cells = L1 + K + 64;
+        std::vector<int32_t> U = offset_table(cells, L0, 1000);
+        for (int64_t c = L1; c < cells; ++c) U[(size_t) c * 3] = U[(size_t) c * 3 + 1] = U[(size_t) c * 3 + 2] = (int32_t) (c + 3000);
+        const std::vector<int32_t> A = offset_table(cells, L0, 1000), B = offset_table(cells, L1, 3000),
+                                   C = offset_table(cells, L0, 5000);
+        const auto t0 = Clock::now();
+        const Probe::SlotsResult ref = pr.slots_run(in, L0, L1, K, U, nullptr, nullptr, U, win_rows, win_tok);
+        verdict(ref.ok, "ref (one table U for everything): " + std::to_string(K) + " windows of slots {0, 1}" +
+                            (ref.ok ? "" : ": " + ref.err));
+        const Probe::SlotsResult test = pr.slots_run(in, L0, L1, K, U, &A, &B, C, win_rows, win_tok);
+        verdict(test.ok, "test (slot 0 saved under A, slot 1 under B, the windows under C)" +
+                             (test.ok ? std::string() : ": " + test.err));
+        const Probe::SlotsResult ref2 = pr.slots_run(in, L0, L1, K, U, nullptr, nullptr, U, win_rows, win_tok);
+        if (!ref.ok || !test.ok || !ref2.ok) return 1;
+        std::printf("  ref   row0 %s row1 %s all %s\n", hx(ref.row[0]).c_str(), hx(ref.row[1]).c_str(), hx(ref.all).c_str());
+        std::printf("  test  row0 %s row1 %s all %s\n", hx(test.row[0]).c_str(), hx(test.row[1]).c_str(), hx(test.all).c_str());
+        std::printf("  ref2  row0 %s row1 %s all %s   (%.1f s)\n", hx(ref2.row[0]).c_str(), hx(ref2.row[1]).c_str(),
+                    hx(ref2.all).c_str(), ms_since(t0) / 1000.0);
+        std::printf("  the last window, test against ref: row 0 %s; row 1 %s\n", diff(test.r0, ref.r0).c_str(),
+                    diff(test.r1, ref.r1).c_str());
+        verdict(ref.all == ref2.all, "ref twice: bitwise the same (determinism)");
+        if (expect_differ)
+            verdict(test.row[0] != ref.row[0] && test.row[1] != ref.row[1],
+                    "one table: BOTH slots' rows differ from ref (each rotated by the main table C)");
+        else
+            verdict(test.row[0] == ref.row[0] && test.row[1] == ref.row[1],
+                    "a table per slot: each slot's rows == ref, bitwise (each rotated by its own table)");
+        std::printf("stage_probe: %s (%d failed)\n", g_bad == 0 ? "PASS" : "FAIL", g_bad);
+        return g_bad == 0 ? 0 : 1;
+    }
 
     // the inputs: a picture of 32 x 24 at cell 1000 and one of 6 x 3 that ends two cells before N, so the verify
     // window [N - 4, N) holds two picture cells and two text cells
