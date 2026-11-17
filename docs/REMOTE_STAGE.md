@@ -424,13 +424,15 @@ main process without it.
 
 **The SYCL worker (2026-11-17, Arc Pro B70, orca Q4_K_S layers 30-47, the options of the trainsv mesh's last stage,
 on 127.0.0.1):** `sycl/src/net/stage_probe.cpp` stands in for the main process and sends synthetic rows (a
-2,600-token prompt in two chunks, a 4-row verify window, 32 decode windows and a batch window), with no table, the
-identity, two pictures in mtmd's layout, and tables that are the identity before a cell and offset after it. Without
-a table and with the identity, every reply was bit-identical to the worker built without the change (536d2b84) and
-to the same worker without `--vision`. With an offset from cell 2,048, the first chunk's rows stayed bit-identical
-and the second chunk's changed; with an offset from the window's first cell, the prompt stayed bit-identical and the
-window, the decode windows and the batch window changed, so each of these paths reads the table. The pictures' table
-gave the same hashes twice. A table longer than the worker's context was refused at the next reset, and after a
+2,600-token prompt in two chunks, a 4-row verify window, 32 decode windows and a batch window of the same 4 rows on
+one slot), with no table, the identity, two pictures in mtmd's layout, and tables that are the identity before a
+cell and offset after it. Without a table and with the identity, every reply was bit-identical to the worker built
+without the change (536d2b84) and to the same worker without `--vision`. With an offset from cell 2,048, the first
+chunk's rows stayed bit-identical and the second chunk's changed; with an offset from the window's first cell, the
+prompt stayed bit-identical and the window, the decode windows and the one-slot batch window changed, so each of
+these paths reads the table (the batch window's rows were bit-identical to the verify window's; rows of several
+slots in one window were not run). The indexer's pooled keys are checked per kernel only. The pictures' table gave
+the same hashes twice. A table longer than the worker's context was refused at the next reset, and after a
 disconnect the next main process's text was bit-identical to the identity's. Per kernel, `mrope_parity` (a ctest of
 the SYCL build) checks every rotation of the worker against the pair-by-pair definition. A decode window of 4 rows
 took 12.85 ms of the worker's time with `--vision` and 12.84 ms on 536d2b84 (32 windows each); a 2,048-token chunk
