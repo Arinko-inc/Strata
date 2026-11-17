@@ -3154,9 +3154,11 @@ int main(int argc, char **argv) try {
         std::vector<int32_t> regions;
         if (slot_positions_table) {
             mrope_stride = strata::kernels::mrope_slot_stride(cells);
-            mrope_table_cells = (1 + (int64_t) o.batch) * mrope_stride;
+            // at most 64 regions (protocol 8 names at most 64 slots): the slot count is resolved further down (a batch
+            // window holds kVerifyMaxT rows), and set_slot_positions refuses a table with fewer regions than slots
+            mrope_table_cells = (1 + std::min<int64_t>(o.batch, 64)) * mrope_stride;
             regions.resize((size_t) mrope_table_cells * 3);
-            for (int64_t r = 0; r <= (int64_t) o.batch; ++r)
+            for (int64_t r = 0; r <= std::min<int64_t>(o.batch, 64); ++r)
                 for (int64_t c = 0; c < mrope_stride; ++c)
                     for (int k = 0; k < 3; ++k) regions[(size_t) ((r * mrope_stride + c) * 3 + k)] = (int32_t) c;
         }
