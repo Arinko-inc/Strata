@@ -291,6 +291,11 @@ target_include_directories(stage_link_batch_test PRIVATE ${STRATA_ROOT}/include)
 target_link_libraries(stage_link_batch_test PRIVATE Threads::Threads)
 add_test(NAME stage_link_batch_test COMMAND stage_link_batch_test)
 set_tests_properties(stage_link_batch_test PROPERTIES TIMEOUT 60)
+# a stand-in main process for one running worker (its image positions, its hashes): port-only, not a ctest
+strata_resolve(_stage_probe src/net/stage_probe.cpp src/net/stage_link.cpp)
+add_executable(stage_probe ${_stage_probe})
+target_include_directories(stage_probe PRIVATE ${STRATA_ROOT}/include)
+target_link_libraries(stage_probe PRIVATE Threads::Threads)
 
 # --- the kernel parity self-tests (each runs on the card and compares against a CPU reference) ---------------------
 option(STRATA_SYCL_PARITY "Build the kernel parity tests" ON)
@@ -333,6 +338,12 @@ if(STRATA_SYCL_PARITY)
   endforeach()
   target_link_libraries(gdn_parity PRIVATE strata_prefill)  # prefill recurrence variant tests
   add_test(NAME prefill_gdn_parity COMMAND gdn_parity --selftest --prefill-only)
+  # the image path's M-RoPE table in every rotation of a stage worker (port-only: src/kernels/mrope_parity.cpp)
+  add_executable(mrope_parity ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/mrope_parity.cpp)
+  target_link_libraries(mrope_parity PRIVATE strata_prefill)
+  add_test(NAME mrope_parity COMMAND mrope_parity --selftest)
+  add_test(NAME mrope_parity_rope_table COMMAND ${CMAKE_COMMAND} -E env STRATA_ROPE_TABLE=1 $<TARGET_FILE:mrope_parity>
+           --selftest)
   # #1795: iq_parity and ple_parity are registered as the top-level CMakeLists.txt does, not by the loop above
   # (iq_parity takes a fixture directory, not --selftest; ple_parity reads real artifacts from the engine root).
   foreach(p IN ITEMS iq ple)
