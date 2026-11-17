@@ -198,13 +198,15 @@ class Session(socketserver.StreamRequestHandler):
             log(f"{peer}: {e}")
         finally:
             if not quit_sent and not closing.is_set():
-                put(("EOF", None))
+                # end the reader first: with the queue full (a client that sent ahead) the put below waits for the
+                # session, and the session may be waiting on a reader that hangs
                 if proc.poll() is None:
                     log(f"{peer}: the relay went away; ending strata-vision")
                     try:
                         proc.kill()
                     except OSError:
                         pass
+                put(("EOF", None))
 
     def pump_stderr(self, proc):
         for raw in iter(proc.stderr.readline, b""):
