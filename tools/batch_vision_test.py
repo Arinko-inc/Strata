@@ -52,6 +52,10 @@ class SetupError(Exception):
     """Not a verdict on the slots: the run did not test what it asked for."""
 
 
+class NoVerdict(Exception):
+    """One scene ran but cannot tell (its slots' cells, or where it continued from): the next scenes still run."""
+
+
 def text_prompt(q):
     return f"<|im_start|>user\n{q}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
 
@@ -293,14 +297,14 @@ def main():
     else:
         print("  (no tokenizer here: the prompts' layout is not shown)")
     plan = {
-        "S1": [(A, "T1", ()), (B, "P1", ("ckpt=0",))],
+        "S1": [(A, "T1", ()), (B, "P1", ())],
         "S4": [(A, "F", ())],
-        "S2": [(A, "P1", ("ckpt=0",)), (B, "T1", ())],
-        "S3": [(0, "P1", ("ckpt=0",)), (1, "P2", ("ckpt=0",)), (2, "T2", ()), (3, "T3", ())],
+        "S2": [(A, "P1", ()), (B, "T1", ())],
+        "S3": [(0, "P1", ()), (1, "P2", ()), (2, "T2", ()), (3, "T3", ())],
     }
     targets = {"S1": A, "S2": A, "S3": 0}
     if a.dry_run:
-        print("  solo records first (S4's F after T1, before any slot holds T1; pictures and F with ckpt=0)")
+        print("  solo records first (S4's F right after T1, before any slot holds T1; every record but T1's with ckpt=0)")
         for s in scenes:
             print(f"  {s}: " + " -> ".join(f"{'BGENI' if n.startswith('P') else 'BGEN'} {sl} {n}"
                                          f"{' ' + ' '.join(k) if k else ''}" for sl, n, k in plan[s])
@@ -339,6 +343,7 @@ def main():
         # ---- the solo records, before any slot holds a conversation: a plain GEN also continues from an idle slot
         print("solo:", flush=True)
         ref = {}
+        f_continued = True
         need = sorted({n for s in scenes for _, n, _ in plan[s] if n != "F"}, key=lambda n: (n != "T1", n))
         for name in need:
             # T1 keeps its checkpoints (F continues from it); every other record keeps none (ckpt=0)
@@ -354,8 +359,10 @@ def main():
                              "max_new": a.max_new_text}
                 ref["F"], fd = solo(eng, out, reqs["F"], ("ckpt=0",))
                 if (fd["reused"] or 0) <= len(reqs["T1"]["ids"]):
+                    f_continued = False
                     print(f"  note: solo F reused {fd['reused']} tokens (not T1's live state): its record was read "
-                          "from the prompt, not continued", flush=True)
+                          "from the prompt, not continued (a difference in S4 is then no verdict)",
+                          flush=True)
         # ---- the scenes
         for s in scenes:
             print(f"{s}:", flush=True)
@@ -363,44 +370,52 @@ def main():
             got, adm = scene(eng, out, items)
             rows = [compare(s, sl, r, got[sl], ref[r["name"]]) for sl, r, _ in items]
             entry = {"slots": rows, "admissions": {str(k): v for k, v in adm.items()}}
-            if s == "S1":
-                t1 = len(reqs["T1"]["ids"])
-                n_a = len(got[A])
-                entry["text_cells"] = [t1, t1 + n_a - 1]
-                print(f"  S1: slot {A} wrote cells {t1}..{t1 + n_a - 1}; P1's admission reused "
-                      f"{adm[B]['reused']} of {adm[B]['prompt']} prompt tokens", flush=True)
-                p1s = reqs["P1"]["ids"].index(IMAGE_PAD)
-                if not (p1s < t1 and t1 + n_a - 1 < p1s + 32 * 32):
-                    raise SetupError(f"S1: slot {A}'s cells {t1}..{t1 + n_a - 1} are not inside P1's picture cells "
-                                     f"{p1s}..{p1s + 32 * 32 - 1}: the scene cannot tell the bug apart")
-                if (adm[B]["reused"] or 0) > 0:
-                    print("  note: P1's admission did not read its whole prompt (a checkpoint): fewer chunks ran "
-                          "beside slot A's windows", flush=True)
-            if s == "S4":
-                reused, t1 = adm[A]["reused"] or 0, len(reqs["T1"]["ids"])
-                entry["continued_from_slot"] = reused > t1
-                if reused <= t1:
-                    raise SetupError(f"S4: F's admission reused {reused} tokens, not more than T1's prompt ({t1}): "
-                                     f"it did not continue from slot {A}'s state")
-            if a.expect_differ:
-                tgt = targets[s]
-                hit = next(r for r in rows if r["slot"] == tgt)
-                # a token that differs where both have one: a slot that only ended sooner or later is not the bug
-                differs = not hit["identical"] and hit["first_diff"] < min(len(hit["batch"]), len(hit["solo"]))
-                entry["target"] = tgt
-                entry["target_differs"] = differs
-                print(f"  {s}: target slot {tgt} ({hit['request']}) "
-                      + ("DIFFERS (the scene tells the bug apart)" if differs else
-                         "does NOT differ in a token: this scene does not tell the bug apart"), flush=True)
-                if not differs:
-                    rc = max(rc, 2)
-            elif not all(r["identical"] for r in rows):
-                rc = max(rc, 2)
             results["scenes"][s] = entry
+            try:
+                if s == "S1":
+                    t1 = len(reqs["T1"]["ids"])
+                    n_a = len(got[A])
+                    entry["text_cells"] = [t1, t1 + n_a - 1]
+                    print(f"  S1: slot {A} wrote cells {t1}..{t1 + n_a - 1}; P1's admission reused "
+                          f"{adm[B]['reused']} of {adm[B]['prompt']} prompt tokens", flush=True)
+                    p1s = reqs["P1"]["ids"].index(IMAGE_PAD)
+                    if not (p1s < t1 and t1 + n_a - 1 < p1s + 32 * 32):
+                        raise NoVerdict(f"S1: slot {A}'s cells {t1}..{t1 + n_a - 1} are not inside P1's picture cells "
+                                         f"{p1s}..{p1s + 32 * 32 - 1}: the scene cannot tell the bug apart")
+                    if (adm[B]["reused"] or 0) > 0:
+                        print("  note: P1's admission did not read its whole prompt (a checkpoint): fewer chunks ran "
+                              "beside slot A's windows", flush=True)
+                if s == "S4":
+                    reused, t1 = adm[A]["reused"] or 0, len(reqs["T1"]["ids"])
+                    entry["continued_from_slot"] = reused > t1
+                    if reused <= t1:
+                        raise NoVerdict(f"S4: F's admission reused {reused} tokens, not more than T1's prompt ({t1}): "
+                                        f"it did not continue from slot {A}'s state")
+                    if not f_continued and not rows[0]["identical"]:
+                        raise NoVerdict("S4: slot differs, but the solo F was read from its prompt, not continued: "
+                                        "the difference can be read-vs-window K, not the position tables")
+                if a.expect_differ:
+                    tgt = targets[s]
+                    hit = next(r for r in rows if r["slot"] == tgt)
+                    # a token that differs where both have one: a slot that only ended sooner or later is not the bug
+                    differs = not hit["identical"] and hit["first_diff"] < min(len(hit["batch"]), len(hit["solo"]))
+                    entry["target"] = tgt
+                    entry["target_differs"] = differs
+                    print(f"  {s}: target slot {tgt} ({hit['request']}) "
+                          + ("DIFFERS (the scene tells the bug apart)" if differs else
+                             "does NOT differ in a token: this scene does not tell the bug apart"), flush=True)
+                    if not differs:
+                        rc = max(rc, 2)
+                elif not all(r["identical"] for r in rows):
+                    rc = max(rc, 2)
+            except NoVerdict as e:
+                print(f"  NO VERDICT: {e}", flush=True)
+                entry["no_verdict"] = str(e)
+                rc = max(rc, 1)
     except SetupError as e:
         print(f"SETUP FAILURE: {e}", flush=True)
         results["setup_error"] = str(e)
-        rc = 1
+        rc = max(rc, 1)
     finally:
         try:
             eng.send("QUIT")
