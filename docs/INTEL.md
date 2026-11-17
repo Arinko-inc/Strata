@@ -34,8 +34,8 @@ A SYCL engine can be a remote stage worker for a CUDA or HIP main process; see
 [REMOTE_STAGE.md](REMOTE_STAGE.md#intel-arc-as-a-worker-sycl-build) for the launch commands and requirements.
 It runs the last layers with `--serve --stage-worker PORT --stage-begin K --stream-experts`.
 Every expert of those layers must fit in VRAM. The main process keeps the head and MTP drafter.
-The SYCL build does not support a remote main process (`--remote-stage`), a relay worker
-(`--stage-end` / `--stage-next`) or images (`--vision`) on a worker.
+The SYCL build does not support a remote main process (`--remote-stage`) or a relay worker
+(`--stage-end` / `--stage-next`). A worker started with `--vision` takes the main process's image positions.
 
 Measured on **2026-10-13, engine 0.1.43.1**, with a CUDA main process:
 

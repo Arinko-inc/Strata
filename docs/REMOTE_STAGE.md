@@ -248,7 +248,8 @@ fastest link: on 1 GbE the relay's link was the limit.
 The engine built from `sycl/` can run the last layers as a worker:
 `--serve --stage-worker PORT --stage-begin K --stream-experts`. The main process uses the CUDA or HIP build with
 `--layer-split K --split-device 0 --remote-stage HOST:PORT`. K must be at least 2 and less than 48; the worker runs
-layers K to 47. SYCL does not run a remote main process, a relay worker or images.
+layers K to 47. SYCL does not run a remote main process or a relay worker. With `--vision` it takes the main
+process's image position table ([Images](#images---vision)).
 
 **All of the worker's experts must fit in VRAM.** Use a native pack, `--native SHARD1`, `--expert-profile` and
 `--stream-experts`, without `--mmap-experts`. The worker reads only its layers' experts from the GGUF into VRAM;
@@ -269,7 +270,6 @@ Unsupported options stop at start with exit code 2 and the prefix `strata genera
 |---|---|
 | `--remote-stage` | `--remote-stage (the main process) is not in the SYCL build: run the main process on the CUDA/HIP build, this build runs a --stage-worker` |
 | `--stage-end` / `--stage-next` on a worker | `a relay worker (--stage-end, --stage-next) is not in the SYCL build: this worker runs the last layers` |
-| `--vision` on a worker | `--vision: the SYCL worker takes no image position table (StageMsg::Positions) yet` |
 | No `--stream-experts`, or with `--mmap-experts` | `the SYCL worker reads its layers' experts from the GGUF into VRAM: it needs --stream-experts (and no --mmap-experts)` |
 | `--expert-cache-per-layer` on a worker | `--expert-cache-per-layer gives every layer slots: a SYCL worker's cache holds all of its own layers' experts and no other's` |
 | `--mtp` on a worker | `a --stage-worker does not take --mtp (the draft layer runs in the main process, with the head)` |
@@ -313,7 +313,8 @@ Start the server as usual. The main process keeps the head, MTP drafter, PLE and
 **The hello is the same as for CUDA/HIP workers.** It compares the protocol, model geometry, floats per hand-off
 row, pack fingerprint (`index.txt` and `native_experts.txt`, not the weights), K and K/V placement mode.
 Use the same model, `--kv` and `STRATA_STAGE_TOKEN` on both processes. The worker's `--prefill`, `--max-context`
-and `--spec` must be at least the main process's. A main process with `--vision` is refused in the hello too.
+and `--spec` must be at least the main process's. A main process with `--vision` needs the worker started with
+`--vision` too, as a CUDA/HIP worker does.
 Like a CUDA/HIP last worker, a SYCL worker lists every row format (`STRATA_REMOTE_ROWS` on the main process picks
 bf16), keeps its layers' part of the conversation checkpoints of a main process with `--prompt-cache`
 ([remote-stage/CHECKPOINTS.md](remote-stage/CHECKPOINTS.md)) and serves a main process with `--pipeline-windows 2`
@@ -400,11 +401,12 @@ the reference, give mean KL 0.0147 (about 0.015) and 94.5% argmax agreement for 
 
 Source for both setups: `strata-mesh/bench/2026-10-13-stage-a-m-loop/README.md`.
 **Not measured:** a HIP main process, a relay through a SYCL worker, images, or bf16 hand-off rows.
-The SYCL worker currently refuses relays and images; these measurements use fp32 rows.
+The SYCL worker refuses relays; these measurements use fp32 rows.
 
 ## Images (`--vision`)
 
-This needs CUDA/HIP workers. SYCL workers do not accept `--vision` or an image position table.
+CUDA, HIP and SYCL workers take it. A SYCL worker is checked alone, without a main process, with synthetic rows
+(below); a picture through a SYCL worker with its main process has not been run.
 
 Pictures work on a split as on one card ([DETAILS.md](DETAILS.md#images-vision)): the main PC's server config has its
 usual `"vision"` section, and the encoder (`strata-vision` and the mmproj file) runs on the main PC only. **Start
@@ -419,6 +421,20 @@ first text request after a picture sends "plain positions again" (no table); oth
 
 The hello checks it: a worker without `--vision` refuses a main process with it. A worker with `--vision` serves a
 main process without it.
+
+**The SYCL worker (2026-11-17, Arc Pro B70, orca Q4_K_S layers 30-47, the options of the trainsv mesh's last stage,
+on 127.0.0.1):** `sycl/src/net/stage_probe.cpp` stands in for the main process and sends synthetic rows (a
+2,600-token prompt in two chunks, a 4-row verify window, 32 decode windows and a batch window), with no table, the
+identity, two pictures in mtmd's layout, and tables that are the identity before a cell and offset after it. Without
+a table and with the identity, every reply was bit-identical to the worker built without the change (536d2b84) and
+to the same worker without `--vision`. With an offset from cell 2,048, the first chunk's rows stayed bit-identical
+and the second chunk's changed; with an offset from the window's first cell, the prompt stayed bit-identical and the
+window, the decode windows and the batch window changed, so each of these paths reads the table. The pictures' table
+gave the same hashes twice. A table longer than the worker's context was refused at the next reset, and after a
+disconnect the next main process's text was bit-identical to the identity's. Per kernel, `mrope_parity` (a ctest of
+the SYCL build) checks every rotation of the worker against the pair-by-pair definition. A decode window of 4 rows
+took 12.85 ms of the worker's time with `--vision` and 12.84 ms on 536d2b84 (32 windows each); a 2,048-token chunk
+541-553 ms on both.
 
 ## Options
 
@@ -777,7 +793,7 @@ python3 tools/stage_tune.py apply cluster.json OUTDIR    # start the workers as 
 | Huihui UD-Q4_K_XL (Unsloth UD layout), native pack read from its GGUF | **measured** (one, two and three PCs) |
 | Qwen3.8-Flash-Next IQ2_XS; OrcaRouter IQ3_XXS | **measured** with a B70 SYCL worker and a CUDA main process (2026-10-13): IQ2_XS on loopback, OrcaRouter on loopback and 2.5 GbE. See [the measured setups](#loopback-one-pc-measured-2026-10-13) |
 | Other quantizations and models of the family (the official IQ3_S, IQ3_XXS, Coder, Swift 1.5, UD-IQ4_XS) | not tested. The hand-off is fp32 rows whatever the quantization, the arena range is cut by layer from the pack's expert table and the shipper works by tensor name |
-| Images (`--vision` on the main PC and every worker) | **measured** on two PCs (RVN IQ3_S, the encoder on the main PC's CPU); through a relay worker not run |
+| Images (`--vision` on the main PC and every worker) | **measured** on two PCs (RVN IQ3_S, the encoder on the main PC's CPU); through a relay worker not run. A SYCL worker: checked alone with synthetic rows (2026-11-17, [Images](#images---vision)); with its main process not run |
 | A pack with `experts.bin`, or `--shared-expert-arena` | refused at start (the layer range needs the GGUF loader) |
 | Linux, NVIDIA (CUDA 13.0) | measured: Ubuntu 24.04 in an LXC container (main), a Linux host with kernel 6.14 (worker) |
 | Windows 11 native, NVIDIA (MSVC 2022, CUDA 13.0) | measured as a worker (and its node agent); as the main PC not tested |

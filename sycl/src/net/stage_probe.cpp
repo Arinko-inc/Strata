@@ -166,6 +166,7 @@ struct Probe {
         StageHello peer;
         if (!link.connect(addr, mine, peer, err, 60)) return false;
         g.peer.max_context = peer.max_context;
+        g.peer.vision = peer.vision;
         return true;
     }
 
@@ -334,8 +335,8 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "stage_probe: %s\n", err.c_str());
         return 1;
     }
-    std::printf("stage_probe: connected (vision %d, batch slots %d, the worker's context %lld)\n", pr.vision ? 1 : 0,
-                pr.batch ? 1 : 0, (long long) pr.g.peer.max_context);
+    std::printf("stage_probe: connected (vision %d, batch slots %d; the worker's vision %d, context %lld)\n",
+                pr.vision ? 1 : 0, pr.batch ? 1 : 0, pr.g.peer.vision, (long long) pr.g.peer.max_context);
 
     // the inputs: a picture of 32 x 24 at cell 1000 and one of 6 x 3 that ends two cells before N, so the verify
     // window [N - 4, N) holds two picture cells and two text cells
@@ -369,6 +370,11 @@ int main(int argc, char** argv) {
     if (!none.ok) return 1;
     std::printf("  the prompt's rows [N-4, N) against the window's: %s\n", diff(none.full_tail, none.win_r).c_str());
     if (pr.batch) std::printf("  the window's rows against the batch window's: %s\n", diff(none.win_r, none.slot_r).c_str());
+    if (!pr.vision && pr.g.peer.vision != 0) {
+        std::printf("stage_probe: the worker has --vision (a main process without it sends no Positions)\n");
+        std::printf("stage_probe: %s (%d failed)\n", g_bad == 0 ? "PASS" : "FAIL", g_bad);
+        return g_bad == 0 ? 0 : 1;
+    }
     if (!pr.vision) {
         // a worker without --vision takes no Positions: the next reply says so
         std::string e;
