@@ -31,6 +31,7 @@ CONNECT_S = 10
 out_lock = threading.Lock()
 pending: queue.Queue = queue.Queue()        # (image, output) of the ENC lines sent and not answered yet
 quitting = threading.Event()
+answered = threading.Semaphore(0)           # one release per answer to an ENC: the next ENC waits for it
 
 
 def say(text: str) -> None:
@@ -113,19 +114,25 @@ def read_frames(rfile, ready: list) -> None:
                 write_atomic(out, data)
             except OSError as e:
                 say(f"ERR cannot write {out} ({e})")
+                answered.release()
                 continue
             say(reply)
+            answered.release()
             continue
+        answer = False
         if ready[0] and (text.startswith("OK") or text.startswith("ERR")):
             try:
                 img, out = pending.get_nowait()
                 # the far side's file names, said as this side's (an ERR names the picture)
                 text = text.replace(" in.img", " " + img).replace(" out.sve", " " + out)
+                answer = True
             except queue.Empty:
                 pass
         if text.startswith("READY"):
             ready[0] = True
         say(text)
+        if answer:
+            answered.release()
 
 
 def main(argv: list) -> int:
@@ -187,6 +194,9 @@ def main(argv: list) -> int:
         pending.put((img, out))
         if not send(f"ENC {len(data)}\n".encode() + data):
             die(1)
+        # one picture at a time, as the server sends them: the far side reads ahead only a little, and a client that
+        # piled pictures into it would also keep it from seeing this side leave while its encoder hangs
+        answered.acquire()
     quitting.set()
     send(b"QUIT\n")
     # the far side closes the connection when its strata-vision has ended; from_far_side then exits with 0

@@ -40,6 +40,7 @@ import time
 PROTOCOL = 1
 MAX_IMAGE = 256 << 20          # a picture the server normalized is far smaller; this only stops a garbage length
 QUIT_WAIT_S = 10
+QUEUED = 2                     # requests read ahead of the encoder (remote_reader sends one ENC at a time)
 
 # the reader's flags that take a value and are passed through (the paths are replaced)
 VALUE_FLAGS = {"--threads", "--max-tokens", "--min-tokens", "--flash-attn"}
@@ -108,6 +109,8 @@ class Session(socketserver.StreamRequestHandler):
             return
         work = None
         proc = None
+        reader = None
+        closing = threading.Event()
         try:
             hello = self.rfile.readline().decode("utf-8", "replace").split(" ", 2)
             if len(hello) != 3 or hello[0] != "HELLO" or hello[1] != str(PROTOCOL):
@@ -127,27 +130,48 @@ class Session(socketserver.StreamRequestHandler):
                 self.send_line(f"ERR the remote picture reader could not start strata-vision on {socket.gethostname()} ({e})")
                 return
             threading.Thread(target=self.pump_stderr, args=(proc,), daemon=True).start()
-            requests: queue.Queue = queue.Queue()
-            threading.Thread(target=self.read_relay, args=(proc, requests, peer), daemon=True).start()
+            # at most QUEUED pictures read ahead: a client that sends more without waiting is held back by TCP
+            requests: queue.Queue = queue.Queue(maxsize=QUEUED)
+            reader = threading.Thread(target=self.read_relay, args=(proc, requests, closing, peer), daemon=True)
+            reader.start()
             if not self.until_ready(proc):
                 return
             self.serve_lines(proc, requests, work, peer)
         except (OSError, ValueError) as e:       # the relay went away, or a bad HELLO
             log(f"{peer}: {e}")
         finally:
+            closing.set()
             if proc is not None:
                 self.stop(proc)
                 log(f"{peer}: strata-vision ended ({proc.returncode})")
+            # the reader thread is blocked reading the socket: shutting it down ends that read (and tells the relay),
+            # so finish() can close the socket's files instead of waiting on the reader's lock for good
+            try:
+                self.request.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            if reader is not None:
+                reader.join(timeout=5)
             if work:
                 shutil.rmtree(work, ignore_errors=True)
             sem.release()
 
-    def read_relay(self, proc, requests: queue.Queue, peer: str) -> None:
+    def read_relay(self, proc, requests: queue.Queue, closing: threading.Event, peer: str) -> None:
         """The relay's messages, read here and queued for the session thread, so the socket is watched even while the
         session waits on strata-vision (a start or an encode that hangs).  When the relay goes away (or breaks the
         protocol) without QUIT, strata-vision is killed: the session's read of its stdout then ends, the session
         closes and its slot comes back.  A relay host that vanished without a word is found by keepalive."""
         quit_sent = False
+
+        def put(item) -> bool:
+            while not closing.is_set():
+                try:
+                    requests.put(item, timeout=0.5)
+                    return True
+                except queue.Full:
+                    continue
+            return False
+
         try:
             while True:
                 line = self.rfile.readline()
@@ -156,10 +180,11 @@ class Session(socketserver.StreamRequestHandler):
                 text = line.decode("utf-8", "replace").rstrip("\r\n")
                 if text == "QUIT":
                     quit_sent = True
-                    requests.put(("QUIT", None))
+                    put(("QUIT", None))
                     return
                 if not text.startswith("ENC "):
-                    requests.put(("LINE", text))
+                    if not put(("LINE", text)):
+                        return
                     continue
                 size = int(text[4:])
                 if not 0 <= size <= MAX_IMAGE:
@@ -167,12 +192,13 @@ class Session(socketserver.StreamRequestHandler):
                 data = self.rfile.read(size)
                 if len(data) != size:
                     break
-                requests.put(("ENC", data))
+                if not put(("ENC", data)):
+                    return
         except (OSError, ValueError) as e:
             log(f"{peer}: {e}")
         finally:
-            if not quit_sent:
-                requests.put(("EOF", None))
+            if not quit_sent and not closing.is_set():
+                put(("EOF", None))
                 if proc.poll() is None:
                     log(f"{peer}: the relay went away; ending strata-vision")
                     try:
