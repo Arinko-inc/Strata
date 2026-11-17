@@ -580,6 +580,14 @@ counter-based draw (Philox(seed, position)).
   one slot per group ([above](#mtp-drafts-in-the-pipelined-groups-strata_piped_mtp-opt-in)), and has not been run
   with helper expert caches.
 - Repetition / frequency / presence penalties are not applied in batch windows.
+- Pictures (`--vision`): every process keeps one position table region per slot beside the main session's, and a
+  slot's windows rotate by its own region (copied from the main session's when a request enters the slot). Before
+  that, one table per card was shared, so a picture request and a text request decoding in slots at the same time
+  rotated by each other's positions; this fixes one card as well as a remote stage. The cost is 12 bytes a cell per
+  slot (12.0 MiB for 4 slots at a 262,144-token context), taken from the expert cache. A `--batch-mtp` draft still
+  reads the main session's region (the model checks the drafts, so the output is the same; a picture slot accepts
+  fewer drafts). `tools/batch_vision_test.py` compares each slot with the same request alone
+  ([REMOTE_STAGE.md](REMOTE_STAGE.md#images---vision)); not run on GPUs yet.
 - A prompt shorter than one chunk is read in one piece (the slots wait for it); a read gives way only at a chunk
   boundary, and not for pictures.
 - Admissions are one at a time: two new long prompts are read one after the other.
@@ -589,8 +597,8 @@ counter-based draw (Philox(seed, position)).
 - Over a remote stage ([REMOTE_STAGE.md](REMOTE_STAGE.md#what-is-turned-off-or-refused)) every PC needs `--batch N`,
   the slots used are the fewest any stage carved, the groups are one unless `--batch-groups G` is given (then the
   groups' windows are pipelined over the link, and a relay overlaps them; the windows carry the busy slots only, so a
-  pipelined slot stays a conversation cache and the main process says `INFO batch_pad=0`), and `--vision` is refused
-  with `--batch`. One group was run on GPUs on 2026-11-07 over three stages (RTX 5070 Ti main -> RX 7900 XT relay ->
+  pipelined slot stays a conversation cache and the main process says `INFO batch_pad=0`), and `--vision` with
+  `--batch` needs every stage to keep a position table per slot (the hello's bit 2; else the slots are off). One group was run on GPUs on 2026-11-07 over three stages (RTX 5070 Ti main -> RX 7900 XT relay ->
   Arc B70, `--batch 4`): the batch windows matched the solo path (`batch_test` with 2 and 4 slots,
   `batch_interleave_test` 10/10), and `http_check` and `serve_load` passed. The pipelined groups (`--batch-groups 2`
   and up) are built and covered over loopback only, not yet run on GPUs.
@@ -684,6 +692,7 @@ tests the server's side with a scripted engine (no GPU).
 | --- | --- |
 | `tools/batch_test.py` | the same prompts alone (`GEN`) and together in the batch slots (`BGEN`): every slot's greedy tokens equal its solo tokens; prints the aggregate rate. `--batch-groups` in `--extra` tests the pipeline, `--keys "temperature=0.7"` the sampled rows. |
 | `tools/batch_interleave_test.py` | a long prompt read while two slots decode, a prompt that gives way (`BYIELD`) and goes on, and a next turn continued from its slot: each equal to its solo tokens. On a two-stage layer split with pipelined groups add `--batch 4 --batch-groups 2` to `--extra` (its 3 slots do not divide into two groups) and set `STRATA_PIPED_READ_PIECE`; run it without a conversation cache, or step 4 restores the prompt instead of reading it. |
+| `tools/batch_vision_test.py` | requests with synthetic pictures (SVE1 embeddings, no encoder) in slots beside text requests: a picture admitted while a text slot decodes, the text slot's next turn, a text admitted while a picture slot decodes, two pictures and two texts in four slots; every slot equal to its solo tokens. `--expect-differ` with `STRATA_SLOT_POSITIONS=0` on every process: the target slots must differ (the scenes tell one table per card from one per slot). |
 | `tools/parking_test.py` | a follow-up to a conversation decodes the same tokens whether its state stayed live or came back from the parking cache (with a layer split: every stage's image). |
 | `tools/early_close_test.py` | a client that stops reading a streamed answer early (alone, and with a second request running) does not leave its tokens to the next request (server). |
 

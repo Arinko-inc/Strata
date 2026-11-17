@@ -422,6 +422,33 @@ first text request after a picture sends "plain positions again" (no table); oth
 The hello checks it: a worker without `--vision` refuses a main process with it. A worker with `--vision` serves a
 main process without it.
 
+**Pictures in batch slots** (`--vision` with `--batch N`, the server's `"parallel": N`; strata-mesh
+IMPL-PLAN-remote-batch-vision.md): every process keeps its position table in N + 1 regions - the main session's and
+one per slot, each `max_context + 64` cells rounded up to a multiple of 4. A slot's windows rotate by its own region,
+so a picture request decoding in one slot and text requests in the others do not rotate by each other's positions.
+When a request enters a slot (SlotSave on a worker), its process copies the main session's table into the slot's
+region on the device; nothing more crosses the link, and SlotRun is unchanged (protocol 8). A slot read back into the
+main session copies no table (only a text conversation is read back; a picture's slot is never a conversation
+cache).
+- Start **every** process with `--vision` and the same `--batch N`. The table costs 12 bytes a cell per region: with
+  4 slots and a 262,144-token context, 15.0 MiB a device instead of 3.0 MiB (12.0 MiB more). It is allocated before
+  the expert cache, so the cache is about 12 MiB smaller.
+- The hello says it: `batch_flags` bit 2 (`kStageBatchSlotPositions`). A relay sets it only when its next worker has
+  it. A main process with `--vision` and `--batch` whose worker lacks it runs without slots (its log says why);
+  a link made again to such a worker is refused.
+- Without `--vision` nothing changes (no table, no copy, the same bytes on the link), so a new build without
+  `--vision` can be mixed with an older one.
+- `STRATA_SLOT_POSITIONS=0` (a test switch, on every process) keeps one table per device as before: a picture in a
+  slot then rotates other slots' rows wrong. `tools/batch_vision_test.py --expect-differ` uses it to show that its
+  scenes tell the two apart.
+- The same change fixes one card with `--batch` and `--vision` (one table per card before it), except a
+  `--batch-mtp` draft, which still reads the main session's region (the drafts are checked by the model, so the
+  output does not change; the acceptance of a picture slot's drafts can drop).
+- Checked: `tools/batch_vision_test.py` compares every slot's greedy tokens with the same request alone - a picture
+  admitted beside a decoding text slot (its picture near the prompt's start, its read in two chunks), the text slot's
+  next turn from its slot, a text admitted beside a decoding picture slot, and two pictures with two texts in four
+  slots. On GPUs over three stages: not run yet.
+
 **The SYCL worker (2026-11-17, Arc Pro B70, orca Q4_K_S layers 30-47, the options of the trainsv mesh's last stage,
 on 127.0.0.1):** `sycl/src/net/stage_probe.cpp` stands in for the main process and sends synthetic rows (a
 2,600-token prompt in two chunks, a 4-row verify window, 32 decode windows and a batch window of the same 4 rows on
@@ -723,8 +750,10 @@ python3 tools/stage_tune.py apply cluster.json OUTDIR    # start the workers as 
   the slots' VRAM comes out of the cache), and the main process uses the fewest slots any stage has (it says so in its
   log and in a second `INFO batch_slots=` line). A worker without `--batch` answers every slot message with an error
   naming `--batch`. Every PC needs the same build (protocol 8: an older worker is refused for its protocol). With a
-  remote stage, `--vision` and `--batch` together are refused, `--batch-mtp` is turned off (as on a layer split with
-  two stages on one GPU) and so is `--pipeline-windows` (as with any `--batch`).
+  remote stage, `--batch-mtp` is turned off (as on a layer split with two stages on one GPU) and so is
+  `--pipeline-windows` (as with any `--batch`). `--vision` works with the slots when every stage keeps a position
+  table per slot ([Images](#images---vision)); a worker whose hello lacks that bit turns the slots off at the start
+  (one request at a time) and is refused when the link is made again.
   The slots run as **one group** by default (one window over every busy slot, the main process waiting for its
   reply). `--batch-groups G` on the main process (G >= 2 dividing the slots agreed; `auto`: 2 for an even count)
   pipelines G groups over the link: when a group's window is through the main process's layers it goes out, and the
@@ -796,6 +825,7 @@ python3 tools/stage_tune.py apply cluster.json OUTDIR    # start the workers as 
 | Qwen3.8-Flash-Next IQ2_XS; OrcaRouter IQ3_XXS | **measured** with a B70 SYCL worker and a CUDA main process (2026-10-13): IQ2_XS on loopback, OrcaRouter on loopback and 2.5 GbE. See [the measured setups](#loopback-one-pc-measured-2026-10-13) |
 | Other quantizations and models of the family (the official IQ3_S, IQ3_XXS, Coder, Swift 1.5, UD-IQ4_XS) | not tested. The hand-off is fp32 rows whatever the quantization, the arena range is cut by layer from the pack's expert table and the shipper works by tensor name |
 | Images (`--vision` on the main PC and every worker) | **measured** on two PCs (RVN IQ3_S, the encoder on the main PC's CPU); through a relay worker not run. A SYCL worker: checked alone with synthetic rows (2026-11-17, [Images](#images---vision)); with its main process not run |
+| Images in batch slots (`--vision` with `--batch`) | the hello's bit 2 over loopback (`stage_link_batch_test`); on GPUs not run yet (`tools/batch_vision_test.py`) |
 | A pack with `experts.bin`, or `--shared-expert-arena` | refused at start (the layer range needs the GGUF loader) |
 | Linux, NVIDIA (CUDA 13.0) | measured: Ubuntu 24.04 in an LXC container (main), a Linux host with kernel 6.14 (worker) |
 | Windows 11 native, NVIDIA (MSVC 2022, CUDA 13.0) | measured as a worker (and its node agent); as the main PC not tested |
@@ -818,6 +848,7 @@ python3 tools/stage_tune.py apply cluster.json OUTDIR    # start the workers as 
 | a worker restarted right after a stop fails (little VRAM free) | the previous worker is still unpinning (more than 30 s with ~30 GB of experts); wait until its process is gone |
 | `remote stage: the worker refused: wrong token (STRATA_STAGE_TOKEN)` | the same `STRATA_STAGE_TOKEN` on every PC |
 | `the main process reads images (--vision): start this worker with --vision too` | add `--vision` to every worker's command, a relay's next worker's too ([Images](#images---vision)) |
+| `--vision with --batch needs every stage to keep a position table per batch slot` (the main process runs one request at a time) | every PC needs a build with a position table per slot, `--vision` and `--batch N`; a relay needs its next worker to have them too ([Images](#images---vision)) |
 | `remote stage: the two sides differ (protocol ..., first remote layer ..., K/V type ..., model pack ...)` | the same build of the engine on every PC, the same pack, the same `--kv`, and `--stage-begin` = the previous stage's K |
 | `the main process reads prompts in chunks of N tokens, this worker's chunk is M` | the worker's `--prefill` must be at least the main process's chunk |
 | `this worker lends the prompt path buffers for M tokens, the main process sends chunks of N` at a long prompt | the worker's cache can lend the buffers neither for the main process's chunk nor for its own `--prefill` (0.1.43.1 halves such a loan); start the main process with `--prefill M`. When only the main process's chunk cannot be lent whole (a smaller chunk can need more slots; a multi-GPU worker reads short requests in its `STRATA_SPLIT_SMALL_OWN` chunks), the worker says at the hello `its prompts lend for this worker's own chunk (M)` and needs nothing |
