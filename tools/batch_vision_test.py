@@ -225,6 +225,10 @@ def main():
                     help="the negative control: the scenes' target slots must differ (run with STRATA_SLOT_POSITIONS=0)")
     ap.add_argument("--no-slot-positions", action="store_true",
                     help="STRATA_SLOT_POSITIONS=0 for this engine (the workers need it too: stages.sh --no-slot-positions)")
+    ap.add_argument("--solo-image-ckpt0", action="store_true",
+                    help="the pictures' solo records with ckpt=0 (before 2026-11-17).  Their read then does not split "
+                         "at the last turn as an admission's does, and on the 3-stage GPUs the last turn's tokens round "
+                         "differently: both pictures differed from their slots at token 27 with correct tables")
     ap.add_argument("--keep-parking", action="store_true",
                     help="do not add --conversation-cache-mib 0 (a parked conversation could serve S4 instead of its slot)")
     ap.add_argument("--mt-min", default="1", help="STRATA_IQ_MT_MIN for the engine (1: exact; empty: the default)")
@@ -304,7 +308,7 @@ def main():
     }
     targets = {"S1": A, "S2": A, "S3": 0}
     if a.dry_run:
-        print("  solo records first (S4's F right after T1, before any slot holds T1; every record but T1's with ckpt=0)")
+        print("  solo records first (S4's F right after T1, before any slot holds T1; every record but T1's and the pictures' with ckpt=0)")
         for s in scenes:
             print(f"  {s}: " + " -> ".join(f"{'BGENI' if n.startswith('P') else 'BGEN'} {sl} {n}"
                                          f"{' ' + ' '.join(k) if k else ''}" for sl, n, k in plan[s])
@@ -346,8 +350,13 @@ def main():
         f_continued = True
         need = sorted({n for s in scenes for _, n, _ in plan[s] if n != "F"}, key=lambda n: (n != "T1", n))
         for name in need:
-            # T1 keeps its checkpoints (F continues from it); every other record keeps none (ckpt=0)
-            ref[name], _ = solo(eng, out, reqs[name], () if name == "T1" else ("ckpt=0",))
+            # T1 keeps its checkpoints (F continues from it).  So do the pictures: an admission cannot take ckpt=0, so
+            # its read splits at the last turn boundary (a checkpoint there, then the turn's last tokens), and a solo
+            # read in one piece rounds those tokens differently (seen on CUDA + HIP + SYCL, 2026-11-17: P1 and P2
+            # differed at token 27 with a table per slot; with the same split every slot is identical).  The texts'
+            # prompts are short reads either way.  Every other record keeps none (ckpt=0)
+            keep = name == "T1" or (name.startswith("P") and not a.solo_image_ckpt0)
+            ref[name], _ = solo(eng, out, reqs[name], () if keep else ("ckpt=0",))
             if name == "T1" and "S4" in scenes:
                 # F: T1, its answer, a next turn - decoded alone right after T1 (it continues T1's live state).
                 # ckpt=0: it leaves no checkpoint deeper than slot A will hold, so S4 can only continue from the slot
