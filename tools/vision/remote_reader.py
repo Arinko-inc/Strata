@@ -71,15 +71,27 @@ def write_atomic(path: str, data: bytes) -> None:
 
 
 def from_far_side(rfile, where: str) -> None:
-    """The far side's messages, until it closes the connection."""
-    ready = False
+    """The far side's messages, until it closes the connection; then this reader ends (status 1 unless QUIT was sent).
+    A connection reset in the middle of a frame (an SVE's body or its OK line) ends it the same way: the exception
+    must not end only this thread, or the main thread would wait on stdin and the server for its encode timeout."""
+    ready = [False]
+    try:
+        read_frames(rfile, ready)
+    except (OSError, ValueError) as e:
+        note(f"remote_reader: reading from the picture reader at {where} failed ({e})")
+    if quitting.is_set():
+        die(0)
+    if ready[0]:
+        note(f"remote_reader: the connection to the picture reader at {where} was lost")
+    die(1)
+
+
+def read_frames(rfile, ready: list) -> None:
+    """Relays the far side's lines and files until the connection ends (returns) or breaks (raises)."""
     while True:
-        try:
-            line = rfile.readline()
-        except OSError:
-            line = b""
+        line = rfile.readline()
         if not line:
-            break
+            return
         text = line.decode("utf-8", "replace").rstrip("\r\n")
         if text.startswith("LOG "):
             note(text[4:])
@@ -88,10 +100,10 @@ def from_far_side(rfile, where: str) -> None:
             size = int(text[4:])
             data = rfile.read(size)
             if len(data) != size:
-                break
+                return
             reply = rfile.readline().decode("utf-8", "replace").rstrip("\r\n")
             if not reply:
-                break
+                return
             try:
                 _, out = pending.get_nowait()
             except queue.Empty:
@@ -104,7 +116,7 @@ def from_far_side(rfile, where: str) -> None:
                 continue
             say(reply)
             continue
-        if ready and (text.startswith("OK") or text.startswith("ERR")):
+        if ready[0] and (text.startswith("OK") or text.startswith("ERR")):
             try:
                 img, out = pending.get_nowait()
                 # the far side's file names, said as this side's (an ERR names the picture)
@@ -112,13 +124,8 @@ def from_far_side(rfile, where: str) -> None:
             except queue.Empty:
                 pass
         if text.startswith("READY"):
-            ready = True
+            ready[0] = True
         say(text)
-    if quitting.is_set():
-        die(0)
-    if ready:
-        note(f"remote_reader: the connection to the picture reader at {where} was lost")
-    die(1)
 
 
 def main(argv: list) -> int:

@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import queue
 import shutil
 import socket
 import socketserver
@@ -126,9 +127,11 @@ class Session(socketserver.StreamRequestHandler):
                 self.send_line(f"ERR the remote picture reader could not start strata-vision on {socket.gethostname()} ({e})")
                 return
             threading.Thread(target=self.pump_stderr, args=(proc,), daemon=True).start()
+            requests: queue.Queue = queue.Queue()
+            threading.Thread(target=self.read_relay, args=(proc, requests, peer), daemon=True).start()
             if not self.until_ready(proc):
                 return
-            self.serve_lines(proc, work, peer)
+            self.serve_lines(proc, requests, work, peer)
         except (OSError, ValueError) as e:       # the relay went away, or a bad HELLO
             log(f"{peer}: {e}")
         finally:
@@ -138,6 +141,44 @@ class Session(socketserver.StreamRequestHandler):
             if work:
                 shutil.rmtree(work, ignore_errors=True)
             sem.release()
+
+    def read_relay(self, proc, requests: queue.Queue, peer: str) -> None:
+        """The relay's messages, read here and queued for the session thread, so the socket is watched even while the
+        session waits on strata-vision (a start or an encode that hangs).  When the relay goes away (or breaks the
+        protocol) without QUIT, strata-vision is killed: the session's read of its stdout then ends, the session
+        closes and its slot comes back.  A relay host that vanished without a word is found by keepalive."""
+        quit_sent = False
+        try:
+            while True:
+                line = self.rfile.readline()
+                if not line:
+                    break
+                text = line.decode("utf-8", "replace").rstrip("\r\n")
+                if text == "QUIT":
+                    quit_sent = True
+                    requests.put(("QUIT", None))
+                    return
+                if not text.startswith("ENC "):
+                    requests.put(("LINE", text))
+                    continue
+                size = int(text[4:])
+                if not 0 <= size <= MAX_IMAGE:
+                    raise ValueError(f"an image of {size} bytes")
+                data = self.rfile.read(size)
+                if len(data) != size:
+                    break
+                requests.put(("ENC", data))
+        except (OSError, ValueError) as e:
+            log(f"{peer}: {e}")
+        finally:
+            if not quit_sent:
+                requests.put(("EOF", None))
+                if proc.poll() is None:
+                    log(f"{peer}: the relay went away; ending strata-vision")
+                    try:
+                        proc.kill()
+                    except OSError:
+                        pass
 
     def pump_stderr(self, proc):
         for raw in iter(proc.stderr.readline, b""):
@@ -159,24 +200,15 @@ class Session(socketserver.StreamRequestHandler):
             if text.startswith("READY"):
                 return True
 
-    def serve_lines(self, proc, work: str, peer: str) -> None:
+    def serve_lines(self, proc, requests: queue.Queue, work: str, peer: str) -> None:
         img, out = os.path.join(work, "in.img"), os.path.join(work, "out.sve")
         while True:
-            line = self.rfile.readline()
-            if not line:                                   # the relay went away
+            kind, data = requests.get()
+            if kind in ("EOF", "QUIT"):                    # the relay went away, or is done
                 return
-            text = line.decode("utf-8", "replace").rstrip("\r\n")
-            if text == "QUIT":
-                return
-            if not text.startswith("ENC "):
+            if kind != "ENC":
                 self.send_line("ERR expected: ENC <image> <output>")
                 continue
-            size = int(text[4:])
-            if not 0 <= size <= MAX_IMAGE:
-                raise ValueError(f"an image of {size} bytes")
-            data = self.rfile.read(size)
-            if len(data) != size:
-                return
             t0 = time.monotonic()
             with open(img, "wb") as f:
                 f.write(data)
