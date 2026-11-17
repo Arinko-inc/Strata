@@ -2236,8 +2236,6 @@ int main(int argc, char **argv) try {
             why = "it does not carry --control-vector (or a speed projection) to the worker's layers";
         else if (o.expert_cache_remote[0] > 0 || o.expert_cache_remote[1] > 0 || o.expert_cache_remote[2] > 0)
             why = "it does not support --expert-cache-remote";
-        else if (o.vision)
-            why = "--vision: the SYCL worker takes no image position table (StageMsg::Positions) yet";
         else if (!o.stream_experts || o.mmap_experts)
             why = "the SYCL worker reads its layers' experts from the GGUF into VRAM: it needs --stream-experts (and no "
                   "--mmap-experts)";
@@ -9145,8 +9143,9 @@ int main(int argc, char **argv) try {
         };
         // remote-stage worker (PR #1748's, ported to the SYCL build): serve the main process (the CUDA/HIP build's
         // --remote-stage) instead of stdin.  A prompt starts with a reset; windows, commits and chunks arrive in order,
-        // each whole, and run here one at a time.  Not ported: the relay (--stage-end, --stage-next), the image
-        // position table (--vision) and the adaptive tier (every expert of this worker's layers is in VRAM).
+        // each whole, and run here one at a time.  Not ported: the relay (--stage-end, --stage-next) and the adaptive
+        // tier (every expert of this worker's layers is in VRAM).  --vision takes the main process's image position
+        // table (StageMsg::Positions).
         if (stage_worker) {
             const int64_t HBF = strata::core::Verifier::handoff_floats(g);
             const int64_t D = g.hc * g.n_embd;
@@ -9163,7 +9162,7 @@ int main(int argc, char **argv) try {
             me.chunk = sp.chunk();
             me.handoff_floats = HBF;
             me.tail_skip = 0;   // no STRATA_ROUTE_TAIL_SKIP in the SYCL build (the hello takes the main process's)
-            me.vision = 0;
+            me.vision = o.vision ? 1 : 0;   // images: the worker's layers need the position table (StageMsg::Positions)
             // conversation checkpoints (docs/remote-stage/CHECKPOINTS.md): a worker's own hello carries its limit
             me.ckpt_max = strata::net::kStageCkptMax;
             // protocol 8: the slot sessions this worker carved at its start (--batch; 0: none)
@@ -9255,9 +9254,9 @@ int main(int argc, char **argv) try {
                         std::to_string(theirs.chunk) + ")";
                     return false;
                 }
-                if (theirs.vision != 0) {
-                    e = "the main process reads images (--vision): the SYCL worker takes no image position table yet "
-                        "(start the main process without --vision, or use a CUDA/HIP worker)";
+                if (theirs.vision != 0 && !o.vision) {
+                    e = "the main process reads images (--vision): start this worker with --vision too (its "
+                        "layers rotate by the images' positions)";
                     return false;
                 }
                 if (theirs.max_context > o.max_context || theirs.max_t > me.max_t) {
@@ -9479,10 +9478,49 @@ int main(int argc, char **argv) try {
                 ckpt_store.prune(keep);
                 return true;
             };
+            // --vision: the main process's position table for its next request (as the CUDA worker's wk_positions_set).
+            // A picture's cells rotate by their (t, h, w) and every cell after it by the picture's extent, not its
+            // token count, so this worker's rope kernels need the same table the main process built (d_mrope, set
+            // before any graph was recorded: only its contents change).  Cells past the table sent continue from its
+            // last one.  The table outlives a connection: the next main process starts from the identity and sends
+            // nothing for text, so a picture's table goes back to the identity when its main process goes away.  The
+            // SYCL worker is the last stage: there is no next worker to pass the table on to.
+            bool wk_mrope_identity = true;
+            auto wk_positions_set = [&](const int32_t* table, int64_t cells_in, std::string& e) -> bool {
+                // no kernel of an earlier request may still read the table
+                if (!ver.wait_commit(e) || !device_sync("before the image positions", e)) return false;
+                wk_mrope_identity = false;   // (until the upload has landed)
+                strata::net::stage_positions_fill(mrope_host.data(), (int64_t) mrope_host.size() / 3, table, cells_in);
+                try {
+                    dpct::get_in_order_queue()
+                        .memcpy(d_mrope, mrope_host.data(), mrope_host.size() * sizeof(int32_t))
+                        .wait();
+                } catch (const sycl::exception& x) {
+                    e = std::string("stage worker: the image position upload failed: ") + x.what();
+                    return false;
+                }
+                wk_mrope_identity = table == nullptr;
+                return true;
+            };
+            if (o.vision)
+                hs.positions = [&](const int32_t* table, int64_t cells_in, std::string& e) -> bool {
+                    const WkBusy busy("stage worker positions");
+                    const int64_t cells = (int64_t) mrope_host.size() / 3;
+                    if (table != nullptr && cells_in > cells) {
+                        e = "the main process's position table (" + std::to_string(cells_in) +
+                            " cells) is longer than this worker's context";
+                        return false;
+                    }
+                    return wk_positions_set(table, cells_in, e);
+                };
             hs.disconnected = [&] {
                 std::string e;
                 ckpt_store.clear();   // a new main process is a new id space
                 (void) ver.wait_commit(e);
+                // a picture's positions do not reach the next main process's text
+                if (o.vision && !wk_mrope_identity && !wk_positions_set(nullptr, 0, e))
+                    std::fprintf(stderr, "strata stage worker: the image positions did not go back to the identity: "
+                                         "%s\n", e.c_str());
             };
             // ==== REMOTE-BATCH WORKER (C) ====  protocol 8's batch slots on this worker: strata-mesh
             // IMPL-PLAN-remote-batch.md sections 3 and 6.  Only with --batch (the slot sessions carved at the start,
