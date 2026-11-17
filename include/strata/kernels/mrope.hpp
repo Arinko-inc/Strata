@@ -25,6 +25,9 @@ namespace strata::kernels {
 
 /// The table of the CURRENT device (a layer split sets one per device; null = the identity).
 void mrope_table_set(const int32_t* device_table);
+/// remote-batch-vision (IMPL-PLAN-remote-batch-vision.md 4.1): with --vision and --batch N the device table holds
+/// 1 + N regions (the main session's, then one per slot) `mrope_slot_stride(cells)` cells apart.
+inline int64_t mrope_slot_stride(int64_t cells) { return (cells + 3) / 4 * 4; }
 const int32_t* mrope_table();
 
 /// #280, opt-in (STRATA_ROPE_TABLE=1): the rotation angles, 32 pairs of a 64-wide rotary slice, from the session's

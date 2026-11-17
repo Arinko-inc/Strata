@@ -53,6 +53,10 @@ inline constexpr int64_t kStageSlotKeepAll = 1;
 /// bit 1 (stage 2, informational), this side starts the next SlotRun while an earlier one is with its next worker
 inline constexpr uint32_t kStageBatchKeepAll = 1u << 0;
 inline constexpr uint32_t kStageBatchOverlap = 1u << 1;
+/// remote-batch-vision (strata-mesh IMPL-PLAN-remote-batch-vision.md 4.6): this side keeps an image position table per
+/// batch slot: a SlotSave copies the session's position table into the slot's with its state, and the slot's windows
+/// rotate by it (--vision with --batch; a relay sets it only when its next worker has it)
+inline constexpr uint32_t kStageBatchSlotPositions = 1u << 2;
 
 // (rows[n * w]: n rows of w floats in the link's row format, StageRows)
 enum class StageMsg : uint32_t {
@@ -124,7 +128,7 @@ struct StageHello {
     /// answers; 0: none).  No side refuses for it: the link uses the fewer of the two hellos' (strata-mesh
     /// IMPL-PLAN-remote-batch.md section 3.7)
     int32_t batch_slots = 0;
-    uint32_t batch_flags = 0;     ///< kStageBatchKeepAll / kStageBatchOverlap
+    uint32_t batch_flags = 0;     ///< kStageBatchKeepAll / kStageBatchOverlap / kStageBatchSlotPositions
     char token[64] = {};          ///< the shared secret (STRATA_STAGE_TOKEN); the worker refuses a wrong one
 };
 #pragma pack(pop)
