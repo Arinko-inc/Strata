@@ -47,6 +47,7 @@
 #include "strata/kernels/native_ple_postops.hpp"
 #include "strata/kernels/native_qsa.hpp"
 #include "strata/kernels/native_qsa_indexer.hpp"
+#include "strata/kernels/mrope.hpp"   // set_slot_positions: the device's position table
 #include "strata/kernels/native_rope.hpp"
 #include "strata/kernels/ngram.hpp"
 #include "strata/kernels/pdl.hpp"
@@ -1821,7 +1822,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                         for (int t = tb; t < te; ++t) {
                             const QsaState& sx = slot_ss(t).qsa_states[qi];
                             const QsaIndexerBuffers ib{sx.idx_tail, sx.idx_dead, sx.idx_pooled, sx.idx_block_pos};
-                            native_qsa_indexer_append(idx_raw + t * ID, step_ + t * kStepCount + kStepPos, 0,
+                            // (a batch row of slot b: its key's block rotates by slot b's position-table region)
+                            native_qsa_indexer_append(idx_raw + t * ID, step_ + t * kStepCount + kStepPos,
+                                                      batch_rec_ ? slot_pos_base(brow_[t]) : 0,
                                                       (const float*) wikn->data, EPS, ib, s, sx.max_cells,
                                                       rope_scaling(), ns);
                         }
@@ -3804,6 +3807,43 @@ bool Verifier::init_slots(const std::vector<SessionState*>& slots, std::string& 
     return true;
 }
 
+bool Verifier::set_slot_positions(int64_t stride, int64_t table_cells, std::string& err) {
+    const OnDevice on_device(device_);   // (mrope_table() is the current device's)
+    if (g_ == nullptr || slots_.empty()) { err = "verify: set_slot_positions before init_slots"; return false; }
+    if (!exec_bm_.empty() || !commit_bm_.empty() || !save_bm_.empty() || !dcommit_bm_.empty()) {
+        err = "verify: set_slot_positions after a batch window was captured (its rows read the main region)";
+        return false;
+    }
+    const int64_t S = (int64_t) slots_.size();
+    if (stride <= 0 || g_->idx_block <= 0 || stride % g_->idx_block != 0) {
+        err = "verify: the slot position stride " + std::to_string((long long) stride) +
+              " is not a multiple of the indexer block";
+        return false;
+    }
+    int64_t max_cells = 0;
+    for (const SessionState* x : slots_) max_cells = std::max<int64_t>(max_cells, x->max_cells);
+    if (max_cells > stride) {
+        err = "verify: a slot session (" + std::to_string((long long) max_cells) + " cells) is longer than the slot "
+              "position stride " + std::to_string((long long) stride);
+        return false;
+    }
+    if ((S + 1) * stride > table_cells) {
+        err = "verify: the position table (" + std::to_string((long long) table_cells) + " cells) does not hold " +
+              std::to_string((long long) (S + 1)) + " regions of " + std::to_string((long long) stride);
+        return false;
+    }
+    if (S * stride + max_cells > (int64_t) INT32_MAX) {
+        err = "verify: the slot position regions pass the int32 positions";
+        return false;
+    }
+    if (strata::kernels::mrope_table() == nullptr) {
+        err = "verify: set_slot_positions on a device without a position table (--vision)";
+        return false;
+    }
+    slot_pos_stride_ = stride;
+    return true;
+}
+
 bool Verifier::capture_batch(const int* rows, int S, int hbase, std::string& err) {
     cudaGraphExec_t& ex = exec_bm_[bkey(rows, S, hbase)];
     if (ex != nullptr) return true;
@@ -3934,7 +3974,8 @@ bool Verifier::capture_commit_batch(const int* rows, int S, int hbase, std::stri
                     for (int u = first; u < t; ++u)
                         native_qsa_indexer_append(idx_raw_L_ + (size_t) (qsa_index * MT + u) * ID,
                                                   commitb_ + (size_t) rows[first] * CB + 2 + (u - first),
-                                                  0, (const float*) wikn->data, EPS, ib, s, st.max_cells,
+                                                  slot_pos_base(rows[first]), (const float*) wikn->data, EPS, ib, s,
+                                                  st.max_cells,
                                                   rope_scaling(), cs_);
                 }
                 ++qsa_index;
@@ -4111,7 +4152,8 @@ bool Verifier::capture_deferred(const int* rows, int S, int hbase, std::string& 
                         const QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};
                         for (int u = first; u < t; ++u)
                             native_qsa_indexer_append(dc_idx_ + (size_t) (qsa_index * R + hbase + u) * ID,
-                                                      commitd_ + (size_t) rows[first] * CB + 2 + (u - first), 0,
+                                                      commitd_ + (size_t) rows[first] * CB + 2 + (u - first),
+                                                      slot_pos_base(rows[first]),
                                                       (const float*) wikn->data, EPS, ib, s, st.max_cells,
                                                       rope_scaling(), cs_);
                     }
@@ -4416,11 +4458,14 @@ bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tok
     for (int t = 0; t < S; ++t) {
         h_tok_[t] = tokens[t];
         qsa_step_fill(h_step_ + t * kStepCount, pos[t], s);
-        for (int64_t h = 0; h < g.n_head; ++h) h_pos_[t * g.n_head + h] = (int32_t) pos[t];
+        // the rotary positions read slot rows[t]'s position-table region (set_slot_positions; 0 without it); the step
+        // above, the commit's positions and last_pos_b_ stay the cell
+        const int32_t rp = (int32_t) pos[t] + slot_pos_base(rows[t]);
+        for (int64_t h = 0; h < g.n_head; ++h) h_pos_[t * g.n_head + h] = rp;
         int32_t* pk = h_pos_ + (size_t) max_t_ * g.n_head;
         int32_t* pi = pk + (size_t) max_t_ * g.n_head_kv;
-        for (int64_t h = 0; h < g.n_head_kv; ++h) pk[t * g.n_head_kv + h] = (int32_t) pos[t];
-        for (int64_t h = 0; h < g.idx_q_heads; ++h) pi[t * g.idx_q_heads + h] = (int32_t) pos[t];
+        for (int64_t h = 0; h < g.n_head_kv; ++h) pk[t * g.n_head_kv + h] = rp;
+        for (int64_t h = 0; h < g.idx_q_heads; ++h) pi[t * g.idx_q_heads + h] = rp;
     }
     if (ss_->ple.ready() && ple_stage()) {
         uint32_t ple_rows[kVerifyMaxT * PLE_N_HEADS];   // (not `rows`: that is the slots of the window's rows)

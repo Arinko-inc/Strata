@@ -253,6 +253,15 @@ public:
     // split's stages each get their own sessions, and run_slots/commit_slots continue into the next stage.
     bool init_slots(const std::vector<SessionState*>& slots, std::string& err);
     int n_slots() const { return (int) slots_.size(); }
+    /// --vision with batch slots (strata-mesh IMPL-PLAN-remote-batch-vision.md 4.1): the device's position table holds
+    /// the main session's region and one region per slot, `stride` cells apart (slot b at (b + 1) * stride).  A batch
+    /// window's row of slot b rotates by the table at (b + 1) * stride + its cell: its Q/K/indexer-query positions and
+    /// the indexer key's pos_base carry that offset; the step (the K/V cell, the attention's range) stays the cell.
+    /// 0 (the default): every row reads the main region, as before.  Call after init_slots, before the first window;
+    /// false + err when the stride is not a multiple of the indexer block, a slot session is longer than the stride,
+    /// the regions do not fit `table_cells`, or this device has no position table.
+    bool set_slot_positions(int64_t stride, int64_t table_cells, std::string& err);
+    int32_t slot_pos_base(int slot) const { return slot_pos_stride_ > 0 ? (int32_t) ((slot + 1) * slot_pos_stride_) : 0; }
     /// One batch window over slots [0, S): tokens[s] at positions pos[s]; out[s] = the greedy pick after it.
     bool run_slots(int S, const int32_t* tokens, const int64_t* pos, PoolMultiFn pool, void* user, int32_t* out,
                    std::string& err);
@@ -452,6 +461,7 @@ private:
     bool capture(int T, std::string& err);
     // batch windows (see init_slots)
     std::vector<SessionState*> slots_;
+    int64_t slot_pos_stride_ = 0;          ///< set_slot_positions: slot b's position-table region at (b + 1) * this
     bool batch_rec_ = false;               ///< record_window is capturing a batch window
     int row_base_ = 0;                     ///< ... its hand-off rows start here (a pipeline group's own rows)
     int brow_[8] = {};                     ///< ... and row t is slot brow_[t]

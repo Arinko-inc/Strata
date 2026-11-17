@@ -3653,11 +3653,8 @@ int main(int argc, char** argv) {
         else if (!o.serve) why = "it needs --serve";
         else if (remote_main && (!split_same || split_at.size() != 1))
             why = "--remote-stage needs --layer-split K --split-device 0 (layers K.. run in the worker)";
-        // remote-batch (protocol 8, strata-mesh IMPL-PLAN-remote-batch.md): --batch runs over the link, but not with
-        // pictures - the worker holds one position table (StageMsg::Positions), not one per slot
-        else if (remote_main && o.batch > 0 && o.vision)
-            why = "--batch with --vision over a remote stage is not supported (the worker holds one position table, "
-                  "not one per batch slot)";
+        // (remote-batch-vision, strata-mesh IMPL-PLAN-remote-batch-vision.md: --batch with --vision runs over the link -
+        // every stage keeps a position table per batch slot, kStageBatchSlotPositions)
         else if (stage_worker && (!o.layer_split.empty() || o.stage_begin < 2 ||
                                   o.stage_begin >= strata::core::ModelGeometry{}.n_layers))
             why = "--stage-worker needs --stage-begin K (2 <= K < the layer count: the main process's --layer-split K) "
@@ -4706,11 +4703,46 @@ int main(int argc, char** argv) {
     // the identity until an image request, and it is set here, before any CUDA graph captures a rope kernel.
     int32_t* d_mrope = nullptr;
     std::vector<int32_t> mrope_host;
+    // remote-batch-vision (strata-mesh IMPL-PLAN-remote-batch-vision.md 4.1): with --vision and --batch the table holds
+    // 1 + N regions, `mrope_stride` cells apart - region 0 the main session's (mrope_host, what every request rewrites
+    // and StageMsg::Positions carries), region b + 1 batch slot b's (a copy of region 0 made as a request goes into the
+    // slot: copy_to_slot_here, a worker's slot_save).  N is the --batch asked here (the slots carved or agreed later
+    // may be fewer).  0 regions past the main one (mrope_slot_regions 0): one table, as before.
+    // STRATA_SLOT_POSITIONS=0 (a test, 4.7): the table is as large, but no slot uses its region - every slot reads the
+    // main one, as before this change, and a picture in a batch slot rotates wrong
+    static const bool slot_positions_on = [] {
+        const char* v = std::getenv("STRATA_SLOT_POSITIONS");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
+    int64_t mrope_stride = 0, mrope_table_cells = 0, mrope_slot_regions = 0;
     if (o.vision) {
         const int64_t cells = o.max_context + 64;
         mrope_host.resize((size_t) cells * 3);
         for (int64_t c = 0; c < cells; ++c)
             mrope_host[(size_t) c * 3] = mrope_host[(size_t) c * 3 + 1] = mrope_host[(size_t) c * 3 + 2] = (int32_t) c;
+        if (o.batch > 0) {   // (remote-batch-vision 4.1: every region the identity to start with)
+            mrope_slot_regions = o.batch;
+            mrope_stride = strata::kernels::mrope_slot_stride(cells);
+            mrope_table_cells = (1 + mrope_slot_regions) * mrope_stride;
+            std::vector<int32_t> all((size_t) mrope_table_cells * 3);
+            for (int64_t r = 0; r <= mrope_slot_regions; ++r)
+                for (int64_t c = 0; c < mrope_stride; ++c) {
+                    int32_t* q = all.data() + (size_t) (r * mrope_stride + c) * 3;
+                    q[0] = q[1] = q[2] = (int32_t) c;
+                }
+            if (cudaMalloc(&d_mrope, all.size() * sizeof(int32_t)) != cudaSuccess ||
+                cudaMemcpy(d_mrope, all.data(), all.size() * sizeof(int32_t), cudaMemcpyHostToDevice) != cudaSuccess) {
+                std::fprintf(stderr, "strata generate: cannot allocate the image position table (%lld regions)\n",
+                             (long long) (1 + mrope_slot_regions));
+                return 1;
+            }
+            std::fprintf(stderr, "strata serve: --vision with --batch: a position table per batch slot (%lld + 1 regions "
+                                 "of %lld cells, %.1f MiB)\n", (long long) mrope_slot_regions, (long long) mrope_stride,
+                         (double) all.size() * sizeof(int32_t) / 1048576.0);
+            if (!slot_positions_on)
+                std::fprintf(stderr, "strata serve: STRATA_SLOT_POSITIONS=0: the batch slots share one position table "
+                                     "(a test: pictures in batch slots rotate wrong)\n");
+        } else
         if (cudaMalloc(&d_mrope, mrope_host.size() * sizeof(int32_t)) != cudaSuccess ||
             cudaMemcpy(d_mrope, mrope_host.data(), mrope_host.size() * sizeof(int32_t), cudaMemcpyHostToDevice) !=
                 cudaSuccess) {
@@ -5197,6 +5229,20 @@ int main(int argc, char** argv) {
         // --vision: this device's image-position table (the identity until a picture request), read by every rope
         // kernel its stage runs - set before any of its graphs is captured
         if (o.vision) {
+            if (mrope_slot_regions > 0) {   // (remote-batch-vision 4.1: the main region and one per batch slot)
+                std::vector<int32_t> all((size_t) mrope_table_cells * 3);
+                for (int64_t r = 0; r <= mrope_slot_regions; ++r)
+                    for (int64_t c = 0; c < mrope_stride; ++c) {
+                        int32_t* q = all.data() + (size_t) (r * mrope_stride + c) * 3;
+                        q[0] = q[1] = q[2] = (int32_t) c;
+                    }
+                if (cudaMalloc(&st.mrope, all.size() * sizeof(int32_t)) != cudaSuccess ||
+                    cudaMemcpy(st.mrope, all.data(), all.size() * sizeof(int32_t), cudaMemcpyHostToDevice) != cudaSuccess) {
+                    std::fprintf(stderr, "strata generate: layer split, CUDA%d: the image position table failed\n",
+                                 st.dev);
+                    return 1;
+                }
+            } else
             if (cudaMalloc(&st.mrope, mrope_host.size() * sizeof(int32_t)) != cudaSuccess ||
                 cudaMemcpy(st.mrope, mrope_host.data(), mrope_host.size() * sizeof(int32_t), cudaMemcpyHostToDevice) !=
                     cudaSuccess) {
@@ -10553,6 +10599,13 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata serve: --batch, stage %zu: %s\n", k + 1, err.c_str());
                     return 1;
                 }
+                // remote-batch-vision 4.3-3: this stage's batch rows rotate by their slot's region of the position
+                // table (the head-only `ver_same` below rotates nothing)
+                if (o.vision && slot_positions_on && mrope_slot_regions > 0 &&
+                    !vk.set_slot_positions(mrope_stride, mrope_table_cells, err)) {
+                    std::fprintf(stderr, "strata serve: --batch with --vision, stage %zu: %s\n", k + 1, err.c_str());
+                    return 1;
+                }
                 // remote-batch: a remote stage's main process runs the head on the worker's rows in `ver_same`, a
                 // second verifier on stage 0's session (the same carve, so the same slot sessions): its batch windows
                 // sample each slot's row with that slot's settings, and hold no layer (no commit graph: verify.cpp)
@@ -13107,6 +13160,11 @@ int main(int argc, char** argv) {
             // the slot sessions it carved (a relay's hello takes the fewer of its own and its next worker's)
             me.batch_slots = o.batch > 0 ? (int32_t) o.batch : 0;
             me.batch_flags = o.batch > 0 ? strata::net::kStageBatchKeepAll : 0u;
+            // remote-batch-vision 4.3-6 (information): this main process keeps a position table per batch slot.  Not
+            // on a worker's `me` - its hello says it in the REMOTE-BATCH WORKER (B) block (a relay: only when its next
+            // worker says it too)
+            if (remote_main && o.vision && o.batch > 0 && slot_positions_on && mrope_slot_regions > 0)
+                me.batch_flags |= strata::net::kStageBatchSlotPositions;
             std::snprintf(me.build, sizeof me.build, "strata remote-stage %s", stage_worker ? "worker" : "main");
             // the model pack's fingerprint: its tensor index and expert table (the same model on both PCs)
             for (const char* f : {"/index.txt", "/native_experts.txt"}) {
@@ -13153,13 +13211,23 @@ int main(int argc, char** argv) {
                 // the INFO lines up to READY and keeps the last value, so this second line is the one it runs.
                 if (o.batch > 0) {
                     const int cap_main = o.batch;
-                    const int n = std::min(cap_main, std::max<int>(0, remote_peer.batch_slots));
+                    int n = std::min(cap_main, std::max<int>(0, remote_peer.batch_slots));
                     if (n < cap_main)
                         std::fprintf(stderr, "strata serve: remote stage: the worker has %d batch slots, this main process "
                                              "carved %d: %s\n", (int) remote_peer.batch_slots, cap_main,
                                      n >= 2 ? (std::to_string(n) + " slots").c_str()
                                             : "no batch slots (2 or more on both sides run them; start the worker "
                                               "with --batch N)");
+                    // remote-batch-vision 4.3-7: a picture in a batch slot needs every stage to rotate the slot's rows by
+                    // the slot's own position table; a worker (or a relay's next worker) without it: no batch slots
+                    // (the n < 2 path below: o.batch, remote_slots_n, the groups and the INFO line all go to 0)
+                    if (o.vision && slot_positions_on && n >= 2 &&
+                        (remote_peer.batch_flags & strata::net::kStageBatchSlotPositions) == 0) {
+                        std::fprintf(stderr, "strata serve: remote stage: --vision with --batch needs every stage to keep "
+                                             "a position table per batch slot (this build's kStageBatchSlotPositions): "
+                                             "the batch slots are off\n");
+                        n = 0;
+                    }
                     o.batch = n >= 2 ? n : 0;
                     remote_slots_n = o.batch;
                     // remote-batch stage 2 (IMPL-PLAN-remote-batch-stage2.md 2.2.1): the groups again, over the slots
@@ -13465,6 +13533,7 @@ int main(int argc, char** argv) {
                     };
                 // remote-batch: the batch slots the next worker carved (its hello), for this relay's hello (担当B)
                 int32_t next_batch_slots = 0;
+                uint32_t next_batch_flags = 0;   // (remote-batch-vision 4.4-2: its kStageBatchSlotPositions)
                 // a relay worker's link to the next worker (it must be listening; tried for a minute)
                 auto connect_next = [&](std::string& e) -> bool {
                     strata::net::StageHello mine_next = me, peer_next;
@@ -13490,6 +13559,7 @@ int main(int argc, char** argv) {
                                  peer_next.n_layers - 1, o.stage_next.c_str(),
                                  strata::net::stage_rows_name(next_link.rows()));
                     next_batch_slots = peer_next.batch_slots;
+                    next_batch_flags = peer_next.batch_flags;
                     return true;
                 };
                 if (stage_relay && !connect_next(err)) {
@@ -13687,6 +13757,7 @@ int main(int argc, char** argv) {
                 // process's and this worker's - a relay's: the fewer of its own and its next worker's), and for each
                 // slot whether this main process saved into it and how many cells it holds
                 int wk_slot_n = 0;
+                bool wk_slot_pos = false;   // remote-batch-vision 4.4-3: this link's hello said kStageBatchSlotPositions
                 std::vector<char> wk_slot_live((size_t) std::max(o.batch, 0), 0);
                 std::vector<int64_t> wk_slot_len((size_t) std::max(o.batch, 0), 0);
                 // a window sent without kStageSlotKeepAll waits for its SlotCommit: its rows (the slots, in row order)
@@ -13865,6 +13936,11 @@ int main(int argc, char** argv) {
                         // stage 2: this relay answers the windows that keep all their rows late (information: the
                         // main process does not depend on it)
                         if (stage_relay && wk_overlap) mine.batch_flags |= strata::net::kStageBatchOverlap;
+                        // remote-batch-vision 4.4-3: this worker keeps a position table per batch slot (a relay: only
+                        // when its next worker does too; else the main process turns the batch slots off)
+                        wk_slot_pos = o.vision && slot_positions_on && mrope_slot_regions > 0 &&
+                                      (!stage_relay || (next_batch_flags & strata::net::kStageBatchSlotPositions) != 0);
+                        if (wk_slot_pos) mine.batch_flags |= strata::net::kStageBatchSlotPositions;
                         // (a take-over's candidate is answered here too; its connection is served next, after the
                         // served one's `disconnected`, and its hello runs again then)
                         wk_slots_forget();
@@ -13886,6 +13962,13 @@ int main(int argc, char** argv) {
                                 e = "relay: the next worker now has " + std::to_string(next_batch_slots) +
                                     " batch slots, fewer than the " + std::to_string(wk_slot_n) +
                                     " this link agreed (start the main process again)";
+                                return false;
+                            }
+                            // remote-batch-vision: the hello said every stage keeps a position table per slot
+                            if (wk_slot_n > 0 && wk_slot_pos &&
+                                (next_batch_flags & strata::net::kStageBatchSlotPositions) == 0) {
+                                e = "relay: the next worker no longer keeps a position table per batch slot "
+                                    "(kStageBatchSlotPositions), which this link agreed (start the main process again)";
                                 return false;
                             }
                             return true;
@@ -14179,6 +14262,17 @@ int main(int argc, char** argv) {
                         if (!ver.wait_commit(e) || !refill(e)) return false;
                         apply_pending(true);
                         if (!wk_slot_copy(ss, *bslot_ss[0][(size_t) b], L, nullptr, e)) return false;
+                        // remote-batch-vision 4.4-4: the position table the request read with (region 0, from the
+                        // main process's Positions) into slot b's region, which slot b's windows read from now on
+                        if (o.vision && slot_positions_on && mrope_slot_regions > 0) {
+                            if (b >= mrope_slot_regions ||
+                                cudaMemcpy(d_mrope + (size_t) (b + 1) * (size_t) mrope_stride * 3, d_mrope,
+                                           mrope_host.size() * sizeof(int32_t), cudaMemcpyDeviceToDevice) != cudaSuccess ||
+                                cudaDeviceSynchronize() != cudaSuccess) {
+                                e = "stage worker: slot " + std::to_string(b) + "'s position table copy failed";
+                                return false;
+                            }
+                        }
                         wk_slot_live[(size_t) b] = 1;
                         wk_slot_len[(size_t) b] = L;
                         wk_slot_fp("slot save", b, *bslot_ss[0][(size_t) b], L);
@@ -14569,6 +14663,28 @@ int main(int argc, char** argv) {
             if (ok) main_fp(what, b, fc, to, (int64_t) ids.size());
             else std::fprintf(stderr, "strata ckpt fp: %s %d at %zu: not read (%s)\n", what, b, ids.size(), fe.c_str());
         };
+        // remote-batch-vision (strata-mesh IMPL-PLAN-remote-batch-vision.md 4.3-4): the position table the request read
+        // with (region 0: its picture's, or the identity for text) into slot b's region, on every stage's device, which
+        // slot b's windows read from now on (Verifier::set_slot_positions).  A device-to-device copy, waited for.
+        auto copy_slot_positions = [&](int b, std::string& e) -> bool {
+            if (b < 0 || b >= mrope_slot_regions) {
+                e = "batch admission: slot " + std::to_string(b) + " has no position-table region";
+                return false;
+            }
+            const size_t n = mrope_host.size();   // region 0: the cells a request writes
+            for (size_t k = 0; k < bslot_ss.size(); ++k) {
+                int32_t* const tab = k == 0 ? d_mrope : stages[k - 1]->mrope;
+                const strata::core::OnDevice on_k(k == 0 ? 0 : stages[k - 1]->dev);
+                if (tab == nullptr ||
+                    cudaMemcpy(tab + (size_t) (b + 1) * (size_t) mrope_stride * 3, tab, n * sizeof(int32_t),
+                               cudaMemcpyDeviceToDevice) != cudaSuccess ||
+                    cudaDeviceSynchronize() != cudaSuccess) {
+                    e = "batch admission: slot " + std::to_string(b) + "'s position table copy failed";
+                    return false;
+                }
+            }
+            return true;
+        };
         auto copy_to_slot_here = [&](int b, const std::vector<int32_t>& ids, std::string& e) -> bool {
             const int64_t upto = (int64_t) ids.size();
             if (slot_copy_direct) {
@@ -14594,6 +14710,7 @@ int main(int argc, char** argv) {
                 }
                 if (cudaDeviceSynchronize() != cudaSuccess) { e = "batch admission: device sync failed"; return false; }
             }
+            if (o.vision && slot_positions_on && mrope_slot_regions > 0 && !copy_slot_positions(b, e)) return false;
             main_slot_fp("slot save", b, *bslot_ss[0][(size_t) b], ids);
             if (batch_mtp) {
                 // Admission first builds the solo draft KV; copy it into the slot before drafting.  Both drafters' K/V
@@ -14702,6 +14819,15 @@ int main(int argc, char** argv) {
                                     [&, b](std::string& le) { return copy_to_slot_here(b, ids, le); });
         };
         auto copy_from_slot = [&](int b, const ConvCheckpoint* at, std::string& e) -> bool {
+            // remote-batch-vision 4.3-5: a slot's position table is not copied back - only a text conversation is read
+            // back from a slot (a picture's slot is never `cached` and keeps no checkpoint), whose cells rotate by the
+            // identity in every request's table.  A picture here would be a bug: refused (the prompt is read instead)
+            if (o.vision && slot_positions_on && mrope_slot_regions > 0 &&
+                (at != nullptr ? !at->imgs.empty() : bs[(size_t) b].img)) {
+                remote_slot_lost.clear();
+                e = "batch slot " + std::to_string(b) + " holds a conversation with pictures (not read back)";
+                return false;
+            }
             const int64_t upto = at != nullptr ? (int64_t) at->ids.size() : (int64_t) bs[(size_t) b].ids.size();
             const int64_t id = at != nullptr ? (int64_t) at->remote_id : 0;
             if (remote_main && at != nullptr && id == 0) {   // (every checkpoint of a remote stage has its worker part)
@@ -14757,6 +14883,15 @@ int main(int argc, char** argv) {
                 if (remote_pipe && (remote_peer.batch_flags & strata::net::kStageBatchKeepAll) == 0) {   // (stage 2)
                     e = "remote stage: the worker's hello was refused: it does not keep a window's rows itself "
                         "(kStageBatchKeepAll), which the pipelined groups need (start the main process again)";
+                    remote_link.close();
+                    return false;
+                }
+                // remote-batch-vision 4.3-8: the slots were agreed with a worker that keeps a position table per slot
+                if (o.vision && slot_positions_on &&
+                    (remote_peer.batch_flags & strata::net::kStageBatchSlotPositions) == 0) {
+                    e = "remote stage: the worker's hello was refused: it does not keep a position table per batch "
+                        "slot (kStageBatchSlotPositions), which --vision with --batch needs (start the main process "
+                        "again)";
                     remote_link.close();
                     return false;
                 }
