@@ -19,6 +19,7 @@
 #include "strata/kernels/cpu/hadamard.hpp"
 #include "strata/kernels/bf16_gemv.hpp"
 #include "strata/kernels/native_router.hpp"
+#include "strata/kernels/router_top10.hpp"
 #include "strata/kernels/native_moe.hpp"
 #include "strata/kernels/cpu/expert.hpp"
 #include "strata/kernels/elementwise.hpp"
@@ -784,6 +785,18 @@ bool Verifier::init(const WeightTable &wt, const ModelGeometry &g,
     std::fprintf(stderr, "strata verify: window up to %d tokens, %.1f MiB of device buffers%s\n", max_t,
                  (double) count.used / 1048576.0,
                  all_resident_ ? " (100% VRAM resident: zero-doorbell graph)" : "");
+    // pruned-experts: said once a process, only for a router shape STRATA_ROUTER_NGEN covers (never 512 / 256)
+    if (strata::kernels::router_ngen_shape((int) g.n_expert, (int) ss.k)) {
+        static bool said = false;
+        if (!said) {
+            said = true;
+            std::fprintf(stderr, "strata verify: %lld experts, top %d: the window routes in %s (STRATA_ROUTER_NGEN=%s)\n",
+                         (long long) g.n_expert, (int) ss.k,
+                         strata::kernels::router_ngen_enabled() ? "one projection and one top-k a layer"
+                                                                : "a projection and a top-k per row and layer",
+                         strata::kernels::router_ngen_enabled() ? "1" : "0");
+        }
+    }
     return true;
 }
 catch (sycl::exception const &exc) {
@@ -1338,6 +1351,14 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
                                   cs, err))
                 return false;
 #endif
+        } else if (dec_batch && n > 1 && w_router != nullptr && strata::kernels::router_ngen_applies((int) NE, (int) K)) {
+            // pruned-experts (STRATA_ROUTER_NGEN, on unless =0): an expert count with no native router (a pruned 384 /
+            // 320) routes the window as the 512 branch above does - one multi-column BF16 projection and one n-token
+            // top-k (moe_route_window) instead of the per-token pair below for each row; every row bitwise its
+            // per-token call (router_ngen_parity).  512 and 256 never come here.
+            if (!moe_route_window(wt, g, l, K, ss.moe, mixed_ + tb * N, logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, n,
+                                  cs, err))
+                return false;
         } else
         for (int t = tb; t < te; ++t) {
             MoEBuffers mb = ss.moe;

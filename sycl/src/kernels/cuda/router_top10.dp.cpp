@@ -678,7 +678,11 @@ bool router_top10_variant(const float* logits, int n_tokens, int n_expert, int k
 
 void router_top10(const float *logits, int n_tokens, int n_expert, int k,
                   int *ids, float *weights, void *stream) try {
-    if (strata::a770_fast() && n_tokens > 0 && n_expert > 64 && n_expert <= 512 && k > 0 && k <= 32) {
+    // the fast kernel (bitwise the portable one: router_top10_parity / router_ngen_parity check the variants): on the
+    // A770 by request, and (pruned-experts, STRATA_ROUTER_NGEN) for an expert count with no native router - neither
+    // 512 nor 256 - whose portable kernel's serial double sum and per-pass barriers cost each verify window
+    if ((strata::a770_fast() || router_ngen_applies(n_expert, k)) && n_tokens > 0 && n_expert > 64 && n_expert <= 512 &&
+        k > 0 && k <= 32) {
         auto& q = *strata::q_of(stream);
         launch_sycl_fast<false>(q, logits, n_tokens, n_expert, k, ids, weights);
         if (stream == nullptr) q.wait_and_throw();

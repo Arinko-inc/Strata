@@ -263,7 +263,8 @@ __global__ void __launch_bounds__(64) router_top10_wave_kernel(const float* __re
 }
 #endif  // STRATA_HIP_GFX906
 
-#if defined(__HIPCC__)
+// (pruned-experts: compiled for CUDA too - router_top10 takes it there for the expert counts router_ngen_applies
+// names, e.g. a pruned 384 / 320, and router_top10_variant runs it in the parity tests on both)
 // ---- S6, AMD: the same router, BIT-IDENTICAL, without its serial parts. Measured on RDNA4 (gfx1201) the kernel
 // above took 39 us per call in decode (16% of the GPU's decode time): the ascending double sum is 512 dependent FP64
 // adds (~50 cycles each there), the ten selection passes are 20 block barriers, and the renormalisation re-reads its
@@ -401,22 +402,32 @@ void launch_generic(const float* logits, int n_tokens, int n_expert, int k, int*
     router_top10_kernel<<<(unsigned) n_tokens, threads, smem, (cudaStream_t) stream>>>(
         logits, n_tokens, n_expert, k, ids, weights);
 }
-#endif
+
+// a launch's error (exit, as router_top10 always did) and, with no stream, the synchronisation
+[[maybe_unused]] void launch_done(void* stream) {
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) {
+        std::fprintf(stderr, "router_top10 launch: %s\n", cudaGetErrorString(e));
+        std::exit(1);
+    }
+    if (stream == nullptr) {
+        const cudaError_t s = cudaDeviceSynchronize();
+        if (s != cudaSuccess) {
+            std::fprintf(stderr, "router_top10: %s\n", cudaGetErrorString(s));
+            std::exit(1);
+        }
+    }
+}
 
 }  // namespace
 
 bool router_top10_variant(const float* logits, int n_tokens, int n_expert, int k, int* ids, float* weights,
                           void* stream, int variant) {
-#if defined(__HIPCC__)
+    // (CUDA too since pruned-experts: the parity tests compare the kernels there)
     if (n_tokens <= 0 || n_expert <= 64 || n_expert > 512 || k <= 0 || k > 32) return false;
     if (variant < 0 || variant > 2) return false;
     launch_generic(logits, n_tokens, n_expert, k, ids, weights, stream, variant);
     return cudaGetLastError() == cudaSuccess;
-#else
-    (void) logits; (void) n_tokens; (void) n_expert; (void) k; (void) ids; (void) weights; (void) stream;
-    (void) variant;
-    return false;
-#endif
 }
 
 void router_top10(const float* logits, int n_tokens, int n_expert, int k, int* ids, float* weights,
@@ -446,6 +457,16 @@ void router_top10(const float* logits, int n_tokens, int n_expert, int k, int* i
             }
             return;
         }
+    }
+#else
+    // pruned-experts (STRATA_ROUTER_NGEN, on unless =0): a pruned model's expert count (neither 512 nor 256, which
+    // have their own kernels) takes the fast kernel above, bitwise the portable one (router_ngen_parity), as HIP
+    // already does; the portable kernel's serial double sum and its 20 block barriers per token were most of a
+    // verify window's routing once the window routes in one launch (verify.cpp).  512 never comes here.
+    if (n_tokens > 0 && router_ngen_applies(n_expert, k)) {
+        launch_generic(logits, n_tokens, n_expert, k, ids, weights, stream, 1);
+        launch_done(stream);
+        return;
     }
 #endif
     if (n_tokens <= 0 || n_expert <= 0 || k <= 0) return;

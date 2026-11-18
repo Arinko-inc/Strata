@@ -1435,6 +1435,13 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_link_libraries(route_window_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
   add_test(NAME route_window_parity COMMAND route_window_parity)
 
+  # pruned-experts (STRATA_ROUTER_NGEN): a 384 / 320 expert router's window path (one multi-column projection, one
+  # n-row top-k on the fast kernel) against the old per-row portable path, bitwise
+  add_executable(router_ngen_parity src/kernels/router_ngen_parity.cpp)
+  target_include_directories(router_ngen_parity PRIVATE ${_strata_gpu_include_directories})
+  target_link_libraries(router_ngen_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+  add_test(NAME router_ngen_parity COMMAND router_ngen_parity)
+
   # STRATA_ROUTE_RESIDENT's swap: the warp-per-token kernel against a scalar reference of the same semantics,
   # bitwise on the ids, the weights and the four counters (GPU, synthetic, no model)
   add_executable(route_resident_parity src/kernels/route_resident_parity.cu)
