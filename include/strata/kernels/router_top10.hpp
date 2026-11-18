@@ -24,15 +24,16 @@ void router_top10(const float* logits, int n_tokens, int n_expert, int k, int* i
 bool router_top10_variant(const float* logits, int n_tokens, int n_expert, int k, int* ids, float* weights,
                           void* stream, int variant);
 
-/// pruned-experts: STRATA_ROUTER_NGEN (on unless set to 0).  A model whose expert count is neither 512 nor 256 (a
-/// pruned Flash-Next, 384 or 320 of 512) has no native router: without this its verify window routed token by token
-/// (two launches per row and layer instead of two per layer) and CUDA / SYCL ran the portable top-k kernel.  With it
+/// pruned-experts: STRATA_ROUTER_NGEN=1 (opt-in; unset or 0 keeps the default path, byte for byte).  A model whose
+/// expert count is neither 512 nor 256 (a pruned Flash-Next, 384 or 320 of 512) has no native router: by default its
+/// verify window routes token by token (two launches per row and layer instead of two per layer) and CUDA / SYCL run
+/// the portable top-k kernel.  With it
 /// the window routes in one multi-column projection and one n-token top-k (verify.cpp, moe_route_window) and the
 /// top-k is the fast kernel - every result bitwise the old path's (router_ngen_parity).  512 and 256 are untouched.
 inline bool router_ngen_enabled() {
     static const bool on = [] {
         const char* v = std::getenv("STRATA_ROUTER_NGEN");
-        return v == nullptr || *v == '\0' || std::atoi(v) != 0;
+        return v != nullptr && *v != '\0' && std::atoi(v) != 0;
     }();
     return on;
 }

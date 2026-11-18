@@ -785,18 +785,6 @@ bool Verifier::init(const WeightTable &wt, const ModelGeometry &g,
     std::fprintf(stderr, "strata verify: window up to %d tokens, %.1f MiB of device buffers%s\n", max_t,
                  (double) count.used / 1048576.0,
                  all_resident_ ? " (100% VRAM resident: zero-doorbell graph)" : "");
-    // pruned-experts: said once a process, only for a router shape STRATA_ROUTER_NGEN covers (never 512 / 256)
-    if (strata::kernels::router_ngen_shape((int) g.n_expert, (int) ss.k)) {
-        static bool said = false;
-        if (!said) {
-            said = true;
-            std::fprintf(stderr, "strata verify: %lld experts, top %d: the window routes in %s (STRATA_ROUTER_NGEN=%s)\n",
-                         (long long) g.n_expert, (int) ss.k,
-                         strata::kernels::router_ngen_enabled() ? "one projection and one top-k a layer"
-                                                                : "a projection and a top-k per row and layer",
-                         strata::kernels::router_ngen_enabled() ? "1" : "0");
-        }
-    }
     return true;
 }
 catch (sycl::exception const &exc) {
@@ -1331,6 +1319,20 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
         // move into the combine, gate + up share one launch (all bitwise; resident combine path, 2-8 rows only)
         const WeightRef* w_sgi = lfuse_on(n) && g_lfuse_gate() ? v.get("ffn_gate_inp_shexp.weight") : nullptr;
         bool sg_ready = false;
+        // pruned-experts: the path a router shape STRATA_ROUTER_NGEN covers actually takes (never 512 / 256), said once
+        // a process from the same conditions as the branch below and moe_route_window's own (STRATA_DEC_BATCH,
+        // STRATA_ROUTE_PER_TOKEN, the native BF16 projections)
+        if (strata::kernels::router_ngen_shape((int) NE, (int) K)) {
+            static bool said = false;
+            if (!said) {
+                said = true;
+                const bool win = strata::kernels::router_ngen_enabled() && dec_batch && moe_route_window_batched(g, K);
+                std::fprintf(stderr, "strata verify: %lld experts, top %d: the window routes %s (STRATA_ROUTER_NGEN=%d)\n",
+                             (long long) NE, (int) K,
+                             win ? "in one projection and one top-k a layer" : "row by row (a projection and a top-k each)",
+                             strata::kernels::router_ngen_enabled() ? 1 : 0);
+            }
+        }
         if (dec_batch && n > 1 && w_router != nullptr && native_router_enabled() && (NE == 512 || NE == 256) && K == 10) {
             try {   // SYCL port: the fused multi-token router for 256 experts as well (it was 512-only)
                 if (w_sgi != nullptr)
@@ -1352,7 +1354,7 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
                 return false;
 #endif
         } else if (dec_batch && n > 1 && w_router != nullptr && strata::kernels::router_ngen_applies((int) NE, (int) K)) {
-            // pruned-experts (STRATA_ROUTER_NGEN, on unless =0): an expert count with no native router (a pruned 384 /
+            // pruned-experts (STRATA_ROUTER_NGEN=1, opt-in): an expert count with no native router (a pruned 384 /
             // 320) routes the window as the 512 branch above does - one multi-column BF16 projection and one n-token
             // top-k (moe_route_window) instead of the per-token pair below for each row; every row bitwise its
             // per-token call (router_ngen_parity).  512 and 256 never come here.

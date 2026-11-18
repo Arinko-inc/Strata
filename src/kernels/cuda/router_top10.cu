@@ -459,7 +459,7 @@ void router_top10(const float* logits, int n_tokens, int n_expert, int k, int* i
         }
     }
 #else
-    // pruned-experts (STRATA_ROUTER_NGEN, on unless =0): a pruned model's expert count (neither 512 nor 256, which
+    // pruned-experts (STRATA_ROUTER_NGEN=1, opt-in): a pruned model's expert count (neither 512 nor 256, which
     // have their own kernels) takes the fast kernel above, bitwise the portable one (router_ngen_parity), as HIP
     // already does; the portable kernel's serial double sum and its 20 block barriers per token were most of a
     // verify window's routing once the window routes in one launch (verify.cpp).  512 never comes here.

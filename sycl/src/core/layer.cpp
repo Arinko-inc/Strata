@@ -450,14 +450,19 @@ catch (sycl::exception const &exc) {
             << ", line:" << __LINE__ << std::endl;
   std::exit(1);
 }
+// Whether moe_route_window routes a window of 2+ rows in one projection and one top-k (else row by row with
+// moe_route): the native BF16 projections, not the native 512 x 10 router, and no STRATA_ROUTE_PER_TOKEN
+bool moe_route_window_batched(const ModelGeometry& g, int64_t k) {
+    return native_bf16_projections && !(strata::kernels::native_router_enabled() && g.n_expert == 512 && k == 10) &&
+           !std::getenv("STRATA_ROUTE_PER_TOKEN");
+}
 // The verify window's routing: n tokens' logits in one BF16 projection and their top-k in one launch, each token
 // bitwise what `moe_route` gives it (the projection is the same kernel per column, the top-k kernel is per token).
 // Anything else (a native router, the canonical BF16 GEMVs, a doorbell) takes the per-token `moe_route`.
 bool moe_route_window(const WeightTable& tables, const ModelGeometry& g, int64_t layer, int64_t k, const MoEBuffers& b,
                       const float* x, float* logits, int32_t* ids, float* weights, int n, void* stream, std::string& err) {
     using namespace strata::kernels;
-    const bool batched = native_bf16_projections && !(native_router_enabled() && g.n_expert == 512 && k == 10) &&
-                         !std::getenv("STRATA_ROUTE_PER_TOKEN");
+    const bool batched = moe_route_window_batched(g, k);
     if (!batched || n == 1) {
         for (int t = 0; t < n; ++t) {
             MoEBuffers mb = b;

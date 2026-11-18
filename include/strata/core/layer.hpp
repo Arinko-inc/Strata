@@ -174,6 +174,8 @@ bool moe_route(const WeightTable& tables, const ModelGeometry& g, int64_t layer,
 /// The verify window's n tokens routed at once (see layer.cpp); bitwise per token what `moe_route` gives.
 bool moe_route_window(const WeightTable& tables, const ModelGeometry& g, int64_t layer, int64_t k, const MoEBuffers& b,
                       const float* x, float* logits, int32_t* ids, float* weights, int n, void* stream, std::string& err);
+/// Whether `moe_route_window` routes 2+ rows in one projection and one top-k (false: row by row through moe_route).
+bool moe_route_window_batched(const ModelGeometry& g, int64_t k);
 
 /// The finishing half: the shared expert and the combination.
 ///

@@ -1,15 +1,16 @@
-// router_ngen_parity - pruned-experts (STRATA_ROUTER_NGEN): a pruned model's routing (384 / 320 experts, no native
+// router_ngen_parity - pruned-experts (STRATA_ROUTER_NGEN=1): a pruned model's routing (384 / 320 experts, no native
 // router) on the new path against the old one, bit for bit (GPU, synthetic, no model).
 //
 // The old path is what the engine ran before STRATA_ROUTER_NGEN: each verify-window row routed by itself - one
 // `bf16_gemv_fp32_mmvf` and one portable top-k (`router_top10_variant` 0, router_top10_kernel) per row.  The new
 // path is `moe_route_window`'s: one `bf16_gemv_fp32_mmvf_cols` over the window and one n-row `router_top10`, which
-// for these expert counts takes the fast kernel (variant 1) unless STRATA_ROUTER_NGEN=0.  Checked:
+// for these expert counts takes the fast kernel (variant 1) with STRATA_ROUTER_NGEN=1.  Checked:
 //   1. the top-k kernels on 4,096 rows of logits with ties, near-ties and a NaN row: router_top10 (the default
 //      dispatch) and variants 1 / 2 against variant 0 - ids and weights bitwise;
 //   2. a window of T = 1..8 rows (2560 -> E BF16 router, random): the new path's logits, ids and weights against the
 //      old path's, bitwise.
-// Run it with STRATA_ROUTER_NGEN unset (the default): with =0 the default dispatch is the portable kernel itself.
+// The test sets STRATA_ROUTER_NGEN=1 itself (unset or 0, the default dispatch is the portable kernel).
+#include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/bf16_gemv.hpp"
 #include "strata/kernels/router_top10.hpp"
 
@@ -27,7 +28,6 @@ namespace {
 void ck(cudaError_t e, const char* what) {
     if (e != cudaSuccess) { std::fprintf(stderr, "%s: %s\n", what, cudaGetErrorString(e)); std::exit(2); }
 }
-uint16_t bf16(float f) { uint32_t i; std::memcpy(&i, &f, 4); return (uint16_t) ((i + ((i >> 16) & 1u) + 0x7FFFu) >> 16); }
 
 struct Out {
     std::vector<int> ids;
@@ -64,14 +64,16 @@ Out topk(const float* dl, int rows, int E, int K, int variant, bool per_row) {
 }  // namespace
 
 int main() {
+    // the path under test is opt-in: turned on here, before the first router call reads the variable
+    setenv("STRATA_ROUTER_NGEN", "1", 1);
     const int N = 2560, K = 10, ROWS = 4096;
     int bad = 0;
     std::mt19937 rng(11);
     std::normal_distribution<float> nd(0.0f, 1.0f);
-    std::printf("router_ngen_parity: STRATA_ROUTER_NGEN %s\n", strata::kernels::router_ngen_enabled() ? "on" : "OFF (=0)");
+    std::printf("router_ngen_parity: STRATA_ROUTER_NGEN %s\n", strata::kernels::router_ngen_enabled() ? "=1 (on)" : "unset or 0 (OFF: run it with STRATA_ROUTER_NGEN=1)");
     for (int E : {384, 320}) {
         if (!strata::kernels::router_ngen_applies(E, K))
-            std::printf("  E %d: the default dispatch is the portable kernel (STRATA_ROUTER_NGEN=0)\n", E);
+            std::printf("  E %d: the default dispatch is the portable kernel (STRATA_ROUTER_NGEN is not 1)\n", E);
         // ---- 1. the top-k kernels
         std::vector<float> lg((size_t) ROWS * E);
         for (int r = 0; r < ROWS; ++r) {
@@ -100,7 +102,7 @@ int main() {
         for (int T = 1; T <= 8; ++T) {
             std::vector<uint16_t> w((size_t) E * N);
             std::vector<float> x((size_t) T * N);
-            for (auto& v : w) v = bf16(nd(rng) * 0.05f);
+            for (auto& v : w) v = strata::kernels::bf16_from_f32(nd(rng) * 0.05f);
             for (auto& v : x) v = nd(rng);
             uint16_t* dw; float *dx, *d_old, *d_new;
             ck(cudaMalloc(&dw, w.size() * 2), "w"); ck(cudaMalloc(&dx, x.size() * 4), "x");
