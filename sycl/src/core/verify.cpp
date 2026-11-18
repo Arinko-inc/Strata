@@ -1326,7 +1326,12 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
             static bool said = false;
             if (!said) {
                 said = true;
+#if defined(STRATA_HIP_GFX906)
+                // gfx906: its STRATA_DEC_BATCH branch below takes every window to moe_route_window, NGEN or not
+                const bool win = dec_batch && moe_route_window_batched(g, K);
+#else
                 const bool win = strata::kernels::router_ngen_enabled() && dec_batch && moe_route_window_batched(g, K);
+#endif
                 std::fprintf(stderr, "strata verify: %lld experts, top %d: the window routes %s (STRATA_ROUTER_NGEN=%d)\n",
                              (long long) NE, (int) K,
                              win ? "in one projection and one top-k a layer" : "row by row (a projection and a top-k each)",

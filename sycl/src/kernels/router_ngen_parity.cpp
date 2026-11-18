@@ -74,7 +74,11 @@ int main(int argc, char** argv) try {
     for (int i = 1; i < argc; ++i)
         if (std::strcmp(argv[i], "--selftest") != 0) { std::fprintf(stderr, "usage: router_ngen_parity [--selftest]\n"); return 2; }
     // the path under test is opt-in: turned on here, before the first router call reads the variable
+#if defined(_WIN32)
+    _putenv_s("STRATA_ROUTER_NGEN", "1");
+#else
     setenv("STRATA_ROUTER_NGEN", "1", 1);
+#endif
     const int N = 2560, K = 10, ROWS = 4096;
     int bad = 0;
     std::mt19937 rng(11);

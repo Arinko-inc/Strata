@@ -65,7 +65,11 @@ Out topk(const float* dl, int rows, int E, int K, int variant, bool per_row) {
 
 int main() {
     // the path under test is opt-in: turned on here, before the first router call reads the variable
+#if defined(_WIN32)
+    _putenv_s("STRATA_ROUTER_NGEN", "1");
+#else
     setenv("STRATA_ROUTER_NGEN", "1", 1);
+#endif
     const int N = 2560, K = 10, ROWS = 4096;
     int bad = 0;
     std::mt19937 rng(11);
