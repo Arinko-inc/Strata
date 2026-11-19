@@ -196,3 +196,33 @@ def test_connection_refused(capsys, monkeypatch):
     rc, out = run("http://127.0.0.1:1", capsys, monkeypatch)
     assert rc == 1
     assert "request_error=2" in lines(out)[1]
+
+
+def test_compare_not_identical_when_nothing_was_compared(server, capsys, monkeypatch, tmp_path):
+    """レビュー P3: 結果が1件も返らない/参照が無いとき、ALL IDENTICAL を出さず、比較の成功件数を分けて出す。"""
+    H, url = server
+    save = tmp_path / "ref"
+    run(url, capsys, monkeypatch, "--save", str(save))
+    # 全件の結果が返らない
+    monkeypatch.setattr(serve_load, "one", lambda *a, **k: None)
+    rc, out = run(url, capsys, monkeypatch, "--compare", str(save))
+    assert rc == 1
+    assert "ALL IDENTICAL" not in out
+    assert lines(out)[0] == "result: 0/2 requests ok, 0/2 compared"
+
+
+def test_result_line_separates_requests_and_compared(server, capsys, monkeypatch, tmp_path):
+    H, url = server
+    save = tmp_path / "ref"
+    run(url, capsys, monkeypatch, "--save", str(save))
+    # 参照が無いだけ: 通信は 2/2 成功だが、比較は 1/2
+    os.remove(save / "c2" / "r0" / "1.txt")
+    rc, out = run(url, capsys, monkeypatch, "--compare", str(save))
+    assert rc == 1
+    assert "ALL IDENTICAL" not in out
+    assert lines(out)[0] == "result: 2/2 requests ok, 1/2 compared"
+    # 全件一致
+    run(url, capsys, monkeypatch, "--save", str(save))
+    rc, out = run(url, capsys, monkeypatch, "--compare", str(save))
+    assert rc == 0 and "ALL IDENTICAL" in out
+    assert lines(out)[0] == "result: 2/2 requests ok, 2/2 compared"

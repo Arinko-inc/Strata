@@ -147,6 +147,7 @@ def main():
     sent = 0                                        # requests started
     fails = {}                                      # failure name -> number of requests (or files, for the counts)
     failed_reqs = 0
+    compared_ok = 0                                 # answers that were fine and identical to their reference file
     for c in [int(x) for x in a.clients.split(",")]:
         rows = []
         for rd in range(a.rounds):
@@ -197,7 +198,10 @@ def main():
                         fails["compare_missing"] = fails.get("compare_missing", 0) + 1
                     else:
                         ref = open(p, encoding="utf-8").read()
-                        if ref != r["text"]:
+                        if ref == r["text"]:
+                            if not problems(r):
+                                compared_ok += 1
+                        else:
                             n = next((k for k, (x, y) in enumerate(zip(ref, r["text"])) if x != y), min(len(ref), len(r["text"])))
                             print(f"  DIFF c={c} round={rd} req={i}: first difference at char {n}")
                             bad += 1
@@ -219,13 +223,18 @@ def main():
         json.dump(out, open(a.json, "w"), indent=1)
     if a.compare:
         miss = fails.get("compare_missing", 0)
-        print("compare:", "ALL IDENTICAL" if not bad and not miss else
-              ", ".join(x for x in (f"{bad} DIFFERENT" if bad else "", f"{miss} REFERENCE FILES MISSING" if miss else "") if x))
+        # "ALL IDENTICAL" only when every request that was sent was compared and matched
+        if compared_ok == sent and not bad and not miss and sent:
+            print("compare: ALL IDENTICAL")
+        else:
+            why = [x for x in (f"{bad} DIFFERENT" if bad else "", f"{miss} REFERENCE FILES MISSING" if miss else "",
+                               f"{sent - compared_ok} OF {sent} NOT COMPARED OK") if x]
+            print("compare:", ", ".join(why))
     if bad:
         fails["diff"] = bad
-    print(f"result: {sent - failed_reqs}/{sent} requests ok")
+    print(f"result: {sent - failed_reqs}/{sent} requests ok" + (f", {compared_ok}/{sent} compared" if a.compare else ""))
     print("failures: " + (", ".join(f"{k}={v}" for k, v in fails.items()) if fails else "none"))
-    return 1 if (bad or fails or failed_reqs) else 0
+    return 1 if (bad or fails or failed_reqs or (a.compare and compared_ok != sent)) else 0
 
 
 if __name__ == "__main__":
