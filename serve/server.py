@@ -425,6 +425,14 @@ class RemoteStageLost(ValueError):
     so a stream that has started reports it as an error event."""
 
 
+class SlotAdmissionFailed(RemoteStageLost):
+    """The engine could not move a request's state into its batch slot (`BADM <slot> 0 failed`: a stage or a worker
+    out of memory, say) and goes on without it; the server's one try to continue the request failed as well, or was
+    not possible.  The request is not finished, so it must not end as "length": a 503 with Retry-After before the
+    answer began, an error event in a stream that has started (a RemoteStageLost, so both are handled as that one's).
+    The engine is still in step and its slots are free for the next request."""
+
+
 def is_remote_stage_error(text: str) -> bool:
     """The engine's ERR text is a remote stage's (RemoteStageLost): its link (`remote stage: ...`) or its worker
     (`remote stage (worker): ...`)."""
@@ -1510,7 +1518,8 @@ class StrataEngine:
 
     def _control(self, cancel, on_token, stop_when=None, on_quiet=None, want_lp=False):
         """Reads the control lines of the request on them (GEN / BGEN), yielding None heartbeats.  Calls on_token(id)
-        for each `T`; returns ("done", None) at DONE, or ("badm", continues) at BADM (after DONE).  `stop_when()`
+        for each `T`; returns ("done", None) at DONE, or ("badm", continues) at BADM (after DONE; `BADM <slot> 0
+        failed` also sets self._adm_failed: the engine could not move the request into its slot).  `stop_when()`
         true sends STOP once (the request is then read to its DONE).  `on_quiet()` runs whenever the engine has been
         quiet for half a second: between two PP lines of a read whose chunks take longer than that.
 
@@ -1580,6 +1589,7 @@ class StrataEngine:
             elif line.startswith("BADM "):
                 f = line.split()
                 self._ctl_result = ("badm", len(f) >= 3 and f[2] == "1")
+                self._adm_failed = f[2:4] == ["0", "failed"]
                 return
             elif line.startswith("YIELDED "):            # the read gave way (BYIELD): <slot> <tokens read>
                 f = line.split()
@@ -1857,6 +1867,7 @@ class StrataEngine:
         phase = "none"            # solo -> (admit -> slot) ; "done" once the engine has finished with this request
         stop_sent = False
         yields, solo_again, refused = 0, 0, 0
+        adm_failures = 0          # admissions the engine failed (`BADM <slot> 0 failed`): continued once, then an error
         admit_wait, admit_since, admit_said = False, 0.0, False   # #1603: waiting for a slot, since when, said
         try:
             while True:   # a request in a slot that is left alone goes back to the solo path
@@ -2012,6 +2023,7 @@ class StrataEngine:
                     phase = "admit"
                     self._ctl_mode, self._ctl_result, self._yielded = "batch", None, None
                     self._ctl_erred = False
+                    self._adm_failed = False
                     asked = False
 
                     def ask():        # as give_way above, for the slot this admission reads into
@@ -2066,8 +2078,36 @@ class StrataEngine:
                     if not cont and self._yielded is not None and self._yielded[0] == slot and not cancel.is_set():
                         continue                            # gave way: again once the shorter request is in
                     break
+                adm_failed = not cont and bool(getattr(self, "_adm_failed", False))
+                self._adm_failed = False
                 self.ctl.release()
                 holding = False
+                if adm_failed and not cancel.is_set() and not (out and out[-1] in EOS_IDS) and len(out) < int(max_new):
+                    # the engine could not move this request into the slot and goes on without it: the request is
+                    # not finished (its DONE says "length" after the admission's one token).  The slot holds nothing
+                    # usable; the request continues once from what it has (the solo path when alone, else another
+                    # admission), and a second failure is an error - never a short answer that looks complete
+                    adm_failures += 1
+                    print(f"[strata] parallel: the engine could not move a request into slot {slot} "
+                          f"({len(out)} of {int(max_new)} tokens so far); "
+                          + ("continuing it once" if adm_failures == 1 else "it ends with an error"), flush=True)
+                    self.slot_live[slot] = None
+                    self.slot_held[slot] = []
+                    self.slot_used[slot] = time.time()
+                    with self.slot_cv:
+                        self.slot_busy[slot] = False
+                        self.slot_claims.discard(slot)
+                        self.slot_cv.notify_all()
+                    slot = None
+                    if adm_failures > 1:
+                        raise SlotAdmissionFailed("the engine could not move this request into a batch slot (twice); "
+                                                  "the answer is incomplete - try again in a moment")
+                    if reused0 is None:
+                        reused0 = (self.last or {}).get("reused")
+                    carry_leg(carry, self.last)             # the legs so far; the continuation's DONE adds to them
+                    prompt, left = list(ids) + out, int(max_new) - len(out)
+                    btrace("admission failed: continuing")
+                    continue
                 if not cont:
                     return
                 live.update(state="decoding", first_token=time.time(), generated=len(out))
