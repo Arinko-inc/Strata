@@ -181,11 +181,39 @@ def combined_embeddings_path(vision_dir: Path, nbytes: int) -> Path:
 
 def write_temporary(path: Path, parts: list) -> None:
     """#874: write `parts` (files) one after the other into `path`; on Windows with FILE_ATTRIBUTE_TEMPORARY
-    (os.O_SHORT_LIVED), so the file normally never reaches the drive before it is deleted."""
+    (os.O_SHORT_LIVED), so the file normally never reaches the drive before it is deleted.  The parts are copied in
+    1 MiB blocks (F20: a request with many pictures no longer holds a whole 10 MB picture in memory at a time), and a
+    copy that fails leaves no half-written file behind."""
     flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_BINARY", 0) | getattr(os, "O_SHORT_LIVED", 0)
-    with os.fdopen(os.open(path, flags, 0o600), "wb") as f:
-        for part in parts:
-            f.write(Path(part).read_bytes())
+    try:
+        with os.fdopen(os.open(path, flags, 0o600), "wb") as f:
+            for part in parts:
+                with open(part, "rb") as src:
+                    shutil.copyfileobj(src, f, 1 << 20)
+    except BaseException:
+        Path(path).unlink(missing_ok=True)
+        raise
+
+
+def make_combined_embeddings(vision_dir: Path, parts: list) -> Path:
+    """F20: the file of one request's image embeddings for the engine's GENI line.  One picture: a hard link to the
+    cache file in the encoder's own directory (no 10-20 MB read and written again for every turn; the cache file is
+    never written once encoded, and deleting the link leaves it), or when the link is refused (another file system,
+    one that has no hard links) a copy as before.  Several pictures: the files joined by write_temporary().  The
+    returned file is the request's own: whoever ends the request deletes it.  Nothing is left behind when it fails."""
+    parts = [Path(p) for p in parts]
+    if len(parts) == 1:
+        link = Path(vision_dir) / f"req-{uuid.uuid4().hex[:12]}.sve"
+        try:
+            os.link(parts[0], link)
+            return link
+        except OSError:
+            link.unlink(missing_ok=True)
+    path = combined_embeddings_path(vision_dir, sum(p.stat().st_size for p in parts))
+    write_temporary(path, parts)
+    return path
+
+
 # #458: the trailing effort turn ("effort_position": "end"); low is the template's own sentence, medium (which the
 # template says nothing for: no xhigh sentence is medium there) says it, since the xhigh one stays at the top
 EFFORT_TURN = "<|im_start|>system\n{}<|im_end|>\n"
@@ -2753,10 +2781,19 @@ class Vision:
         # fall back on when it does not start; _start switches to it by itself
         cpu = vision_reader.cpu_fallback(cfg)
         self.fallback = (self.reader_args(cpu), log, env) if cpu else None
+        # F20 (high 5): what the reader runs on now ("gpu" / "cpu"), the GPU reader's spawn to come back to after a start
+        # that fell back, the CPU reader's, and why/when the device last changed (shown in /health)
+        self.device = "gpu" if cfg.get("gpu") else "cpu"
+        self.gpu_spawn = None
+        self.cpu_spawn = self.fallback
+        self.switch: dict | None = None
+        self.gpu_retry_s = self.gpu_retry_of(cfg)
+        self.gpu_retry_error: str | None = None
         self.proc = None
         self.stopped = True
         self.lock = threading.Lock()
         self.cache: dict[str, tuple[Path, int]] = {}
+        self.refs: dict[str, int] = {}                  # F20 (high 4): cache files a request still reads, never evicted
         # opt-in (the vision section's "elastic": true, with the config's "vram_elastic"): the encoder starts with the
         # first picture and stops after elastic_idle_s without one; while it runs, the engine's expert cache keeps
         # elastic_mib of VRAM free for it (Service._vision_up / _vision_idle_down)
@@ -2781,6 +2818,22 @@ class Vision:
             except (TypeError, ValueError):
                 pass
         return Vision.DEFAULT_MAX_TOKENS["gpu" if cfg.get("gpu") else "cpu"]
+
+    GPU_RETRY_S = 60.0
+
+    @staticmethod
+    def gpu_retry_of(cfg: dict) -> float:
+        """F20: the vision section's "gpu_retry_s": seconds between two looks at whether the GPU reader starts again after a
+        start that fell back to the CPU reader (default 60; 0 = never).  A value that is not a number >= 0 is said and the
+        default is used: the server does not stop for a setting of the picture reader."""
+        v = cfg.get("gpu_retry_s")
+        if v is None:
+            return Vision.GPU_RETRY_S
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or v < 0:
+            print(f'[strata] images: "gpu_retry_s" must be a number of seconds >= 0 (0 = never), not {v!r}; using '
+                  f"{Vision.GPU_RETRY_S:g}", flush=True)
+            return Vision.GPU_RETRY_S
+        return float(v)
 
     @staticmethod
     def reader_args(cfg: dict) -> list:
@@ -2815,27 +2868,44 @@ class Vision:
             if fallback is None:
                 raise
             why = " ".join(str(e).split())[:240]
-            print(f"[strata] the GPU picture reader did not start ({why}); pictures are read on the CPU", flush=True)
+            print(f"[strata] the GPU picture reader did not start ({why}); pictures are read on the CPU"
+                  + (f" (the GPU reader is tried again every {self.gpu_retry_s:g} s while no picture is being read)"
+                     if getattr(self, "gpu_retry_s", 0) > 0 else ""), flush=True)
+            # F20 (high 5): the GPU reader's settings are kept to come back to (retry_gpu)
+            self.gpu_spawn, self.cpu_spawn = self.spawn, fallback
             self.spawn, self.fallback = fallback, None
+            self.device = "cpu"
+            self.switch = {"to": "cpu", "reason": why, "at": time.time()}
             self._start_reader()
 
     def _start_reader(self):
-        args, log, env = self.spawn
+        self.proc = self._spawn_reader(self.spawn, self)
+        self.stopped = False
+
+    def _spawn_reader(self, spawn, owner=None):
+        """Start the reader of `spawn` ((args, log, env)) and wait for READY: the started process.  Raises RuntimeError
+        with the reader's own message when it does not (it is not left half-started).  With `owner` (the start of the
+        encoder itself) a failure also leaves owner.proc None and owner.stopped True; retry_gpu() starts the GPU reader
+        beside the running CPU one without owner."""
+        args, log, env = spawn
         self._ensure_dir()
         # cwd is the encoder's directory: the ENC lines name the files relative to it (#480: no space in the line)
-        self.proc = popen("the image encoder", args, role="vision", stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                          stderr=log or subprocess.DEVNULL, text=True, encoding="utf-8", bufsize=1, env=env,
-                          cwd=self.dir)
+        proc = popen("the image encoder", args, role="vision", stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                     stderr=log or subprocess.DEVNULL, text=True, encoding="utf-8", bufsize=1, env=env,
+                     cwd=self.dir)
+        if owner is not None:
+            owner.proc = proc
         try:
-            line = self._readline(VISION_READY_S, "the vision encoder did not start")
+            line = self._readline(VISION_READY_S, "the vision encoder did not start", proc)
         except RuntimeError as e:                       # silent for VISION_READY_S: it was ended, and it is not left half-started
-            self.proc, self.stopped = None, True
+            if owner is not None:
+                owner.proc, owner.stopped = None, True
             if VISION_READY_S:
                 raise RuntimeError(vision_start_error("", log, waited=VISION_READY_S)) from None
             raise RuntimeError(str(e)) from None
         if not line.startswith("READY"):
-            proc, self.proc = self.proc, None
-            self.stopped = True
+            if owner is not None:
+                owner.proc, owner.stopped = None, True
             code = proc.poll() if hasattr(proc, "poll") else None   # an encoder that died by itself has its status already
             try:
                 proc.kill()
@@ -2845,12 +2915,12 @@ class Vision:
             if code is None:
                 code = getattr(proc, "returncode", None)
             raise RuntimeError(vision_start_error(line, log, code))
-        self.stopped = False
+        return proc
 
-    def _readline(self, timeout: float, what: str) -> str:
+    def _readline(self, timeout: float, what: str, proc=None) -> str:
         """One line from the encoder, waiting at most `timeout` s (#1317).  On a timeout the encoder is killed, so the
         next request starts a fresh one, and the read raises RuntimeError instead of holding the request turn."""
-        proc = self.proc
+        proc = proc or self.proc
         got: queue.Queue = queue.Queue()
 
         def read():
@@ -2876,6 +2946,58 @@ class Vision:
         """Stop the encoder process (its VRAM or RAM goes back); the encoded images stay cached on disk."""
         self.close()
         self.stopped = True
+
+    def status(self) -> dict:
+        """F20: what /health shows of the picture reader: the device it reads on now ("gpu" / "cpu"), the last change of
+        device (to, reason, at) and, while on the CPU after a fall back, how the way back stands."""
+        out = {"device": getattr(self, "device", "gpu"), "last_switch": getattr(self, "switch", None)}
+        if getattr(self, "gpu_spawn", None) is not None and out["device"] == "cpu":
+            out["gpu_retry_s"] = getattr(self, "gpu_retry_s", 0)
+            out["gpu_retry_error"] = getattr(self, "gpu_retry_error", None)
+        return out
+
+    def retry_gpu(self) -> str:
+        """F20 (high 5): after a start that fell back to the CPU reader, start the GPU reader again and, once it says
+        READY, read on it and stop the CPU reader.  Never while a picture is being read: "busy" when one is (the switch
+        waits out a picture that begins while the GPU reader starts, it never cuts one off).  The GPU reader is started
+        beside the CPU one, so a failed try costs the pictures nothing.  -> "gpu" (switched), "busy", "failed" (the
+        GPU reader did not start; the CPU reader goes on) or "nothing" (not on the CPU after a fall back, or no retry)."""
+        gpu = getattr(self, "gpu_spawn", None)
+        if gpu is None or getattr(self, "device", "gpu") != "cpu" or getattr(self, "gpu_retry_s", 0) <= 0:
+            return "nothing"
+        if not self.lock.acquire(blocking=False):
+            return "busy"                                # a picture is being read
+        try:
+            idle = self.proc is None or self.stopped
+            if idle:                                     # no reader running (an elastic one unloaded): the next start tries the GPU first
+                self.spawn, self.fallback, self.device = gpu, getattr(self, "cpu_spawn", None), "gpu"
+                self.gpu_spawn = None
+                self.switch = {"to": "gpu", "reason": "the GPU reader is tried again at the next start", "at": time.time()}
+                return "gpu"
+        finally:
+            self.lock.release()
+        try:
+            proc = self._spawn_reader(gpu)
+        except (RuntimeError, OSError) as e:
+            why = " ".join(str(e).split())[:240]
+            if why != getattr(self, "gpu_retry_error", None):      # said once per kind of failure, not every minute
+                print(f"[strata] images: the GPU picture reader still does not start ({why}); pictures stay on the CPU", flush=True)
+            self.gpu_retry_error = why
+            return "failed"
+        with self.lock:                                  # waits for a picture that began meanwhile
+            if self.proc is None or self.stopped:        # unloaded while the GPU reader started: it is not kept running
+                old = proc
+                self.spawn, self.fallback, self.device = gpu, getattr(self, "cpu_spawn", None), "gpu"
+                self.gpu_spawn = None
+                self.switch = {"to": "gpu", "reason": "the GPU reader is tried again at the next start", "at": time.time()}
+            else:
+                old, self.proc = self.proc, proc
+                self.spawn, self.fallback, self.device = gpu, getattr(self, "cpu_spawn", None), "gpu"
+                self.gpu_spawn, self.stopped, self.gpu_retry_error = None, False, None
+                self.switch = {"to": "gpu", "reason": "the GPU reader started again", "at": time.time()}
+                print("[strata] images: the GPU picture reader started again; pictures are read on the GPU", flush=True)
+        self._stop_reader(old)
+        return "gpu"
 
     def restart(self):
         """Start the encoder again after an unload (or if it died); the cache of encoded images is kept."""
@@ -2972,26 +3094,59 @@ class Vision:
         im.save(out, format="PNG")
         return out.getvalue()
 
-    def encode_all(self, sources: list, cancel=None) -> list[tuple[Path, int]]:
+    # F20 (high 4): the cache files that requests are reading, by path: a count each, so two requests (or one request
+    # with the same picture twice) hold it twice.  Guarded by its own lock: a release must not wait behind an encode.
+    _refs_lock = threading.Lock()
+
+    def _pin(self, path: Path) -> None:
+        with self._refs_lock:
+            refs = self.__dict__.setdefault("refs", {})
+            refs[str(path)] = refs.get(str(path), 0) + 1
+
+    def release(self, encoded: list) -> None:
+        """F20 (high 4): the request is done with these files (encode_all(..., hold=True)'s result): they can be evicted
+        again, at the next encode.  A file released twice is released once."""
+        with self._refs_lock:
+            refs = self.__dict__.setdefault("refs", {})
+            for p, _ in encoded:
+                n = refs.get(str(p), 0) - 1
+                if n > 0:
+                    refs[str(p)] = n
+                else:
+                    refs.pop(str(p), None)
+
+    def encode_all(self, sources: list, cancel=None, hold: bool = False) -> list[tuple[Path, int]]:
         """encode() for every image of one request: the files of this request's earlier images are never evicted to
         make room for a later one (#1072: with more than 64 unique images the first was deleted before the request
-        had read it).  `cancel` (#1999): a request whose client left does not encode its next pictures."""
+        had read it).  `cancel` (#1999): a request whose client left does not encode its next pictures.
+        `hold` (F20, high 4): the files also stay out of the cache's eviction - by this request's later pictures and by
+        any other request's - until the caller gives them back with release(): the request reads them after the encoder's
+        turn (the size, the copy for the engine), when another request may already be adding pictures."""
         out: list[tuple[Path, int]] = []
-        for src in sources:
-            if cancel is not None and cancel.is_set():
-                raise ClientGone()
-            out.append(self.encode(src, keep=[p for p, _ in out]))
+        try:
+            for src in sources:
+                if cancel is not None and cancel.is_set():
+                    raise ClientGone()
+                out.append(self.encode(src, keep=[p for p, _ in out], hold=True) if hold
+                           else self.encode(src, keep=[p for p, _ in out]))
+        except BaseException:
+            if hold:
+                self.release(out)
+            raise
         return out
 
-    def encode(self, source: str | bytes, keep=()) -> tuple[Path, int]:
+    def encode(self, source: str | bytes, keep=(), hold: bool = False) -> tuple[Path, int]:
         """-> (embeddings file, number of image tokens).  `source`: what load() reads, or the image's bytes.
-        `keep`: files the caller still needs (never evicted by this call)."""
+        `keep`: files the caller still needs (never evicted by this call).  `hold`: the file is also held for
+        release() (taken under the cache's lock, so no eviction sits between the encode and the hold)."""
         data = self.normalize(source if isinstance(source, bytes) else self.load(source))
         key = hashlib.sha256(data).hexdigest()[:32]
         with self.lock:
             self._ensure_dir()
             if key in self.cache:
                 self.cache[key] = self.cache.pop(key)                  # most recently used last
+                if hold:
+                    self._pin(self.cache[key][0])
                 return self.cache[key]
             if self.proc is None or self.proc.stdin is None:           # an elastic encoder not started yet, or one that was unloaded
                 raise ValueError("the picture reader is not running")
@@ -3012,7 +3167,10 @@ class Vision:
                                                                      "the vision encoder stopped"))
             self.cache[key] = (out, int(line.split()[1]))
             self.warn_if_over_limit(self.cache[key][1])
-            held = {str(p) for p in keep} | {str(out)}
+            if hold:
+                self._pin(out)
+            with self._refs_lock:
+                held = {str(p) for p in keep} | {str(out)} | set(self.__dict__.get("refs") or ())
             for old in list(self.cache):                               # oldest first, but never one still in use
                 if len(self.cache) <= 64:
                     break
@@ -3031,8 +3189,13 @@ class Vision:
 
     def close(self):
         proc, self.proc = self.proc, None
+        self.stopped = True
+        self._stop_reader(proc)
+
+    @staticmethod
+    def _stop_reader(proc):
+        """Ask a reader to QUIT and wait for it (killed when it does not); None is nothing."""
         if proc is None:
-            self.stopped = True
             return
         try:
             proc.stdin.write("QUIT\n")
@@ -3047,7 +3210,6 @@ class Vision:
                 proc.wait(timeout=10)
             except (OSError, subprocess.TimeoutExpired):
                 pass
-        self.stopped = True
 
     def shutdown(self):
         """#914: close() for good: the server ends, so the encoder's directory (one ~10 MB .sve per image, on a tmpfs
@@ -4450,6 +4612,23 @@ class Service:
                     print(f"[strata] images: stopping the idle image encoder: {e}", flush=True)
         threading.Thread(target=loop, daemon=True).start()
 
+    def start_vision_gpu_retry(self):
+        """F20 (high 5): a picture reader that fell back to the CPU gets its GPU reader looked at again every gpu_retry_s
+        seconds (Vision.retry_gpu: only while no picture is being read).  The thread does nothing when the reader started
+        on the GPU, is on the CPU by choice, or "gpu_retry_s" is 0."""
+        v = self.vision
+        if v is None or not hasattr(v, "retry_gpu") or getattr(v, "gpu_retry_s", 0) <= 0:
+            return
+
+        def loop():
+            while True:
+                time.sleep(max(1.0, v.gpu_retry_s))
+                try:
+                    v.retry_gpu()
+                except Exception as e:                 # tried again at the next look; the thread keeps running
+                    print(f"[strata] images: looking for the GPU picture reader: {e}", flush=True)
+        threading.Thread(target=loop, daemon=True).start()
+
     def free_vram_mib(self) -> int | None:
         """Free VRAM on the engine's (first) GPU, from the backend's reader - NVML, the amdgpu sysfs files (#301) or
         IOKit on macOS (Metal backend); None when it can't be read (then nothing is refused)."""
@@ -4924,7 +5103,9 @@ class Service:
             "concurrency": {"serving": max(1, int(getattr(self.engine, "batch", 0) or 0)),
                             "requested": getattr(self, "requested_slots", max(1, int(getattr(self.engine, "batch", 0) or 0)))},
             "dialects": ["/v1/chat/completions", "/v1/messages", "/v1/responses"],
-            "vision": {"enabled": images, "available": images, "error": None},
+            "vision": {"enabled": images, "available": images, "error": None,
+                       # F20 (high 5): the device the picture reader reads on, and when and why it last changed
+                       **(self.vision.status() if images and hasattr(self.vision, "status") else {})},
             "image_generation": self.images.status() if self.images is not None else {"enabled": False},
             "activity": {"requests": totals["requests"] + running,
                          "in_flight": running + int(s.get("queued") or 0),
@@ -5031,7 +5212,17 @@ class Service:
     def prepare(self, messages, tools, kwargs, max_new=None, force=None, req=None, cancel=None):
         """-> (ids, thinking, max_new). An unset or non-positive max_new (some clients send -1) means "unlimited":
         the rest of the context.  `force` (forced_call): without thinking the reply starts with it, so it ends the
-        prompt; with thinking, Service.run writes it once the thinking is over."""
+        prompt; with thinking, Service.run writes it once the thinking is over.
+        F20 (high 4): the encoder's cache files this request reads stay held (never evicted for another request's
+        pictures) until it has made its own file for the engine - or failed to."""
+        held: list = []
+        try:
+            return self._prepare(messages, tools, kwargs, max_new, force, req, cancel, held)
+        finally:
+            if held:
+                self.vision.release(held)
+
+    def _prepare(self, messages, tools, kwargs, max_new, force, req, cancel, held):
         # `cancel` (#1999): set when the client hangs up; the downloads, the wait for the turn and the encodes stop
         # between pictures and raise ClientGone
         # Cached tool images are references in browser history, never arbitrary file paths or huge base64 strings.
@@ -5094,8 +5285,12 @@ class Service:
             with self._turn(cancel):
                 self._vision_up()
                 try:
-                    encoded = (self.vision.encode_all(images, cancel) if hasattr(self.vision, "encode_all")
-                               else [self.vision.encode(src) for src in images])
+                    if hasattr(self.vision, "encode_all") and hasattr(self.vision, "release"):
+                        encoded = self.vision.encode_all(images, cancel, hold=True)
+                        held.extend(encoded)
+                    else:
+                        encoded = (self.vision.encode_all(images, cancel) if hasattr(self.vision, "encode_all")
+                                   else [self.vision.encode(src) for src in images])
                 finally:
                     self.last_image_at = time.time()
             # one <|image_pad|> per image -> one per image token.  Only the markers the template writes for an image
@@ -5151,13 +5346,13 @@ class Service:
             # The request's images in one file for GENI (~10 MB a picture), written once nothing above refuses the
             # request: one refused after it (the engine starting, no room) left it in the vision directory for good,
             # one more for every retry of a 503.  run() deletes it; drop_embeddings() if run() never starts.
-            combined = combined_embeddings_path(self.vision.dir, sum(Path(p).stat().st_size for p, _ in encoded))
-            self.embeddings.path = combined             # first, so a half-written one is found as well
+            # F20: one picture is a hard link to its cache file, several are joined in blocks (make_combined_embeddings);
+            # the file is the request's own, and a failure leaves none behind
+            self.embeddings.path = make_combined_embeddings(self.vision.dir, [p for p, _ in encoded])
             # #2228: each picture's key is its normalized bytes' hash (the encoder's file name), so the engine's
             # conversation cache matches a picture by what it is, not by its embedding floats: a picture encoded again
             # (an encoder restart, the cache's eviction) with other bits still matches its checkpoints
             self.embeddings.keys = [Path(p).stem[:16] for p, _ in encoded]
-            write_temporary(combined, [p for p, _ in encoded])
         if self.family == "deepseek41" and req is not None and req.get("strata_prefix") is None and not images and not ds_pics:
             lead = self.deepseek_shared_start(messages)
             if lead:
@@ -7179,6 +7374,8 @@ def make_handler(svc: Service):
                 self._json(200, {"status": "ok", "max_context": svc.reported_ctx(), "model": svc.model,
                                  "images": svc.vision is not None, "api_key": bool(svc.api_key),
                                  "image_generation": svc.images is not None,
+                                 # F20 (high 5): the picture reader's device (gpu / cpu) and its last change
+                                 **({"vision": svc.vision.status()} if hasattr(svc.vision, "status") else {}),
                                  "loaded": svc.loaded(), "service": "strata"})
             elif path.startswith("/v1/images/files/"):
                 # response_format url: the name (32 random hex digits) is the access, as an OpenAI image URL is
@@ -9328,6 +9525,7 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
     bound_port = httpd.server_address[1]               # --port 0: report the port the OS actually assigned
     svc.start_idle_unload()
     svc.start_vision_idle()
+    svc.start_vision_gpu_retry()                        # F20: a reader that fell back to the CPU comes back to the GPU
     here = "[::1]" if a.host == "::" else "127.0.0.1" if a.host in ("0.0.0.0", "") else f"[{a.host}]" if ":" in a.host else a.host
     print(f"ready: http://{here}:{bound_port}/v1  (OpenAI: /v1/chat/completions, Anthropic: /v1/messages, "
           f"context {engine.max_context} tokens{', images on' if vision else ''}"
