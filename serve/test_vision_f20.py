@@ -49,6 +49,8 @@ class FakeReader:
             threading.Thread(target=late, daemon=True).start()
         self.lines, self.quit, self.dead = [], False, not ready
         self.stdin = self.stdout = self
+        self.closes = 0                             # close() calls (stdin and stdout are both this object: two when both are closed)
+        self.part_on_enc = False                    # ENC leaves a half-written `<out>.part<pid>` and answers ERR (a full disk)
         self.returncode = 1 if not ready else None
 
     # stdin
@@ -67,12 +69,19 @@ class FakeReader:
         def answer():
             if self.gate is not None:
                 self.gate.wait(10)
+            if self.part_on_enc:
+                (self.cwd / f"{out}.part4242").write_bytes(b"half")
+                self.answers.put("ERR No space left on device\n")
+                return
             if self.enc_error:
                 self.answers.put(f"ERR {self.enc_error}\n")
                 return
             (self.cwd / out).write_bytes(f"{self.kind}:".encode() + data)
             self.answers.put("OK 3 1 1 1\n")
         threading.Thread(target=answer, daemon=True).start()
+
+    def close(self):
+        self.closes += 1
 
     # stdout
     def readline(self):
@@ -99,6 +108,7 @@ class Farm:
         self.on_gpu_start = None          # called (in the starting thread) before a GPU reader answers
         self.gpu_ready_gate = None        # the GPU reader says READY only when this Event is set
         self.gpu_enc_error = None         # the GPU reader's ENC answers ERR with this
+        self.gpu_part_on_enc = False
 
     def popen(self, what, args, **kw):
         kind = "gpu" if "--gpu" in args else "cpu"
@@ -108,6 +118,7 @@ class Farm:
         proc = FakeReader(kind, kw["cwd"], ready=kind == "cpu" or self.gpu_ok, gate=self.gate,
                           ready_gate=self.gpu_ready_gate if gpu and self.gpu_ok else None,
                           enc_error=self.gpu_enc_error if gpu else None)
+        proc.part_on_enc = gpu and self.gpu_part_on_enc
         self.procs.append(proc)
         return proc
 
@@ -360,6 +371,87 @@ class GpuRetry(VisionTestCase):
         self.assertTrue(self.farm.procs[-1].dead or self.farm.procs[-1].quit)   # stopped, not left holding the GPU
         self.assertIsNone(v.proc)
         self.assertTrue(v.stopped)
+
+    def test_readers_that_fail_to_start_are_closed_and_not_tracked(self):
+        """Review 2 P2: each failed retry left its two pipes open and its process in `starting` (a long outage of the far
+        side would end in no file descriptors left)."""
+        v = self.make()
+        for _ in range(4):
+            self.assertEqual(v.retry_gpu(), "failed")
+        failed = [p for p in self.farm.procs[2:] if p.kind == "gpu"]
+        self.assertEqual(len(failed), 4)
+        self.assertTrue(all(p.closes == 2 for p in failed), [p.closes for p in failed])
+        self.assertEqual(v.__dict__.get("starting"), set())
+        v.unload()
+        self.assertEqual(v.__dict__.get("starting"), set())
+
+    def test_a_reader_that_fails_its_test_picture_is_closed_too(self):
+        v = self.make()
+        self.farm.gpu_ok, self.farm.gpu_enc_error = True, "cannot encode on the GPU"
+        self.assertEqual(v.retry_gpu(), "failed")
+        self.assertEqual(self.farm.procs[-1].closes, 2)
+        self.assertEqual(v.__dict__.get("starting"), set())
+
+    def test_an_unload_between_the_test_picture_and_the_switch_wins(self):
+        """Review 2 P2: unload, then the next picture starts the CPU reader again; the switch must not stop that one and
+        register the GPU reader the unload killed."""
+        v = self.make()
+        self.farm.gpu_ok = True
+        real = v._probe
+
+        def probe_then_unload_and_restart(proc):
+            real(proc)
+            v.unload()                                             # kills the starting GPU reader
+            v.restart()                                            # the next request starts the reader again
+        v._probe = probe_then_unload_and_restart
+        self.assertEqual(v.retry_gpu(), "nothing")
+        self.assertEqual(v.device, "cpu")
+        self.assertEqual(v.proc.kind, "cpu")
+        self.assertFalse(v.proc.dead or v.proc.quit)
+        self.assertFalse(v.stopped)
+        self.assertEqual(self.read(v, b"n"), b"cpu:n")            # a picture that is not cached yet still reads
+
+    def test_a_huge_integer_for_gpu_retry_s_is_just_out_of_range(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            for bad in (-(10 ** 400), 10 ** 400):
+                self.assertEqual(Vision.gpu_retry_of({"gpu_retry_s": bad}), 0.0)
+        self.assertEqual(out.getvalue().count("gpu_retry_s"), 2)
+        self.assertEqual(Vision.gpu_retry_of({"gpu_retry_s": 3}), 3.0)
+
+    def test_the_test_picture_leaves_no_partial_file(self):
+        v = self.make()
+        self.farm.gpu_ok, self.farm.gpu_part_on_enc = True, True
+        self.assertEqual(v.retry_gpu(), "failed")
+        self.assertEqual(sorted(p.name for p in v.dir.glob("probe-*")), [])
+
+    def test_remote_reader_removes_its_partial_file_when_the_write_fails(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("remote_reader_f20", ROOT / "tools/vision/remote_reader.py")
+        rr = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(rr)
+        with tempfile.TemporaryDirectory() as t:
+            target = os.path.join(t, "x.sve")
+            real_open = open
+
+            class Full:
+                def __init__(self, f):
+                    self.f = f
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *a):
+                    self.f.close()
+
+                def write(self, data):
+                    raise OSError(errno.ENOSPC, "No space left on device")
+            with mock.patch("builtins.open", lambda p, m="r", *a, **k: Full(real_open(p, m)) if str(p).startswith(t) else real_open(p, m, *a, **k)):
+                with self.assertRaises(OSError):
+                    rr.write_atomic(target, b"x" * 10)
+            self.assertEqual(os.listdir(t), [])
+            rr.write_atomic(target, b"ok")                          # and a write that works still lands
+            self.assertEqual(os.listdir(t), ["x.sve"])
 
     def test_the_service_looks_for_the_gpu_while_idle(self):
         v = self.make({**vision_cfg(), "gpu_retry_s": 0.05})

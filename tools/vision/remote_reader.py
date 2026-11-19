@@ -66,9 +66,16 @@ def parse_enc(line: str):
 
 def write_atomic(path: str, data: bytes) -> None:
     tmp = f"{path}.part{os.getpid()}"
-    with open(tmp, "wb") as f:
-        f.write(data)
-    os.replace(tmp, path)
+    try:
+        with open(tmp, "wb") as f:
+            f.write(data)
+        os.replace(tmp, path)
+    except BaseException:                       # a full disk: the half-written file does not stay beside the cache
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def from_far_side(rfile, where: str) -> None:

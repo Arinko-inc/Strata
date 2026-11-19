@@ -2841,7 +2841,8 @@ class Vision:
         v = cfg.get("gpu_retry_s")
         if v is None:
             return Vision.GPU_RETRY_S
-        if (isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v)
+        # the range is compared before anything turns the number into a float: a JSON integer of 400 digits cannot be one
+        if (isinstance(v, bool) or not isinstance(v, (int, float)) or (isinstance(v, float) and not math.isfinite(v))
                 or not 0 <= v <= Vision.GPU_RETRY_MAX_S):
             print(f'[strata] images: "gpu_retry_s" must be a number of seconds from 0 to {Vision.GPU_RETRY_MAX_S:g} '
                   f"(0 = never), not {v!r}; using {Vision.GPU_RETRY_S:g}", flush=True)
@@ -2924,6 +2925,9 @@ class Vision:
         except RuntimeError as e:                       # silent for VISION_READY_S: it was ended, and it is not left half-started
             if owner is not None:
                 owner.proc, owner.stopped = None, True
+            self._kill_reader(proc)                     # review 2: its pipes are closed and it is not tracked any more
+            if owner is None:
+                self._untrack(proc)
             if VISION_READY_S:
                 raise RuntimeError(vision_start_error("", log, waited=VISION_READY_S)) from None
             raise RuntimeError(str(e)) from None
@@ -2931,11 +2935,9 @@ class Vision:
             if owner is not None:
                 owner.proc, owner.stopped = None, True
             code = proc.poll() if hasattr(proc, "poll") else None   # an encoder that died by itself has its status already
-            try:
-                proc.kill()
-                proc.wait(timeout=5)
-            except (OSError, subprocess.TimeoutExpired):
-                pass
+            self._kill_reader(proc, 5)
+            if owner is None:
+                self._untrack(proc)
             if code is None:
                 code = getattr(proc, "returncode", None)
             raise RuntimeError(vision_start_error(line, log, code))
@@ -3009,7 +3011,7 @@ class Vision:
                 if proc is not None:
                     self._kill_reader(proc)              # READY but not usable: stopped, the CPU reader goes on
                 raise
-            return self._switch_to(proc, gpu)
+            return self._switch_to(proc, gpu, gen)
         except (RuntimeError, OSError) as e:
             if self.__dict__.get("close_gen", 0) != gen:
                 return "nothing"                         # an unload stopped the starting reader: not a failure
@@ -3022,22 +3024,33 @@ class Vision:
             if proc is not None:
                 self._untrack(proc)
 
-    def _switch_to(self, proc, gpu) -> str:
-        """The GPU reader `proc` (READY, and it has read a test picture) takes over from the CPU reader."""
-        with self.lock:                                  # waits for a picture that began meanwhile
-            if self.proc is None or self.stopped:        # unloaded while the GPU reader started: it is not kept running
+    def _switch_to(self, proc, gpu, gen) -> str:
+        """The GPU reader `proc` (READY, and it has read a test picture) takes over from the CPU reader.  `gen`: close()'s
+        count when the retry began; close() counts under _starting_lock, which the check and the switch hold, so an unload
+        either comes first (nothing is switched: the reader the unload stopped is not registered, and a reader started
+        again since is not touched) or after (it stops the reader that has taken over)."""
+        with self.lock, self._starting_lock:             # the first waits for a picture that began meanwhile
+            if self.__dict__.get("close_gen", 0) != gen:
+                old = proc
+                result = "nothing"
+            elif self.proc is None or self.stopped:        # unloaded while the GPU reader started: it is not kept running
                 old = proc
                 self.spawn, self.fallback, self.device = gpu, getattr(self, "cpu_spawn", None), "gpu"
                 self.gpu_spawn = None
                 self.switch = {"to": "gpu", "reason": "the GPU reader is tried again at the next start", "at": time.time()}
+                result = "gpu"
             else:
+                result = "gpu"
                 old, self.proc = self.proc, proc
                 self.spawn, self.fallback, self.device = gpu, getattr(self, "cpu_spawn", None), "gpu"
                 self.gpu_spawn, self.stopped, self.gpu_retry_error = None, False, None
                 self.switch = {"to": "gpu", "reason": "the GPU reader started again", "at": time.time()}
                 print("[strata] images: the GPU picture reader started again; pictures are read on the GPU", flush=True)
-        self._stop_reader(old)
-        return "gpu"
+        if result == "nothing":
+            self._kill_reader(old)
+        else:
+            self._stop_reader(old)
+        return result
 
     def restart(self):
         """Start the encoder again after an unload (or if it died); the cache of encoded images is kept."""
@@ -3238,15 +3251,24 @@ class Vision:
         self._stop_reader(proc)
 
     @staticmethod
-    def _kill_reader(proc):
-        try:
-            proc.kill()
-        except OSError:
-            pass
-        try:
-            proc.wait(timeout=10)
-        except (OSError, subprocess.TimeoutExpired):
-            pass
+    def _kill_reader(proc, wait_s: float = 10):
+        """End a reader for good: killed, waited for, and its pipes closed (a reader left with open pipes holds two
+        file descriptors for as long as the server runs)."""
+        for step in (proc.kill, lambda: proc.wait(timeout=wait_s)):
+            try:
+                step()
+            except Exception:                            # noqa: BLE001 - already gone, or slow to go: the pipes are closed all the same
+                pass
+        Vision._close_pipes(proc)
+
+    @staticmethod
+    def _close_pipes(proc):
+        for pipe in (getattr(proc, "stdin", None), getattr(proc, "stdout", None)):
+            try:
+                if pipe is not None:
+                    pipe.close()
+            except Exception:                            # noqa: BLE001 - closing a broken pipe may say so; nothing more to do
+                pass
 
     def _untrack(self, proc):
         with self._starting_lock:
@@ -3266,7 +3288,8 @@ class Vision:
             raise RuntimeError(f"the GPU reader could not read a test picture: {e}") from None
         finally:
             img.unlink(missing_ok=True)
-            out.unlink(missing_ok=True)
+            for f in (out, *self.dir.glob(f"{out.name}.part*")):      # a reader that ran out of disk leaves `<out>.part<pid>`
+                f.unlink(missing_ok=True)
         if not line.startswith("OK"):
             raise RuntimeError("the GPU reader said READY but could not read a test picture: " + (line[4:] if line.startswith("ERR") else
                                                                                                   line or "it stopped"))
@@ -3289,6 +3312,7 @@ class Vision:
                 proc.wait(timeout=10)
             except (OSError, subprocess.TimeoutExpired):
                 pass
+        Vision._close_pipes(proc)
 
     def shutdown(self):
         """#914: close() for good: the server ends, so the encoder's directory (one ~10 MB .sve per image, on a tmpfs
