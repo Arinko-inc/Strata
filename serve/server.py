@@ -51,6 +51,7 @@ import threading
 import time
 import urllib.request
 import uuid
+import zlib
 from http.client import HTTPException
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -2748,6 +2749,15 @@ def vision_start_error(line: str, log=None, code: int | None = None, waited: flo
     return msg
 
 
+def probe_png(side: int = 64) -> bytes:
+    """A small grey PNG: the test picture Vision._probe() has a new reader read before it takes over."""
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
+    raw = b"".join(b"\x00" + b"\x80" * side for _ in range(side))
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", side, side, 8, 0, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))
+
+
 class Vision:
     """The resident image encoder: `strata-vision` (llama.cpp mtmd + the mmproj file) reads `ENC <image> <out>`
     lines and writes each image's embeddings; results are cached by the image's hash, so a conversation that
@@ -2819,19 +2829,22 @@ class Vision:
                 pass
         return Vision.DEFAULT_MAX_TOKENS["gpu" if cfg.get("gpu") else "cpu"]
 
-    GPU_RETRY_S = 60.0
+    GPU_RETRY_S = 0.0                  # off unless the config names it: a GPU reader encodes a picture before its READY, which
+    GPU_RETRY_MAX_S = 86400.0          # must not happen on the GPU the engine generates on (a reader on another PC is the case for 60)
 
     @staticmethod
     def gpu_retry_of(cfg: dict) -> float:
         """F20: the vision section's "gpu_retry_s": seconds between two looks at whether the GPU reader starts again after a
-        start that fell back to the CPU reader (default 60; 0 = never).  A value that is not a number >= 0 is said and the
+        start that fell back to the CPU reader (default 0 = never; a reader that runs on another PC, like the remote
+        reader, is the case to set it for, e.g. 60).  A value that is not a finite number from 0 to 86400 is said and the
         default is used: the server does not stop for a setting of the picture reader."""
         v = cfg.get("gpu_retry_s")
         if v is None:
             return Vision.GPU_RETRY_S
-        if isinstance(v, bool) or not isinstance(v, (int, float)) or v < 0:
-            print(f'[strata] images: "gpu_retry_s" must be a number of seconds >= 0 (0 = never), not {v!r}; using '
-                  f"{Vision.GPU_RETRY_S:g}", flush=True)
+        if (isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v)
+                or not 0 <= v <= Vision.GPU_RETRY_MAX_S):
+            print(f'[strata] images: "gpu_retry_s" must be a number of seconds from 0 to {Vision.GPU_RETRY_MAX_S:g} '
+                  f"(0 = never), not {v!r}; using {Vision.GPU_RETRY_S:g}", flush=True)
             return Vision.GPU_RETRY_S
         return float(v)
 
@@ -2882,6 +2895,10 @@ class Vision:
         self.proc = self._spawn_reader(self.spawn, self)
         self.stopped = False
 
+    # review P2: readers a retry is starting (not self.proc until they are READY and have read a test picture), and how
+    # many times close() ran: an unload stops them, and the retry that started one sees the count change and gives up
+    _starting_lock = threading.Lock()
+
     def _spawn_reader(self, spawn, owner=None):
         """Start the reader of `spawn` ((args, log, env)) and wait for READY: the started process.  Raises RuntimeError
         with the reader's own message when it does not (it is not left half-started).  With `owner` (the start of the
@@ -2889,12 +2906,19 @@ class Vision:
         beside the running CPU one without owner."""
         args, log, env = spawn
         self._ensure_dir()
+        gen = self.__dict__.get("close_gen", 0)
         # cwd is the encoder's directory: the ENC lines name the files relative to it (#480: no space in the line)
         proc = popen("the image encoder", args, role="vision", stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                      stderr=log or subprocess.DEVNULL, text=True, encoding="utf-8", bufsize=1, env=env,
                      cwd=self.dir)
         if owner is not None:
             owner.proc = proc
+        else:
+            with self._starting_lock:
+                self.__dict__.setdefault("starting", set()).add(proc)
+                cancelled = self.__dict__.get("close_gen", 0) != gen      # an unload came before it was tracked
+            if cancelled:
+                self._kill_reader(proc)
         try:
             line = self._readline(VISION_READY_S, "the vision encoder did not start", proc)
         except RuntimeError as e:                       # silent for VISION_READY_S: it was ended, and it is not left half-started
@@ -2976,14 +3000,30 @@ class Vision:
                 return "gpu"
         finally:
             self.lock.release()
+        gen, proc = self.__dict__.get("close_gen", 0), None
         try:
-            proc = self._spawn_reader(gpu)
+            try:
+                proc = self._spawn_reader(gpu)
+                self._probe(proc)
+            except (RuntimeError, OSError):
+                if proc is not None:
+                    self._kill_reader(proc)              # READY but not usable: stopped, the CPU reader goes on
+                raise
+            return self._switch_to(proc, gpu)
         except (RuntimeError, OSError) as e:
+            if self.__dict__.get("close_gen", 0) != gen:
+                return "nothing"                         # an unload stopped the starting reader: not a failure
             why = " ".join(str(e).split())[:240]
             if why != getattr(self, "gpu_retry_error", None):      # said once per kind of failure, not every minute
                 print(f"[strata] images: the GPU picture reader still does not start ({why}); pictures stay on the CPU", flush=True)
             self.gpu_retry_error = why
             return "failed"
+        finally:
+            if proc is not None:
+                self._untrack(proc)
+
+    def _switch_to(self, proc, gpu) -> str:
+        """The GPU reader `proc` (READY, and it has read a test picture) takes over from the CPU reader."""
         with self.lock:                                  # waits for a picture that began meanwhile
             if self.proc is None or self.stopped:        # unloaded while the GPU reader started: it is not kept running
                 old = proc
@@ -3188,9 +3228,48 @@ class Vision:
                   "tokens' from the reader's log with the report", flush=True)
 
     def close(self):
+        with self._starting_lock:
+            self.close_gen = self.__dict__.get("close_gen", 0) + 1
+            starting = list(self.__dict__.get("starting", ()))
+        for p in starting:                               # review P2: a reader of a retry that is still starting goes too
+            self._kill_reader(p)
         proc, self.proc = self.proc, None
         self.stopped = True
         self._stop_reader(proc)
+
+    @staticmethod
+    def _kill_reader(proc):
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        try:
+            proc.wait(timeout=10)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+    def _untrack(self, proc):
+        with self._starting_lock:
+            self.__dict__.get("starting", set()).discard(proc)
+
+    def _probe(self, proc):
+        """Review P2: READY does not say the reader can encode (strata-vision's warm-up picture may have failed, and it still
+        prints READY).  One small picture is read on `proc`; RuntimeError when that is not an OK."""
+        name = f"probe-{uuid.uuid4().hex[:12]}"
+        img, out = self.dir / f"{name}.img", self.dir / f"{name}.sve"
+        img.write_bytes(probe_png())
+        try:
+            proc.stdin.write(f"ENC {img.name} {out.name}\n")
+            proc.stdin.flush()
+            line = self._readline(VISION_ENCODE_S, "the GPU reader could not read a test picture", proc).strip()
+        except OSError as e:
+            raise RuntimeError(f"the GPU reader could not read a test picture: {e}") from None
+        finally:
+            img.unlink(missing_ok=True)
+            out.unlink(missing_ok=True)
+        if not line.startswith("OK"):
+            raise RuntimeError("the GPU reader said READY but could not read a test picture: " + (line[4:] if line.startswith("ERR") else
+                                                                                                  line or "it stopped"))
 
     @staticmethod
     def _stop_reader(proc):
