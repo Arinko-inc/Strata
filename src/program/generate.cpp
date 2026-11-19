@@ -19630,7 +19630,12 @@ int main(int argc, char** argv) {
                         (long long) req_offload, chain_txt, (long long) req_chunk,
                         (long long) (sp.chain_experts_streamed() - streamed0));
             std::fflush(stdout);
-            if (admit_slot >= 0) {   // --batch: BADM <slot> <1 = continues in the batch windows | 0 = done>
+            if (admit_slot >= 0) {   // --batch: BADM <slot> <1 = continues in the batch windows | 0 = done> [failed]
+                // `failed` (a third field, after a 0): the request was to continue in the slot, but the copy of its
+                // state into the slot failed and the engine goes on without it - the request is NOT finished (its
+                // DONE says "length" after one token).  The server continues it or reports an error; a server that
+                // reads only two fields sees the 0 as before.  A lost remote link is an ERR and the engine's end.
+                bool adm_failed = false;
                 bool cont = !cancelled && produced_n == 1 && admit_max_new > 1 && std::strcmp(finish, "length") == 0 &&
                             (int64_t) live.size() == p;
                 const auto tc0 = Clock::now();
@@ -19639,6 +19644,7 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata serve: batch admission failed: %s\n", err.c_str());
                     bs[(size_t) admit_slot].cached = false;   // its sessions may be half written
                     cont = false;
+                    adm_failed = true;
                     // remote-batch: the link went meanwhile - the engine ends, as on a lost window
                     if (!remote_slot_lost.empty()) {
                         std::printf("ERR %s (a batch admission)\n", remote_slot_lost.c_str());
@@ -19776,7 +19782,7 @@ int main(int argc, char** argv) {
                                      span(tc1, tc2), span(tc3, tc4), move_best ? " (moved)" : "");
                     }
                 }
-                std::printf("BADM %d %d\n", admit_slot, cont ? 1 : 0);
+                std::printf("BADM %d %d%s\n", admit_slot, cont ? 1 : 0, adm_failed ? " failed" : "");
                 if (trace && piped && cont) {
                     rows_wait = "the admission";
                     rows_wait_t = Clock::now();
