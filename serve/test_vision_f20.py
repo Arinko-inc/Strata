@@ -22,6 +22,7 @@ import time
 import unittest
 import urllib.request
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import serve.server as server
@@ -55,6 +56,8 @@ class FakeReader:
 
     # stdin
     def write(self, text):
+        if self.closes:
+            raise ValueError("I/O operation on closed file")
         self.lines.append(text)
         if text.startswith("QUIT"):
             self.quit = True
@@ -452,6 +455,56 @@ class GpuRetry(VisionTestCase):
             self.assertEqual(os.listdir(t), [])
             rr.write_atomic(target, b"ok")                          # and a write that works still lands
             self.assertEqual(os.listdir(t), ["x.sve"])
+
+    def test_an_unload_between_ready_and_the_test_picture_is_a_cancel_not_an_error(self):
+        """Review 3 P3: the unload closes the starting reader's stdin; the write of the test picture's ENC then raises
+        ValueError, which must not end the retry as an exception or a logged failure."""
+        v = self.make()
+        self.farm.gpu_ok = True
+        real = v._probe
+
+        def unload_then_probe(proc):
+            v.unload()
+            real(proc)
+        v._probe = unload_then_probe
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(v.retry_gpu(), "nothing")
+        self.assertNotIn("still does not start", out.getvalue())
+        self.assertIsNone(v.proc)
+
+    def test_closing_a_reader_does_not_wait_for_a_read_that_does_not_end(self):
+        """Review 3 P2: a reader whose stdout a child inherited never says READY and never closes it; closing the pipe waits
+        for the blocked read, so it must not be the caller that waits."""
+        release = threading.Event()
+        reading = threading.Lock()
+
+        class Stuck(FakeReader):
+            def readline(self):
+                with reading:                                      # a read in progress holds the pipe's lock, as TextIOWrapper's
+                    release.wait(10)
+                return ""
+
+            def close(self):
+                with reading:
+                    self.closes += 1
+        v = self.make({**vision_cfg(), "gpu": False, "cpu_exe": None})
+        stuck = Stuck("cpu", v.dir)
+        stuck.answers = queue.Queue()
+        stuck.dead = False
+        stuck.stdin = SimpleNamespace(write=lambda text: None, flush=lambda: None, close=lambda: None)   # its own pipe
+        with mock.patch.object(server, "popen", lambda *a, **k: stuck), mock.patch.object(server, "VISION_READY_S", 0.3):
+            t0 = time.monotonic()
+            with self.assertRaises(RuntimeError):
+                v._spawn_reader(v.spawn)
+            took = time.monotonic() - t0
+        self.assertLess(took, 3)                                   # the timeout, not the child's end
+        release.set()                                              # the child ends: the pipe is closed in the background
+        for _ in range(200):
+            if stuck.closes >= 1:
+                break
+            time.sleep(0.01)
+        self.assertEqual(stuck.closes, 1)                          # stdout (stdin was its own object)
 
     def test_the_service_looks_for_the_gpu_while_idle(self):
         v = self.make({**vision_cfg(), "gpu_retry_s": 0.05})

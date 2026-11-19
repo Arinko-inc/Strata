@@ -3223,12 +3223,19 @@ class Vision:
 
     @staticmethod
     def _close_pipes(proc):
-        for pipe in (getattr(proc, "stdin", None), getattr(proc, "stdout", None)):
+        """Close a reader's pipes without waiting: closing stdout waits for a read that is still blocked on it (a child of the
+        reader that inherited the pipe keeps it open after the reader is killed), so that close runs in a daemon thread
+        and the caller goes on (review 3)."""
+        def close(pipe):
             try:
-                if pipe is not None:
-                    pipe.close()
+                pipe.close()
             except Exception:                            # noqa: BLE001 - closing a broken pipe may say so; nothing more to do
                 pass
+        stdin, stdout = getattr(proc, "stdin", None), getattr(proc, "stdout", None)
+        if stdin is not None:
+            close(stdin)
+        if stdout is not None:
+            threading.Thread(target=close, args=(stdout,), daemon=True).start()
 
     def _untrack(self, proc):
         with self._starting_lock:
@@ -3244,7 +3251,7 @@ class Vision:
             proc.stdin.write(f"ENC {img.name} {out.name}\n")
             proc.stdin.flush()
             line = self._readline(VISION_ENCODE_S, "the GPU reader could not read a test picture", proc).strip()
-        except OSError as e:
+        except (OSError, ValueError) as e:                # ValueError: stdin was closed (an unload; retry_gpu() sees the count change)
             raise RuntimeError(f"the GPU reader could not read a test picture: {e}") from None
         finally:
             img.unlink(missing_ok=True)
