@@ -35,10 +35,18 @@ class FakeReader:
     """A `strata-vision` process object: READY (or an error line), then every `ENC <image> <out>` writes <out> in its
     working directory (named after the reader and the image) and answers `OK 3 ...`.  `gate`: an Event the answers wait for."""
 
-    def __init__(self, kind, cwd, ready=True, gate=None):
+    def __init__(self, kind, cwd, ready=True, gate=None, ready_gate=None, enc_error=None):
         self.kind, self.cwd, self.gate = kind, Path(cwd), gate
+        self.enc_error = enc_error                  # every ENC answers `ERR <this>` (a warm-up that failed under READY)
         self.answers: queue.Queue = queue.Queue()
-        self.answers.put("READY 8\n" if ready else "ERR connection to 8797 refused\n")
+        if ready_gate is None:
+            self.answers.put("READY 8\n" if ready else "ERR connection to 8797 refused\n")
+        else:                                       # READY only when the gate opens (a start that takes its time)
+            def late():
+                ready_gate.wait(10)
+                if not self.dead:
+                    self.answers.put("READY 8\n")
+            threading.Thread(target=late, daemon=True).start()
         self.lines, self.quit, self.dead = [], False, not ready
         self.stdin = self.stdout = self
         self.returncode = 1 if not ready else None
@@ -59,6 +67,9 @@ class FakeReader:
         def answer():
             if self.gate is not None:
                 self.gate.wait(10)
+            if self.enc_error:
+                self.answers.put(f"ERR {self.enc_error}\n")
+                return
             (self.cwd / out).write_bytes(f"{self.kind}:".encode() + data)
             self.answers.put("OK 3 1 1 1\n")
         threading.Thread(target=answer, daemon=True).start()
@@ -86,12 +97,17 @@ class Farm:
         self.procs: list[FakeReader] = []
         self.gate = None                  # given to the next readers
         self.on_gpu_start = None          # called (in the starting thread) before a GPU reader answers
+        self.gpu_ready_gate = None        # the GPU reader says READY only when this Event is set
+        self.gpu_enc_error = None         # the GPU reader's ENC answers ERR with this
 
     def popen(self, what, args, **kw):
         kind = "gpu" if "--gpu" in args else "cpu"
         if kind == "gpu" and self.on_gpu_start is not None:
             self.on_gpu_start()
-        proc = FakeReader(kind, kw["cwd"], ready=kind == "cpu" or self.gpu_ok, gate=self.gate)
+        gpu = kind == "gpu"
+        proc = FakeReader(kind, kw["cwd"], ready=kind == "cpu" or self.gpu_ok, gate=self.gate,
+                          ready_gate=self.gpu_ready_gate if gpu and self.gpu_ok else None,
+                          enc_error=self.gpu_enc_error if gpu else None)
         self.procs.append(proc)
         return proc
 
@@ -101,7 +117,7 @@ class Farm:
 
 def vision_cfg(**extra):
     return {"exe": "/x/remote_reader.py", "mmproj": "/x/m.gguf", "model": "/x/g.gguf", "gpu": True,
-            "cpu_exe": "/x/strata-vision", **extra}
+            "cpu_exe": "/x/strata-vision", "gpu_retry_s": 60, **extra}
 
 
 class VisionTestCase(unittest.TestCase):
@@ -236,18 +252,79 @@ class GpuRetry(VisionTestCase):
         self.assertTrue(cpu.quit)
         self.assertEqual(v.device, "gpu")
 
-    def test_gpu_retry_s_zero_turns_it_off_and_a_bad_value_is_the_default(self):
-        v = self.make({**vision_cfg(), "gpu_retry_s": 0})
-        self.assertEqual(v.gpu_retry_s, 0)
+    def test_the_retry_is_off_unless_the_config_asks_for_it(self):
+        """Review P1: a GPU reader encodes a picture before it says READY, so a retry on the GPU the engine is generating on
+        can stall the generation.  Only a configuration that names "gpu_retry_s" (a reader on another PC) retries."""
+        self.assertEqual(Vision.gpu_retry_of({}), 0.0)
+        cfg = vision_cfg()
+        del cfg["gpu_retry_s"]
+        v = self.make(cfg)
+        self.assertEqual(v.device, "cpu")
+        self.farm.gpu_ok = True
         self.assertEqual(v.retry_gpu(), "nothing")
+        self.assertEqual(self.farm.kinds(), ["gpu", "cpu"])        # no GPU reader was started again
         self.assertNotIn("tried again", self.log)
-        self.assertEqual(Vision.gpu_retry_of({}), 60.0)
+        tok = ByteTokenizer()
+        svc = Service(MockEngine(tok, "ok", max_context=4096), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"), vision=v)
+        svc.start_vision_gpu_retry()                               # no thread to look at it
+        time.sleep(0.1)
+        self.assertEqual(self.farm.kinds(), ["gpu", "cpu"])
+
+    def test_gpu_retry_s_range(self):
+        self.assertEqual(Vision.gpu_retry_of({"gpu_retry_s": 0}), 0.0)
         self.assertEqual(Vision.gpu_retry_of({"gpu_retry_s": 5}), 5.0)
+        self.assertEqual(Vision.gpu_retry_of({"gpu_retry_s": 86400}), 86400.0)
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            for bad in (-1, "x", True):
-                self.assertEqual(Vision.gpu_retry_of({"gpu_retry_s": bad}), 60.0)
-        self.assertEqual(out.getvalue().count("gpu_retry_s"), 3)
+            for bad in (-1, "x", True, 1e999, float("nan"), 86401, 1e300):
+                self.assertEqual(Vision.gpu_retry_of({"gpu_retry_s": bad}), 0.0, bad)
+        self.assertEqual(out.getvalue().count("gpu_retry_s"), 7)
+
+    def test_infinity_never_reaches_the_retry_thread_or_health(self):
+        v = self.make({**vision_cfg(), "gpu_retry_s": json.loads("1e999")})
+        self.assertEqual(v.gpu_retry_s, 0.0)
+        self.assertNotIn("Infinity", json.dumps(v.status()))
+
+    def test_an_unload_during_the_start_stops_the_starting_reader(self):
+        """Review P2: the GPU reader of a retry is not v.proc until READY; an unload that came meanwhile left it running."""
+        v = self.make()
+        gate = threading.Event()
+        self.farm.gpu_ok, self.farm.gpu_ready_gate = True, gate
+        got = []
+        r = threading.Thread(target=lambda: got.append(v.retry_gpu()))
+        r.start()
+        for _ in range(200):
+            if len(self.farm.procs) == 3:
+                break
+            time.sleep(0.01)
+        starting = self.farm.procs[-1]
+        self.assertEqual(starting.kind, "gpu")
+        v.unload()                                                 # returns only when the starting reader is stopped too
+        self.assertTrue(starting.dead or starting.quit)
+        self.assertIsNone(v.proc)
+        gate.set()
+        r.join(10)
+        self.assertNotEqual(got, ["gpu"])
+        self.assertIsNone(v.proc)
+        self.assertTrue(v.stopped)
+
+    def test_a_gpu_reader_whose_warm_up_failed_is_not_switched_to(self):
+        """Review P2: READY does not say the GPU can encode (the warm-up's failure is only logged); a picture is encoded
+        before the CPU reader stops, and the CPU reader goes on when that fails."""
+        v = self.make()
+        cpu = v.proc
+        self.farm.gpu_ok, self.farm.gpu_enc_error = True, "cannot encode on the GPU"
+        self.assertEqual(v.retry_gpu(), "failed")
+        self.assertEqual((v.device, v.proc), ("cpu", cpu))
+        self.assertFalse(cpu.quit)
+        self.assertTrue(self.farm.procs[-1].dead or self.farm.procs[-1].quit)    # the unusable GPU reader is stopped
+        self.assertIn("cannot encode", v.status()["gpu_retry_error"])
+        self.assertEqual(self.read(v, b"p"), b"cpu:p")             # pictures still work
+        self.assertEqual(list(v.dir.glob("probe-*")), [])
+        self.farm.gpu_enc_error = None                             # the next look finds it healthy
+        self.assertEqual(v.retry_gpu(), "gpu")
+        self.assertEqual(self.read(v, b"q"), b"gpu:q")
+        self.assertEqual(list(v.dir.glob("probe-*")), [])
 
     def test_recovery_and_a_second_failure_in_a_row(self):
         v = self.make()
@@ -279,8 +356,8 @@ class GpuRetry(VisionTestCase):
         v = self.make()
         self.farm.gpu_ok = True
         self.farm.on_gpu_start = v.unload                          # the elastic idle stop comes while the GPU reader starts
-        self.assertEqual(v.retry_gpu(), "gpu")
-        self.assertTrue(self.farm.procs[-1].quit)                  # stopped again, not left holding the GPU
+        self.assertEqual(v.retry_gpu(), "nothing")                 # the unload is not counted as a failure
+        self.assertTrue(self.farm.procs[-1].dead or self.farm.procs[-1].quit)   # stopped, not left holding the GPU
         self.assertIsNone(v.proc)
         self.assertTrue(v.stopped)
 
