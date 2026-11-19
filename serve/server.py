@@ -2859,6 +2859,7 @@ class Vision:
     # review P2: readers a retry is starting (not self.proc until they are READY and have read a test picture), and how
     # many times close() ran: an unload stops them, and the retry that started one sees the count change and gives up
     _starting_lock = threading.Lock()
+    _closing: list = []                                  # review 4: the threads still closing a stopped reader's stdout
 
     def _spawn_reader(self, spawn, owner=None):
         """Start the reader of `spawn` ((args, log, env)) and wait for READY: the started process.  Raises RuntimeError
@@ -2962,6 +2963,16 @@ class Vision:
                 return "gpu"
         finally:
             self.lock.release()
+        with self._starting_lock:
+            stuck = any(t.is_alive() for t in Vision._closing)
+        if stuck:
+            # a descendant of an earlier failed reader still holds its stdout: another try would leave one more pipe and two
+            # threads behind each time, so there is none until that one is closed
+            why = "the stdout of an earlier GPU reader is still open (a child process of it holds it); not tried again until it closes"
+            if why != getattr(self, "gpu_retry_error", None):
+                print(f"[strata] images: {why}", flush=True)
+            self.gpu_retry_error = why
+            return "failed"
         gen, proc = self.__dict__.get("close_gen", 0), None
         try:
             try:
@@ -3235,7 +3246,10 @@ class Vision:
         if stdin is not None:
             close(stdin)
         if stdout is not None:
-            threading.Thread(target=close, args=(stdout,), daemon=True).start()
+            t = threading.Thread(target=close, args=(stdout,), daemon=True)
+            with Vision._starting_lock:
+                Vision._closing[:] = [c for c in Vision._closing if c.is_alive()] + [t]
+            t.start()
 
     def _untrack(self, proc):
         with self._starting_lock:
