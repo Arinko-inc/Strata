@@ -50,6 +50,7 @@ class FakeReader:
             threading.Thread(target=late, daemon=True).start()
         self.lines, self.quit, self.dead = [], False, not ready
         self.stdin = self.stdout = self
+        self.closed_both = threading.Event()        # set when both pipes are closed (stdout is closed in a background thread)
         self.closes = 0                             # close() calls (stdin and stdout are both this object: two when both are closed)
         self.part_on_enc = False                    # ENC leaves a half-written `<out>.part<pid>` and answers ERR (a full disk)
         self.returncode = 1 if not ready else None
@@ -85,6 +86,8 @@ class FakeReader:
 
     def close(self):
         self.closes += 1
+        if self.closes >= 2:
+            self.closed_both.set()
 
     # stdout
     def readline(self):
@@ -101,6 +104,27 @@ class FakeReader:
         return 0
 
 
+def stuck_reader_class(release, reading):
+    """A reader whose stdout a child process kept open: a read that does not end until `release`, and a close of that pipe
+    that waits for the read (as TextIOWrapper's does), on a stdin of its own."""
+    class Stuck(FakeReader):
+        def __init__(self, kind, cwd, **kw):
+            super().__init__(kind, cwd, **kw)
+            self.answers = queue.Queue()
+            self.dead = False
+            self.stdin = SimpleNamespace(write=lambda text: None, flush=lambda: None, close=lambda: None)
+
+        def readline(self):
+            with reading:
+                release.wait(10)
+            return ""
+
+        def close(self):
+            with reading:
+                self.closes += 1
+    return Stuck
+
+
 class Farm:
     """The popen stand-in: which readers were started (by kind), and whether the GPU one starts."""
 
@@ -112,12 +136,17 @@ class Farm:
         self.gpu_ready_gate = None        # the GPU reader says READY only when this Event is set
         self.gpu_enc_error = None         # the GPU reader's ENC answers ERR with this
         self.gpu_part_on_enc = False
+        self.make_gpu = None              # a function (cwd) -> the GPU reader, instead of the usual stand-in
 
     def popen(self, what, args, **kw):
         kind = "gpu" if "--gpu" in args else "cpu"
         if kind == "gpu" and self.on_gpu_start is not None:
             self.on_gpu_start()
         gpu = kind == "gpu"
+        if gpu and self.make_gpu is not None:
+            proc = self.make_gpu(kw["cwd"])
+            self.procs.append(proc)
+            return proc
         proc = FakeReader(kind, kw["cwd"], ready=kind == "cpu" or self.gpu_ok, gate=self.gate,
                           ready_gate=self.gpu_ready_gate if gpu and self.gpu_ok else None,
                           enc_error=self.gpu_enc_error if gpu else None)
@@ -383,7 +412,8 @@ class GpuRetry(VisionTestCase):
             self.assertEqual(v.retry_gpu(), "failed")
         failed = [p for p in self.farm.procs[2:] if p.kind == "gpu"]
         self.assertEqual(len(failed), 4)
-        self.assertTrue(all(p.closes == 2 for p in failed), [p.closes for p in failed])
+        for p in failed:
+            self.assertTrue(p.closed_both.wait(5), p.closes)       # stdout is closed in a background thread
         self.assertEqual(v.__dict__.get("starting"), set())
         v.unload()
         self.assertEqual(v.__dict__.get("starting"), set())
@@ -392,7 +422,7 @@ class GpuRetry(VisionTestCase):
         v = self.make()
         self.farm.gpu_ok, self.farm.gpu_enc_error = True, "cannot encode on the GPU"
         self.assertEqual(v.retry_gpu(), "failed")
-        self.assertEqual(self.farm.procs[-1].closes, 2)
+        self.assertTrue(self.farm.procs[-1].closed_both.wait(5))
         self.assertEqual(v.__dict__.get("starting"), set())
 
     def test_an_unload_between_the_test_picture_and_the_switch_wins(self):
@@ -476,23 +506,10 @@ class GpuRetry(VisionTestCase):
     def test_closing_a_reader_does_not_wait_for_a_read_that_does_not_end(self):
         """Review 3 P2: a reader whose stdout a child inherited never says READY and never closes it; closing the pipe waits
         for the blocked read, so it must not be the caller that waits."""
-        release = threading.Event()
-        reading = threading.Lock()
-
-        class Stuck(FakeReader):
-            def readline(self):
-                with reading:                                      # a read in progress holds the pipe's lock, as TextIOWrapper's
-                    release.wait(10)
-                return ""
-
-            def close(self):
-                with reading:
-                    self.closes += 1
+        release, reading = threading.Event(), threading.Lock()
+        Stuck = stuck_reader_class(release, reading)
         v = self.make({**vision_cfg(), "gpu": False, "cpu_exe": None})
         stuck = Stuck("cpu", v.dir)
-        stuck.answers = queue.Queue()
-        stuck.dead = False
-        stuck.stdin = SimpleNamespace(write=lambda text: None, flush=lambda: None, close=lambda: None)   # its own pipe
         with mock.patch.object(server, "popen", lambda *a, **k: stuck), mock.patch.object(server, "VISION_READY_S", 0.3):
             t0 = time.monotonic()
             with self.assertRaises(RuntimeError):
@@ -505,6 +522,31 @@ class GpuRetry(VisionTestCase):
                 break
             time.sleep(0.01)
         self.assertEqual(stuck.closes, 1)                          # stdout (stdin was its own object)
+
+    def test_no_new_retry_while_a_stdout_of_an_earlier_failure_is_still_open(self):
+        """Review 4 P2: a descendant of a failed reader keeps its stdout open, and the close waits in a thread; every retry
+        would add a pipe and two threads.  Not another retry until that one is closed: one pair at most."""
+        release, reading = threading.Event(), threading.Lock()
+        Stuck = stuck_reader_class(release, reading)
+        v = self.make()
+        self.farm.make_gpu = lambda cwd: Stuck("gpu", cwd)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), mock.patch.object(server, "VISION_READY_S", 0.3):
+            self.assertEqual(v.retry_gpu(), "failed")              # times out; its stdout stays open
+            started = len(self.farm.procs)
+            for _ in range(3):
+                self.assertEqual(v.retry_gpu(), "failed")
+            self.assertEqual(len(self.farm.procs), started)        # no new reader was started
+            self.assertIn("still open", v.status()["gpu_retry_error"])
+            self.assertEqual(out.getvalue().count("still open"), 1)    # said once
+            release.set()                                          # the descendant ends: the pipe closes
+            for _ in range(200):
+                if all(not t.is_alive() for t in Vision._closing):
+                    break
+                time.sleep(0.01)
+            self.farm.make_gpu = None
+            self.assertEqual(v.retry_gpu(), "failed")              # tried again (the far side is still down)
+        self.assertEqual(len(self.farm.procs), started + 1)
 
     def test_the_service_looks_for_the_gpu_while_idle(self):
         v = self.make({**vision_cfg(), "gpu_retry_s": 0.05})
