@@ -197,6 +197,13 @@ while True:
               (f" 0 0 0 0 0.0 {len(ids) - reused(ids)}" if READF else ""), flush=True)
         if slot is not None:
             cont = fin == "length" and max_new > 1
+            # the copy into the slot fails (the engine goes on): ADMFAILONCE the first time, ADMFAILALL every time
+            if cont and (b"ADMFAILALL" in pb or (b"ADMFAILONCE" in pb and "admfail" not in fired)):
+                fired.add("admfail")
+                if log:
+                    log.write(f"ADMFAILED {slot}\n"); log.flush()
+                print(f"BADM {slot} 0 failed", flush=True)
+                continue
             if cont:
                 active[slot] = [toks[1:], max_new, 1]
             print(f"BADM {slot} {1 if cont else 0}", flush=True)
@@ -462,6 +469,134 @@ class ParallelService(FakeEngineCase):
             self.assertIn("remote stage (worker): SlotRun: a test error", out[k][2])
             self.assertIn("Retry-After", out[k][3])
         self.assertIn("remote stage (worker): SlotRun: a test error", self.engine.death_note())
+
+    LONG_TEXT = "ok, " + "la " * 15 + "done."
+
+    def _stream(self, text, max_tokens=64):
+        """A streamed chat request -> (the text of its deltas, its finish reasons, its error events)."""
+        body = {"messages": [{"role": "user", "content": text}], "max_tokens": max_tokens,
+                "reasoning_effort": "none", "stream": True}
+        req = urllib.request.Request(self.base + "/v1/chat/completions", data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json"})
+        parts, finishes, errors = [], [], []
+        with urllib.request.urlopen(req, timeout=60) as r:
+            for raw in r:
+                line = raw.decode().strip()
+                if not line.startswith("data: ") or line == "data: [DONE]":
+                    continue
+                e = json.loads(line[6:])
+                if "error" in e:
+                    errors.append(e["error"])
+                for c in e.get("choices") or []:
+                    parts.append((c.get("delta") or {}).get("content") or "")
+                    if c.get("finish_reason"):
+                        finishes.append(c["finish_reason"])
+        return "".join(parts), finishes, errors
+
+    def _slots_free_and_usable(self):
+        deadline = time.time() + 5
+        while time.time() < deadline and any(self.engine.slot_busy):
+            time.sleep(0.05)
+        self.assertEqual(self.engine.slot_busy, [False, False])
+        self.assertEqual(self.engine.slot_live, [None, None])
+        self.assertEqual(self.engine.waiting, 0)
+        before = self.log.read_text().count("BGEN ")
+        out = self._two_at_once("after the failure")           # the control lines and both slots serve again
+        self.assertEqual(out["a"][0], "ok", out["a"])
+        self.assertEqual(out["a"][1]["choices"][0]["message"]["content"], self.LONG_TEXT)
+        self.assertEqual(out["b"][0], "ok", out["b"])
+        self.assertEqual(out["b"][1]["choices"][0]["message"]["content"], "ok, done.")
+        self.assertGreater(self.log.read_text().count("BGEN "), before)
+
+    def test_a_failed_slot_admission_is_continued_to_the_whole_answer(self):
+        """11-18 review, high 1 (+ GLM N-1): the engine could not move a request into its slot and goes on (`BADM
+        <slot> 0 failed`).  That was read as the request's end: 8 tokens, "length", HTTP 200.  The request continues
+        from what it has and ends as it would have: the whole reply, "stop"; the request beside it completes."""
+        self.start(2)
+        out = {}
+        def go(k, text):
+            out[k] = self.chat(text, max_tokens=64)
+        ta = threading.Thread(target=go, args=("a", "LONGREPLY ADMFAILONCE please"))
+        ta.start()
+        time.sleep(0.15)
+        go("b", "second question")
+        ta.join(30)
+        self.assertEqual(self.log.read_text().count("ADMFAILED"), 1)
+        a = out["a"]["choices"][0]
+        self.assertEqual(a["message"]["content"], self.LONG_TEXT)       # nothing lost, nothing sent twice
+        self.assertEqual(a["finish_reason"], "stop")
+        self.assertEqual(out["a"]["usage"]["completion_tokens"], len(self.LONG_TEXT) + 1)
+        self.assertEqual(out["b"]["choices"][0]["message"]["content"], "ok, done.")
+        self._slots_free_and_usable()
+
+    def test_a_failed_slot_admission_is_continued_in_a_stream_and_under_max_tokens(self):
+        """... the same in a stream (each token once), and with a max_tokens the reply does not fit in: "length" at
+        exactly that many tokens (the continuation asks for the rest only)."""
+        self.start(2)
+        got = {}
+        ta = threading.Thread(target=lambda: got.update(a=self._stream("LONGREPLY ADMFAILONCE please")))
+        ta.start()
+        time.sleep(0.15)
+        self.assertEqual(self.chat("second question")["choices"][0]["message"]["content"], "ok, done.")
+        ta.join(30)
+        self.assertEqual(got["a"], (self.LONG_TEXT, ["stop"], []))
+        self.assertEqual(self.log.read_text().count("ADMFAILED"), 1)
+        self.tearDown()
+        self.start(2)
+        out = {}
+        ta = threading.Thread(target=lambda: out.update(a=self.chat("LONGREPLY ADMFAILONCE please", max_tokens=30)))
+        ta.start()
+        time.sleep(0.15)
+        self.chat("second question")
+        ta.join(30)
+        self.assertEqual(self.log.read_text().count("ADMFAILED"), 1)
+        a = out["a"]["choices"][0]
+        self.assertEqual(a["message"]["content"], self.LONG_TEXT[:30])
+        self.assertEqual(a["finish_reason"], "length")
+        self.assertEqual(out["a"]["usage"]["completion_tokens"], 30)
+        self._slots_free_and_usable()
+
+    def test_a_slot_admission_that_keeps_failing_is_an_error_not_a_200_length(self):
+        """... and when the continuation's admission fails too: a 503 with Retry-After (not streamed), an error event
+        and no finish reason (streamed) - never a short answer that ends "length".  The request beside it completes,
+        and the next requests use the control lines and the slots."""
+        self.start(2)
+        out = self._two_at_once_first("LONGREPLY ADMFAILALL please", "second question")
+        self.assertEqual(out["a"][0], "http", out["a"])
+        self.assertEqual(out["a"][1], 503, out["a"])
+        self.assertIn("could not move this request into a batch slot", out["a"][2])
+        self.assertIn("Retry-After", out["a"][3])
+        self.assertEqual(out["b"][0], "ok", out["b"])
+        self.assertEqual(out["b"][1]["choices"][0]["message"]["content"], "ok, done.")
+        self.assertEqual(self.log.read_text().count("ADMFAILED"), 2)       # continued once, not for ever
+        self._slots_free_and_usable()
+        got = {}
+        ta = threading.Thread(target=lambda: got.update(a=self._stream("LONGREPLY ADMFAILALL please")))
+        ta.start()
+        time.sleep(0.15)
+        self.assertEqual(self.chat("second question")["choices"][0]["message"]["content"], "ok, done.")
+        ta.join(30)
+        text, finishes, errors = got["a"]
+        self.assertEqual(finishes, [], got["a"])
+        self.assertEqual(len(errors), 1, got["a"])
+        self.assertIn("could not move this request into a batch slot", errors[0]["message"])
+        self.assertTrue(self.LONG_TEXT.startswith(text) and 0 < len(text) < len(self.LONG_TEXT), text)
+        self._slots_free_and_usable()
+
+    def _two_at_once_first(self, text_a, text_b):
+        """As _two_at_once, with the first (long) request's text given."""
+        out = {}
+        def go(k, text):
+            try:
+                out[k] = ("ok", self.chat(text, max_tokens=64))
+            except urllib.error.HTTPError as e:
+                out[k] = ("http", e.code, e.read().decode(), dict(e.headers))
+        ta = threading.Thread(target=go, args=("a", text_a))
+        ta.start()
+        time.sleep(0.15)
+        go("b", text_b)
+        ta.join(30)
+        return out
 
     def test_engine_reports_fewer_slots(self):
         self.start(4, fit=2)

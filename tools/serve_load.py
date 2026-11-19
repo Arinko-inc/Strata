@@ -9,6 +9,13 @@ wall time of the burst), per-request tokens/s, time to first token (p50 / p95 ov
 the request latency (p50 / p95).  With --save DIR it writes every answer, so a later run can be compared byte for
 byte with `--compare DIR` (greedy answers of a request must not depend on who else ran).
 
+Exit status: 0 only when every request really succeeded.  It is 1 when any request failed (HTTP/connection error, an
+error event inside the stream), when fewer or more answers came back than were sent, when a stream did not end with
+`data: [DONE]`, when the finish_reason is missing or not one of FINISH_OK, when the usage is missing or says 0 output
+tokens, when --compare was given and the reference file of an answer is missing, or when an answer differs from its
+reference.  The last two lines of the output are `result: ...` (how many requests were fine) and `failures: ...` (the
+breakdown by cause).
+
 Standard library only.  The prompts are fixed texts, so two runs of the tool send the same requests.
 """
 import argparse, json, os, statistics, sys, threading, time, urllib.request
@@ -23,6 +30,32 @@ TOPICS = [
     "how a transistor switches, explained for a curious teenager",
     "the life of a honey bee colony through one year",
 ]
+
+
+# the finish_reason values a healthy answer ends with ("cancel" is sent as "stop" by the server)
+FINISH_OK = ("stop", "length", "tool_calls")
+
+
+def problems(r):
+    """The ways a request result is not a success (empty list = fine).  Names are the keys of the `failures:` line."""
+    p = []
+    if r.get("err"):
+        p.append("request_error")
+    if r.get("stream_error"):
+        p.append("stream_error")
+    if not r.get("done"):
+        p.append("no_done")
+    fin = r.get("finish")
+    if fin is None:
+        p.append("no_finish")
+    elif fin not in FINISH_OK:
+        p.append("bad_finish")
+    u = r.get("usage_tokens")
+    if u is None:
+        p.append("no_usage")
+    elif u <= 0:
+        p.append("zero_tokens")
+    return p
 
 
 def prompt_for(i: int, words: int, nonce: str = "") -> str:
@@ -44,6 +77,7 @@ def one(url, key, model, i, words, max_tokens, res, extra, think, nonce=""):
     t0 = time.perf_counter()
     first, n, text = None, 0, []
     err = None
+    done, finish, usage_tokens, stream_error = False, None, None, None
     try:
         with urllib.request.urlopen(req, timeout=900) as r:
             for raw in r:
@@ -52,13 +86,20 @@ def one(url, key, model, i, words, max_tokens, res, extra, think, nonce=""):
                     continue
                 d = line[5:].strip()
                 if d == "[DONE]":
+                    done = True
                     break
                 try:
                     j = json.loads(d)
                 except ValueError:
                     continue
-                for ch in j.get("choices", []):
-                    dl = ch.get("delta", {})
+                if not isinstance(j, dict):
+                    continue
+                if j.get("error"):
+                    stream_error = str(j["error"])[:200]
+                for ch in j.get("choices") or []:
+                    if ch.get("finish_reason") is not None:
+                        finish = ch["finish_reason"]
+                    dl = ch.get("delta") or {}
                     piece = (dl.get("content") or "") + (dl.get("reasoning_content") or "")
                     if piece:
                         if first is None:
@@ -66,10 +107,13 @@ def one(url, key, model, i, words, max_tokens, res, extra, think, nonce=""):
                         n += 1                      # one SSE chunk = one token (the server flushes per token)
                         text.append(piece)
                 if j.get("usage"):
-                    n = j["usage"].get("completion_tokens", n)
+                    usage_tokens = j["usage"].get("completion_tokens", usage_tokens)
+                    if usage_tokens is not None:
+                        n = usage_tokens
     except Exception as e:                          # noqa: BLE001
         err = repr(e)
-    res[i] = {"first": first, "tokens": n, "total": time.perf_counter() - t0, "text": "".join(text), "err": err}
+    res[i] = {"first": first, "tokens": n, "total": time.perf_counter() - t0, "text": "".join(text), "err": err,
+              "done": done, "finish": finish, "usage_tokens": usage_tokens, "stream_error": stream_error}
 
 
 def pct(v, p):
@@ -100,6 +144,10 @@ def main():
     extra = {}
     out = []
     bad = 0
+    sent = 0                                        # requests started
+    fails = {}                                      # failure name -> number of requests (or files, for the counts)
+    failed_reqs = 0
+    compared_ok = 0                                 # answers that were fine and identical to their reference file
     for c in [int(x) for x in a.clients.split(",")]:
         rows = []
         for rd in range(a.rounds):
@@ -115,8 +163,24 @@ def main():
             for t in th:
                 t.join()
             wall = time.perf_counter() - t0
+            sent += c
+            missing = [i for i in range(c) if i not in res]
+            if missing or len(res) != c:
+                fails["count_mismatch"] = fails.get("count_mismatch", 0) + max(len(missing), abs(len(res) - c))
+                print(f"  COUNT MISMATCH c={c} round={rd}: sent {c}, got {len(res)} results (missing {missing})", flush=True)
+            for i in range(c):
+                r = res.get(i)
+                if r is None:                       # a thread that died before it stored anything (counted above)
+                    failed_reqs += 1
+                    continue
+                pr = problems(r)
+                for name in pr:
+                    fails[name] = fails.get(name, 0) + 1
+                if pr:
+                    failed_reqs += 1
+                    print(f"  FAILED c={c} round={rd} req={i}: {', '.join(pr)}", flush=True)
             toks = sum(r["tokens"] for r in res.values())
-            errs = [r["err"] for r in res.values() if r["err"]]
+            errs = [r["err"] or ("stream error: " + r["stream_error"]) for r in res.values() if r["err"] or r["stream_error"]]
             firsts = [r["first"] for r in res.values() if r["first"] is not None]
             tot = [r["total"] for r in res.values()]
             per = [r["tokens"] / max(r["total"] - (r["first"] or 0), 1e-6) for r in res.values()]
@@ -129,9 +193,15 @@ def main():
             if a.compare:
                 for i, r in res.items():
                     p = os.path.join(a.compare, f"c{c}", f"r{rd}", f"{i}.txt")
-                    if os.path.exists(p):
+                    if not os.path.exists(p):
+                        print(f"  MISSING REFERENCE c={c} round={rd} req={i}: {p}", flush=True)
+                        fails["compare_missing"] = fails.get("compare_missing", 0) + 1
+                    else:
                         ref = open(p, encoding="utf-8").read()
-                        if ref != r["text"]:
+                        if ref == r["text"]:
+                            if not problems(r):
+                                compared_ok += 1
+                        else:
                             n = next((k for k, (x, y) in enumerate(zip(ref, r["text"])) if x != y), min(len(ref), len(r["text"])))
                             print(f"  DIFF c={c} round={rd} req={i}: first difference at char {n}")
                             bad += 1
@@ -152,8 +222,19 @@ def main():
     if a.json:
         json.dump(out, open(a.json, "w"), indent=1)
     if a.compare:
-        print("compare:", "ALL IDENTICAL" if not bad else f"{bad} DIFFERENT")
-    return 1 if bad else 0
+        miss = fails.get("compare_missing", 0)
+        # "ALL IDENTICAL" only when every request that was sent was compared and matched
+        if compared_ok == sent and not bad and not miss and sent:
+            print("compare: ALL IDENTICAL")
+        else:
+            why = [x for x in (f"{bad} DIFFERENT" if bad else "", f"{miss} REFERENCE FILES MISSING" if miss else "",
+                               f"{sent - compared_ok} OF {sent} NOT COMPARED OK") if x]
+            print("compare:", ", ".join(why))
+    if bad:
+        fails["diff"] = bad
+    print(f"result: {sent - failed_reqs}/{sent} requests ok" + (f", {compared_ok}/{sent} compared" if a.compare else ""))
+    print("failures: " + (", ".join(f"{k}={v}" for k, v in fails.items()) if fails else "none"))
+    return 1 if (bad or fails or failed_reqs or (a.compare and compared_ok != sent)) else 0
 
 
 if __name__ == "__main__":

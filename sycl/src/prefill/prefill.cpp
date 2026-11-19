@@ -434,7 +434,12 @@ struct Stager {
     std::vector<uint64_t> want;              // the sequence number each buffer's last DMA writes
     uint64_t issue_seq = 0;
     std::vector<Job> jobs;
+    // ready[j]: 0 = not read yet, 1 = the bytes are in the buffer, 2 = the read failed (the buffer holds nothing to use)
     std::unique_ptr<std::atomic<int>[]> ready;
+    // a failed read: the first one's expert is kept for the error text.  Set by a stager thread, read by the launching
+    // thread and the issuer thread; start() clears it for the next layer / chunk.
+    std::atomic<bool> failed{false};
+    std::atomic<int> fail_l{-1}, fail_e{-1};
     size_t ready_cap = 0;
     // gen << 32 | n << 16 | next index: a claim is a CAS on the generation it woke for (a thread late from the
     // previous layer can never take a job of this one - the expert pool's issue #29 lesson)
@@ -517,22 +522,38 @@ struct Stager {
                 const int j = claim(seen);
                 if (j < 0) { active.fetch_sub(1, std::memory_order_acq_rel); break; }
                 const int b = j % kRing;
+                if (failed.load(std::memory_order_acquire)) {   // an earlier read of this walk failed: the walk ends in an error
+                    ready[(size_t) j].store(2, std::memory_order_release);
+                    active.fetch_sub(1, std::memory_order_acq_rel);
+                    continue;
+                }
                 if (j >= kRing)   // job j - kRing's DMA from this buffer is queued
                     while (issued.load(std::memory_order_acquire) <= j - kRing) std::this_thread::yield();
                 // and done (#385) - for a generation's first kRing jobs that is the previous generation's last DMA from
                 // the buffer, which nothing else waits for when a chunk ends without a sync (no MTP)
                 while (!buffer_free(b)) std::this_thread::yield();
                 const Job& jb = jobs[(size_t) j];
+                bool read_ok = true;
                 if (jb.gsrc != nullptr) {
-                    if (!jb.gsrc->read_into(jb.l, jb.e, buf[b], jb.bytes)) {
+                    // a failed read is never a filled buffer: the zero-filled blob used to run as if it were the
+                    // expert (an I/O fault became a wrong answer); the job is marked failed and wait() says so
+                    if (test_read_fail() || !jb.gsrc->read_into(jb.l, jb.e, buf[b], jb.bytes)) {
                         std::fprintf(stderr, "prefill: reading expert %d of layer %d from the GGUF failed\n", jb.e, jb.l);
-                        std::memset(buf[b], 0, jb.bytes);
+                        read_ok = false;
                     }
                 } else if (jb.from == nullptr) {
                     std::memcpy(buf[b], jb.src, jb.bytes);
-                } else if (!jb.from->copy_blob(jb.l, jb.e, buf[b])) {
+                } else if (test_read_fail() || !jb.from->copy_blob(jb.l, jb.e, buf[b])) {
                     std::fprintf(stderr, "prefill: the expert source could not copy expert %d of layer %d\n", jb.e, jb.l);
-                    std::abort();
+                    read_ok = false;
+                }
+                if (!read_ok) {
+                    int none = -1;
+                    if (fail_l.compare_exchange_strong(none, jb.l, std::memory_order_acq_rel)) fail_e.store(jb.e, std::memory_order_release);
+                    failed.store(true, std::memory_order_release);
+                    ready[(size_t) j].store(2, std::memory_order_release);
+                    active.fetch_sub(1, std::memory_order_acq_rel);
+                    continue;
                 }
                 ready[(size_t) j].store(1, std::memory_order_release);
                 active.fetch_sub(1, std::memory_order_acq_rel);
@@ -550,6 +571,9 @@ struct Stager {
     }
     /// A layer's jobs; the previous layer's are finished (finish()).
     void start(std::vector<Job>&& js) {
+        failed.store(false, std::memory_order_release);
+        fail_l.store(-1, std::memory_order_release);
+        fail_e.store(-1, std::memory_order_release);
         if (js.empty()) return;
         std::lock_guard<std::mutex> lk(mu);
         jobs = std::move(js);
@@ -563,10 +587,23 @@ struct Stager {
         head.store((uint64_t) gen << 32 | (uint64_t) jobs.size() << 16, std::memory_order_release);
         cv.notify_all();
     }
-    /// Job j's bytes, in a pinned buffer (waits for the copy).
+    /// Job j's bytes, in a pinned buffer (waits for the copy).  nullptr when job j's read failed (the caller must not
+    /// run the expert, nor queue its DMA: it ends the walk with an error - fail_text()).
     const uint8_t* wait(int j) {
-        while (!ready[(size_t) j].load(std::memory_order_acquire)) std::this_thread::yield();
-        return buf[j % kRing];
+        int r;
+        while ((r = ready[(size_t) j].load(std::memory_order_acquire)) == 0) std::this_thread::yield();
+        return r == 1 ? buf[j % kRing] : nullptr;
+    }
+    std::string fail_text() const {
+        return "prefill: reading expert " + std::to_string(fail_e.load()) + " of layer " + std::to_string(fail_l.load()) +
+               " from the expert source failed (the prompt is not computed with a wrong expert)";
+    }
+    /// STRATA_TEST_EXPERT_READ_FAIL=<n> (a test): the n-th read of a GGUF / source job in this process (1-based) fails,
+    /// once; the process goes on, the next prompt reads again.
+    static bool test_read_fail() {
+        static const long n = [] { const char* v = std::getenv("STRATA_TEST_EXPERT_READ_FAIL"); return v ? std::atol(v) : 0L; }();
+        static std::atomic<long> count{0};
+        return n > 0 && count.fetch_add(1, std::memory_order_acq_rel) + 1 == n;
     }
     /// The launching thread queued job j's DMA on `copy`: its buffer is free once that is done.
     /// The launching thread queued job j's DMA on `copy`: its buffer is free once that is done.
@@ -2871,6 +2908,7 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                     ++stats_.experts_dma;
                 } else {
                     const uint8_t* hb = m.stager->wait(en.job);
+                    if (hb == nullptr) return;   // the read failed: nothing more is queued; the consumer sees stager->failed
                     /*
                     DPCT1124: cudaMemcpyAsync is migrated to asynchronous
                     memcpy API. While the origin API might be synchronous, it
@@ -2939,6 +2977,7 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                         ++iss_dma;
                     } else {
                         const uint8_t* hb = m.stager->wait(en.job);
+                        if (hb == nullptr) return;   // the read failed: the consumer sees stager->failed and ends the walk
                         /*
                         DPCT1124: cudaMemcpyAsync is migrated to
                         asynchronous memcpy API. While the origin API might be
@@ -2960,9 +2999,17 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
             issue_until((size_t) m.ring);   // layer 0's first experts, behind the embedding and the PLE
         }
         // the consumer's side: entry k's copy is on the copy stream (the thread issued it), then k is given back
-        auto wait_issued = [&](size_t k) {
-            if (!threaded_issue) return;
-            while (a_issued.load(std::memory_order_acquire) <= k) std::this_thread::yield();
+        // false: an expert's read failed - the entry (and the ones after it) was never queued; err says which
+        auto wait_issued = [&](size_t k) -> bool {
+            if (threaded_issue) {
+                while (a_issued.load(std::memory_order_acquire) <= k) {
+                    if (m.stager->failed.load(std::memory_order_acquire)) break;
+                    std::this_thread::yield();
+                }
+            }
+            if (!stream_all || !m.stager->failed.load(std::memory_order_acquire)) return true;
+            err = m.stager->fail_text();
+            return false;
         };
         auto give_back = [&](size_t upto) {
             if (threaded_issue) a_consumed.store(upto, std::memory_order_release);
@@ -3574,7 +3621,7 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                             if (k > k0) {
                                 // one copy stream, in order: the batch's last blob covers the others
                                 pt.mark(kPfWaitCopy, cs);
-                                wait_issued(k - 1);
+                                if (!wait_issued(k - 1)) return false;
                                 (m.cs)->ext_oneapi_submit_barrier(
                                     {*m.copied[(k - 1) % (size_t)m.ring]});
                             }
@@ -4151,6 +4198,7 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                             } else {
                                 // copied to a pinned buffer by the stager (waits only if it is behind), then DMA
                                 const uint8_t* hb = m.stager->wait(job_of[j]);
+                                if (hb == nullptr) { err = m.stager->fail_text(); return false; }   // the read failed
                                 if (m.stage_live[sl])(m.copy)
                                     ->ext_oneapi_submit_barrier(
                                         {*m.used[m.used_of[sl]]});
@@ -4593,7 +4641,7 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                                 release_to(e);
                                 if (k < kend && seq[k].e == e) {
                                     const int sl = (int) (k % (size_t) m.ring);
-                                    wait_issued(k);
+                                    if (!wait_issued(k)) return false;
                                     if (!group_gather) {
                                         pt.mark(kPfWaitCopy, cs);
                                         (m.cs)->ext_oneapi_submit_barrier(

@@ -9380,6 +9380,11 @@ int main(int argc, char **argv) try {
                                              "for the GPU %.2f, pool + plan %.2f, host staging %.2f)\n",
                                      wk_own_ms / 64, (ver.ms_wait - wk_wait0) / 64, (ver.ms_pool - wk_pool0) / 64,
                                      (ver.ms_host - wk_host0) / 64);
+                        // STRATA_VERIFY_PROFILE: the same 64 windows' GPU phases on this card (the standalone serve
+                        // prints them with STRATA_DECODE_TIMING; a stage worker had nowhere to print them)
+                        const std::string pr = ver.profile_report();
+                        if (!pr.empty())
+                            std::fprintf(stderr, "strata stage worker: windows: GPU stages (ms/window):%s\n", pr.c_str());
                         wk_wait0 = ver.ms_wait;
                         wk_pool0 = ver.ms_pool;
                         wk_host0 = ver.ms_host;
@@ -12900,7 +12905,12 @@ int main(int argc, char **argv) try {
                         (double) (src.file_read_bytes() - file_bytes0) / 1e6, (long long) read_n,
                         (long long) req_offload, chain_txt);
             std::fflush(stdout);
-            if (admit_slot >= 0) {   // --batch: BADM <slot> <1 = continues in the batch windows | 0 = done>
+            if (admit_slot >= 0) {   // --batch: BADM <slot> <1 = continues in the batch windows | 0 = done> [failed]
+                // `failed` (a third field, after a 0): the request was to continue in the slot, but the copy of its
+                // state into the slot failed and the engine goes on without it - the request is NOT finished (its
+                // DONE says "length" after one token).  The server continues it or reports an error; a server that
+                // reads only two fields sees the 0 as before.  A lost remote link is an ERR and the engine's end.
+                bool adm_failed = false;
                 bool cont = !cancelled && produced_n == 1 && admit_max_new > 1 && std::strcmp(finish, "length") == 0 &&
                             (int64_t) live.size() == p;
                 const auto tc0 = Clock::now();
@@ -12909,6 +12919,7 @@ int main(int argc, char **argv) try {
                     std::fprintf(stderr, "strata serve: batch admission failed: %s\n", err.c_str());
                     bs[(size_t) admit_slot].cached = false;   // its sessions may be half written
                     cont = false;
+                    adm_failed = true;
                 }
                 if (cont) {
                     ver.set_slot_sampling(admit_slot, req_sp);   // the request's own sampling, row by row
@@ -12941,7 +12952,7 @@ int main(int argc, char **argv) try {
                     std::fprintf(stderr, "strata batch: slot %d takes %lld tokens (copied in %.1f ms)\n", admit_slot,
                                  (long long) live.size(), std::chrono::duration<double, std::milli>(Clock::now() - tc0).count());
                 }
-                std::printf("BADM %d %d\n", admit_slot, cont ? 1 : 0);
+                std::printf("BADM %d %d%s\n", admit_slot, cont ? 1 : 0, adm_failed ? " failed" : "");
                 std::fflush(stdout);
                 admit_slot = -1;
             }
