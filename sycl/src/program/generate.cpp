@@ -9380,6 +9380,11 @@ int main(int argc, char **argv) try {
                                              "for the GPU %.2f, pool + plan %.2f, host staging %.2f)\n",
                                      wk_own_ms / 64, (ver.ms_wait - wk_wait0) / 64, (ver.ms_pool - wk_pool0) / 64,
                                      (ver.ms_host - wk_host0) / 64);
+                        // STRATA_VERIFY_PROFILE: the same 64 windows' GPU phases on this card (the standalone serve
+                        // prints them with STRATA_DECODE_TIMING; a stage worker had nowhere to print them)
+                        const std::string pr = ver.profile_report();
+                        if (!pr.empty())
+                            std::fprintf(stderr, "strata stage worker: windows: GPU stages (ms/window):%s\n", pr.c_str());
                         wk_wait0 = ver.ms_wait;
                         wk_pool0 = ver.ms_pool;
                         wk_host0 = ver.ms_host;
