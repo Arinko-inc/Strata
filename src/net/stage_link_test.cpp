@@ -916,6 +916,83 @@ int main() {
     a.close();
     wk6.stop();
 
+    // 9b. a relay's prompt chunk replies: with more output buffers it reads the next chunks while the replies before
+    // them wait on its next worker (strata-mesh bench/2026-11-21-read-path); the replies keep their rows and order
+    {
+        std::vector<float> pf_out2(pf_in0.size()), pf_out3(pf_in0.size());
+        StageBuffers buf4 = buf;
+        buf4.pf_out[2] = pf_out2.data();
+        buf4.pf_out[3] = pf_out3.data();
+        constexpr int kN = 6;
+        // The next worker's replies are held at a gate: the chunks the relay reads meanwhile are counted (it must stop
+        // at its buffers' count while the first reply is held), then the gate opens and every reply comes back.  Waits
+        // are on conditions; the times below only end a test that would hang
+        auto relay_pace = [&](const StageBuffers& b, int expect_held, int& read_while_held, int& read_after_more,
+                              bool& rows_ok) {
+            std::atomic<int> started{0};
+            std::mutex gm;
+            std::condition_variable gcv;
+            bool open = false;
+            StageHandlers rh = h;
+            rh.prefill = [&](const int64_t*, int64_t T, int64_t, int64_t, int64_t, const float* in, float* out,
+                             std::string&) {
+                std::memcpy(out, in, (size_t) (T * kD) * 4);
+                ++started;
+                return true;
+            };
+            rh.prefill_reply = [&](float* out, int64_t T, int64_t skip, std::string&) {   // the next worker, held
+                {
+                    std::unique_lock<std::mutex> lk(gm);
+                    gcv.wait_for(lk, std::chrono::seconds(20), [&] { return open; });
+                }
+                for (int64_t i = skip * kD; i < T * kD; ++i) out[i] += 1000.0f;
+                return true;
+            };
+            Worker wr;
+            if (!wr.start(rh, b, "tok")) return false;
+            StageClient m;
+            std::string e;
+            bool ok = greet_with(m, wr.where, with_token(hello_of(), "tok")) && m.reset({}, e);
+            const int64_t tk[2] = {1, 2};
+            for (int k = 0; ok && k < kN; ++k) {
+                float rows[2 * kD];
+                for (int i = 0; i < 2 * kD; ++i) rows[i] = (float) (k * 100 + i);
+                ok = m.prefill_send(tk, 2, (int64_t) k * 2, 0, rows, kD, 0, e);
+            }
+            // the chunks it reads with the first reply held: up to expect_held (its buffers), however long the worker
+            // takes to start (10 s only ends a test that would hang), then a while more of holding must not add one
+            for (int i = 0; ok && i < 1000 && started.load() < expect_held; ++i)
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            read_while_held = started.load();
+            std::this_thread::sleep_for(std::chrono::milliseconds(300));
+            read_after_more = started.load();
+            {
+                std::lock_guard<std::mutex> lk(gm);
+                open = true;
+            }
+            gcv.notify_all();
+            rows_ok = ok;
+            for (int k = 0; ok && k < kN; ++k) {
+                float back[2 * kD] = {};
+                ok = m.prefill_recv(back, kD, 2, 0, e);
+                for (int i = 0; ok && i < 2 * kD; ++i) rows_ok = rows_ok && back[i] == (float) (k * 100 + i) + 1000.0f;
+            }
+            rows_ok = rows_ok && ok && started.load() == kN && m.reset({}, e);
+            m.close();
+            wr.stop();
+            return ok;
+        };
+        int held4 = 0, more4 = 0, held2 = 0, more2 = 0;
+        bool rows4 = false, rows2 = false;
+        const bool ran4 = relay_pace(buf4, 4, held4, more4, rows4);
+        check(ran4 && rows4, "a relay with 4 output buffers: 6 chunks' replies come back with their rows, in order");
+        check(held4 == 4 && more4 == 4,
+              "... with the first reply held on the next worker it reads chunks 0-3, and chunk 4 only after that reply");
+        const bool ran2 = relay_pace(buf, 2, held2, more2, rows2);
+        check(ran2 && rows2 && held2 == 2 && more2 == 2,
+              "a relay with 2 output buffers reads one chunk past a reply that is held (as before)");
+    }
+
     // 10. alive(): the link between requests, checked with nothing sent and without blocking
     Worker wk7;
     if (!wk7.start(h, buf, "tok")) {

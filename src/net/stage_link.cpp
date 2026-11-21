@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <future>
+#include <memory>
 #include <thread>
 #include <vector>
 
@@ -1740,25 +1741,76 @@ int serve_stage(const std::string& bind_addr, int port, const std::string& token
         // position plus its accepted count, 0 after a reset, L after a checkpoint restore
         int64_t pos = 0, run_pos0 = 0;
         // a slice of the replies' rows in another format than fp32: a window's (this thread's), a prompt chunk's (its
-        // reply thread's: one is out at a time), and that one's conversion time (stats has it once the reply is out)
+        // reply threads': they run one after another, see pf_replies)
         std::vector<unsigned char> run_tx, pf_tx;
         // a late window's reply (protocol 8 stage 2, a relay): its rows in the link's format, on its reply thread
         std::vector<unsigned char> sr_tx;
         double reply_encode_ms = 0;
-        // a prompt chunk's reply goes out on its own thread while the next chunk is read; every later send waits
-        // for it (the replies keep their order), and so does the reuse of its output buffer
+        // a late window's reply (protocol 8 stage 2) goes out on its own thread while the next message is read;
+        // every later send waits for it (the replies keep their order)
         std::future<bool> reply_out;
-        bool reply_is_slot = false;   // reply_out is a late window's (else a prompt chunk's)
+        bool reply_is_slot = false;   // reply_out is a late window's
         std::string reply_err;
+        // the prompt chunks' replies going out, oldest first: each on its own thread, which first waits for the one
+        // before it (so they go out in chunk order, one at a time, and a relay reads its next worker's replies in that
+        // order too), while the serving thread reads the next chunks.  A chunk's rows are in pf_out[its buffer] until
+        // its reply is out, so a chunk waits for the reply n_pf_out chunks before it (the one whose buffer it takes).
+        // Two buffers keep one reply out while the next chunk is read; a relay's more let its passed-on chunks wait on
+        // the next worker without holding up the chunks after them (strata-mesh bench/2026-11-21-read-path)
+        struct PfReply {
+            std::shared_future<bool> done;
+            std::shared_ptr<std::string> err;
+            std::shared_ptr<double> encode_ms;
+        };
+        std::deque<PfReply> pf_replies;
+        int n_pf_out = 2;
+        while (n_pf_out < kStagePfOutMax && buf.pf_out[n_pf_out] != nullptr) ++n_pf_out;
         int out_buf = 0;
+        // the oldest prompt chunk's reply is out (false: it failed; err has why - a reply that failed only because
+        // the one before it did leaves err as that one set it, so the first failure's cause is what the log shows)
+        auto pf_retire = [&]() -> bool {
+            PfReply r = std::move(pf_replies.front());
+            pf_replies.pop_front();
+            const bool ok = r.done.get();
+            stats.ms_encode += *r.encode_ms;
+            if (!ok && !r.err->empty()) err = *r.err;
+            return ok;
+        };
+        // the prompt chunks' replies already out, oldest first, without waiting (false: one failed - the link is
+        // lost, the connection ends; err has why).  A failed send is found here, not only when a later chunk needs
+        // its buffer or another message waits for every reply
+        auto pf_reap = [&]() -> bool {
+            while (!pf_replies.empty() &&
+                   pf_replies.front().done.wait_for(std::chrono::seconds(0)) == std::future_status::ready)
+                if (!pf_retire()) return false;
+            return true;
+        };
+        // every reply going out is out: the prompt chunks' (in order), then a late window's
         auto replies_out = [&]() -> bool {
-            if (!reply_out.valid()) return true;
-            const bool ok = reply_out.get();
-            stats.ms_encode += reply_encode_ms;
-            reply_encode_ms = 0;
-            if (ok) return true;
-            err = reply_err;
-            return false;
+            bool ok = true;
+            std::string first;
+            while (!pf_replies.empty())
+                if (!pf_retire() && ok) {
+                    ok = false;
+                    first = err;   // (the first failure's cause: pf_retire leaves err alone for the ones after it)
+                }
+            if (reply_out.valid()) {
+                const bool sent = reply_out.get();
+                stats.ms_encode += reply_encode_ms;
+                reply_encode_ms = 0;
+                if (!sent && ok) {
+                    ok = false;
+                    first = reply_err;
+                }
+            }
+            if (!ok) err = first;
+            return ok;
+        };
+        // a reply still going out (the idle clock waits for it)
+        auto reply_going = [&]() -> bool {
+            if (reply_out.valid() && reply_out.wait_for(std::chrono::seconds(0)) != std::future_status::ready) return true;
+            return !pf_replies.empty() &&
+                   pf_replies.back().done.wait_for(std::chrono::seconds(0)) != std::future_status::ready;
         };
         auto reply_error = [&](const std::string& m) -> bool {
             if (!replies_out()) return false;
@@ -1838,11 +1890,14 @@ int serve_stage(const std::string& bind_addr, int port, const std::string& token
                     in.err = "the worker is stopping";
                     return true;
                 }
+                if (!pf_reap()) {   // a prompt chunk's reply failed while no message came: the connection ends
+                    in.closed = true;
+                    in.err = err;
+                    return true;
+                }
                 // the idle time starts when the last message is read and its reply is out (a relay's reply can wait
                 // on its next worker for long)
-                if (reading_now ||
-                    (reply_out.valid() && reply_out.wait_for(std::chrono::seconds(0)) != std::future_status::ready))
-                    quiet_from = Clock::now();
+                if (reading_now || reply_going()) quiet_from = Clock::now();
                 idle_s = ms_since(quiet_from) / 1000.0;
                 // a relay's look at its next worker: one lost while idle ends this connection (h.idle)
                 if (greeted && h.idle && idle_s >= 1.0 && ms_since(idle_looked) >= 1000.0) {
@@ -2027,15 +2082,21 @@ int serve_stage(const std::string& bind_addr, int port, const std::string& token
                 const int64_t skip = std::max<int64_t>(0, std::min<int64_t>(in.h.c >> 8, T));
                 std::string e;
                 bool ok;
-                // this chunk's output buffer: the one whose reply went out two chunks ago - the reply in flight (the
-                // last chunk's) uses the other
+                // this chunk's output buffer: the one whose reply went out n_pf_out chunks ago (the replies after it
+                // use the others).  The replies before that one went first (they keep their order)
+                bool replies_ok = pf_reap();
+                while (replies_ok && (int) pf_replies.size() >= n_pf_out) replies_ok = pf_retire();
+                if (!replies_ok) { keep = false; break; }   // (a reply failed: the link is lost)
+                // this worker's own time for the chunk starts here (the wait for a free buffer is its next worker's
+                // or the link's, not its own: the main process and stage_tune.py read it as this worker's work)
+                const auto t_work = Clock::now();
                 float* const out = buf.pf_out[out_buf];
                 if (!pending_err.empty() || !pos_err.empty()) { e = take_pending(); ok = false; }
                 else ok = h.prefill(in.tok64.data(), T, in.h.b, in.h.c & 0xff, skip, buf.pf_in[in.slot], out, e);
                 release();   // the chunk is read (its rows were uploaded before `prefill` returned)
                 if (!ok) { keep = reply_error(e); break; }
                 pos = in.h.b + T;
-                const double work_ms = ms_since(t0);
+                const double work_ms = ms_since(t_work);
                 stats.ms_decode += in.decode_ms;
                 if (remote_timing()) {
                     char conv[80] = "";
@@ -2046,35 +2107,48 @@ int serve_stage(const std::string& bind_addr, int port, const std::string& token
                                  (long long) in.h.b, work_ms, conv);
                 }
                 const size_t back_rows = (size_t) (T - skip), D = (size_t) buf.pf_row_floats;
-                if (!replies_out()) { keep = false; break; }   // the previous reply is out: its buffer is free next time
                 StageHeader r;
                 r.type = (uint32_t) StageMsg::PrefillOk;
                 r.a = (int64_t) (work_ms * 1000.0);
                 r.bytes = stage_rows_bytes(rows_fmt, back_rows, D);
                 const float* src = out + (size_t) skip * D;
-                reply_err.clear();
-                reply_is_slot = false;
-                // (the rows in the link's format on the reply thread too, after a relay's next worker has filled them)
-                reply_out = std::async(std::launch::async, [fd, r, src, back_rows, D, out, T, skip, fmt = rows_fmt,
-                                                            &pf_tx, &reply_encode_ms, &h, &reply_err] {
+                // its reply on a thread of its own, after the reply before it (the rows in the link's format there
+                // too, after a relay's next worker has filled them)
+                PfReply pr;
+                pr.err = std::make_shared<std::string>();
+                pr.encode_ms = std::make_shared<double>(0.0);
+                std::shared_future<bool> prev;
+                if (!pf_replies.empty()) prev = pf_replies.back().done;
+                pr.done = std::async(std::launch::async, [fd, r, src, back_rows, D, out, T, skip, fmt = rows_fmt, &pf_tx,
+                                                          &h, prev, perr = pr.err, penc = pr.encode_ms]() mutable {
+                    // (the reply before it is let go once waited for: a finished one's state - and the one before it,
+                    // and so on - is not held for as long as this one's is)
+                    const bool prev_ok = !prev.valid() || prev.get();
+                    prev = std::shared_future<bool>();
+                    if (!prev_ok) {
+                        // the reply before it failed (the link is lost, the connection ends): not this one either.
+                        // No error of its own (*perr stays empty): the first failure's is the cause
+                        return false;
+                    }
                     if (h.prefill_reply) {   // a relay worker: the next worker's rows (in chunk order)
                         std::string e;
                         if (!h.prefill_reply(out, T, skip, e)) {
                             StageHeader eh;
                             eh.type = (uint32_t) StageMsg::Error;
                             eh.bytes = e.size();
-                            return send_msg(fd, eh, e.data(), e.size(), nullptr, 0, reply_err);
+                            return send_msg(fd, eh, e.data(), e.size(), nullptr, 0, *perr);
                         }
                     }
-                    if (fmt == StageRows::F32) return send_msg(fd, r, src, (size_t) r.bytes, nullptr, 0, reply_err);
-                    const bool sent = send_msg(fd, r, nullptr, 0, nullptr, 0, reply_err) &&
-                                      send_rows(fd, fmt, src, back_rows, D, pf_tx, reply_encode_ms, reply_err);
+                    if (fmt == StageRows::F32) return send_msg(fd, r, src, (size_t) r.bytes, nullptr, 0, *perr);
+                    const bool sent = send_msg(fd, r, nullptr, 0, nullptr, 0, *perr) &&
+                                      send_rows(fd, fmt, src, back_rows, D, pf_tx, *penc, *perr);
                     if (sent && remote_timing())
                         std::fprintf(stderr, "strata stage worker: chunk T=%lld: its rows to %s in %.0f ms\n",
-                                     (long long) T, stage_rows_name(fmt), reply_encode_ms);
+                                     (long long) T, stage_rows_name(fmt), *penc);
                     return sent;
-                });
-                out_buf ^= 1;
+                }).share();
+                pf_replies.push_back(std::move(pr));
+                out_buf = (out_buf + 1) % n_pf_out;
                 stats.bytes_out += sizeof r + r.bytes;
                 ++stats.prefills;
                 stats.ms_prefill += work_ms;
@@ -2174,7 +2248,7 @@ int serve_stage(const std::string& bind_addr, int port, const std::string& token
                 if (late) {
                     // a prompt chunk's reply reads the next worker's link on its thread: out first.  The window
                     // before this one's is not waited for yet (its thread may still wait on the next worker)
-                    if (reply_out.valid() && !reply_is_slot && !replies_out()) { keep = false; break; }
+                    if (!pf_replies.empty() && !replies_out()) { keep = false; break; }
                     std::memcpy(buf.run_in, in.rows.data(), in.rows.size() * 4);
                     stats.ms_decode += in.decode_ms;
                     std::string e;
