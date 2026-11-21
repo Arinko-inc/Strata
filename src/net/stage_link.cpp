@@ -1766,13 +1766,14 @@ int serve_stage(const std::string& bind_addr, int port, const std::string& token
         int n_pf_out = 2;
         while (n_pf_out < kStagePfOutMax && buf.pf_out[n_pf_out] != nullptr) ++n_pf_out;
         int out_buf = 0;
-        // the oldest prompt chunk's reply is out (false: it failed; err has why)
+        // the oldest prompt chunk's reply is out (false: it failed; err has why - a reply that failed only because
+        // the one before it did leaves err as that one set it, so the first failure's cause is what the log shows)
         auto pf_retire = [&]() -> bool {
             PfReply r = std::move(pf_replies.front());
             pf_replies.pop_front();
             const bool ok = r.done.get();
             stats.ms_encode += *r.encode_ms;
-            if (!ok) err = *r.err;
+            if (!ok && !r.err->empty()) err = *r.err;
             return ok;
         };
         // the prompt chunks' replies already out, oldest first, without waiting (false: one failed - the link is
@@ -1791,7 +1792,7 @@ int serve_stage(const std::string& bind_addr, int port, const std::string& token
             while (!pf_replies.empty())
                 if (!pf_retire() && ok) {
                     ok = false;
-                    first = err;
+                    first = err;   // (the first failure's cause: pf_retire leaves err alone for the ones after it)
                 }
             if (reply_out.valid()) {
                 const bool sent = reply_out.get();
@@ -2125,8 +2126,8 @@ int serve_stage(const std::string& bind_addr, int port, const std::string& token
                     const bool prev_ok = !prev.valid() || prev.get();
                     prev = std::shared_future<bool>();
                     if (!prev_ok) {
-                        // the reply before it failed (the link is lost, the connection ends): not this one either
-                        *perr = "an earlier prompt chunk's reply failed";
+                        // the reply before it failed (the link is lost, the connection ends): not this one either.
+                        // No error of its own (*perr stays empty): the first failure's is the cause
                         return false;
                     }
                     if (h.prefill_reply) {   // a relay worker: the next worker's rows (in chunk order)

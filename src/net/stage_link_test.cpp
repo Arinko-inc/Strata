@@ -927,7 +927,8 @@ int main() {
         // The next worker's replies are held at a gate: the chunks the relay reads meanwhile are counted (it must stop
         // at its buffers' count while the first reply is held), then the gate opens and every reply comes back.  Waits
         // are on conditions; the times below only end a test that would hang
-        auto relay_pace = [&](const StageBuffers& b, int& read_while_held, int& read_after_more, bool& rows_ok) {
+        auto relay_pace = [&](const StageBuffers& b, int expect_held, int& read_while_held, int& read_after_more,
+                              bool& rows_ok) {
             std::atomic<int> started{0};
             std::mutex gm;
             std::condition_variable gcv;
@@ -958,15 +959,10 @@ int main() {
                 for (int i = 0; i < 2 * kD; ++i) rows[i] = (float) (k * 100 + i);
                 ok = m.prefill_send(tk, 2, (int64_t) k * 2, 0, rows, kD, 0, e);
             }
-            // as many chunks as it reads with the first reply held (it stops there: the next chunk needs that reply's
-            // buffer), then a while more of holding must not add one
-            int last = -1;
-            for (int i = 0; ok && i < 500; ++i) {
-                const int now = started.load();
-                if (now == last && i > 20) break;   // (steady for 20 looks)
-                if (now != last) { last = now; i = 0; }
+            // the chunks it reads with the first reply held: up to expect_held (its buffers), however long the worker
+            // takes to start (10 s only ends a test that would hang), then a while more of holding must not add one
+            for (int i = 0; ok && i < 1000 && started.load() < expect_held; ++i)
                 std::this_thread::sleep_for(std::chrono::milliseconds(10));
-            }
             read_while_held = started.load();
             std::this_thread::sleep_for(std::chrono::milliseconds(300));
             read_after_more = started.load();
@@ -988,11 +984,11 @@ int main() {
         };
         int held4 = 0, more4 = 0, held2 = 0, more2 = 0;
         bool rows4 = false, rows2 = false;
-        const bool ran4 = relay_pace(buf4, held4, more4, rows4);
+        const bool ran4 = relay_pace(buf4, 4, held4, more4, rows4);
         check(ran4 && rows4, "a relay with 4 output buffers: 6 chunks' replies come back with their rows, in order");
         check(held4 == 4 && more4 == 4,
               "... with the first reply held on the next worker it reads chunks 0-3, and chunk 4 only after that reply");
-        const bool ran2 = relay_pace(buf, held2, more2, rows2);
+        const bool ran2 = relay_pace(buf, 2, held2, more2, rows2);
         check(ran2 && rows2 && held2 == 2 && more2 == 2,
               "a relay with 2 output buffers reads one chunk past a reply that is held (as before)");
     }
