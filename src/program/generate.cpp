@@ -13272,25 +13272,30 @@ int main(int argc, char** argv) {
                 // commits and chunks arrive in order, each whole, and run here one at a time.
                 const int64_t pf_chunk = sp.chunk();
                 // two in (one on the wire, one being read) and two out (one being sent back, one being written).  A
-                // relay worker has more out (STRATA_RELAY_REPLY_BUFS, 2..kStagePfOutMax, default the most): the replies
-                // of the chunks it passed on wait there on the next worker while it reads the next chunks - with two,
-                // each chunk waited for the reply before it, and that set a long prompt's pace (strata-mesh
-                // bench/2026-11-21-read-path)
+                // relay worker may have more out (STRATA_RELAY_REPLY_BUFS=3..kStagePfOutMax; unset: two, as before):
+                // the replies of the chunks it passed on wait there on the next worker while it reads the next chunks
+                // - with two, each chunk waited for the reply before it, and that set a long prompt's pace (strata-mesh
+                // bench/2026-11-21-read-path).  Each is chunk * D floats of pinned RAM (2048 x 10,240: 80 MiB)
                 int n_pf_out = 2;
-                if (stage_relay) {
-                    n_pf_out = strata::net::kStagePfOutMax;
+                if (stage_relay)
                     if (const char* v = std::getenv("STRATA_RELAY_REPLY_BUFS"); v != nullptr && v[0] != '\0')
                         n_pf_out = std::max(2, std::min(strata::net::kStagePfOutMax, std::atoi(v)));
-                }
                 float *pf_in[2] = {nullptr, nullptr}, *pf_out[strata::net::kStagePfOutMax] = {};
                 float* pf_cur_out = nullptr;
                 bool pf_ok = true;
                 for (int b = 0; b < 2; ++b)
                     pf_ok = pf_ok &&
-                            cudaHostAlloc((void**) &pf_in[b], (size_t) (pf_chunk * D) * 4, cudaHostAllocPortable) == cudaSuccess;
-                for (int b = 0; b < n_pf_out; ++b)
-                    pf_ok = pf_ok &&
+                            cudaHostAlloc((void**) &pf_in[b], (size_t) (pf_chunk * D) * 4, cudaHostAllocPortable) == cudaSuccess &&
                             cudaHostAlloc((void**) &pf_out[b], (size_t) (pf_chunk * D) * 4, cudaHostAllocPortable) == cudaSuccess;
+                // the extra ones only as far as they fit (the worker runs with two, as before, if they do not)
+                for (int b = 2; pf_ok && b < n_pf_out; ++b)
+                    if (cudaHostAlloc((void**) &pf_out[b], (size_t) (pf_chunk * D) * 4, cudaHostAllocPortable) != cudaSuccess) {
+                        (void) cudaGetLastError();
+                        pf_out[b] = nullptr;
+                        std::fprintf(stderr, "strata serve: stage worker: STRATA_RELAY_REPLY_BUFS=%d: only %d prompt reply "
+                                             "buffers fit in pinned RAM (it runs with %d)\n", n_pf_out, b, b);
+                        n_pf_out = b;
+                    }
                 if (!pf_ok) {
                     std::fprintf(stderr, "strata serve: the stage worker's prompt buffers do not fit in RAM\n");
                     return 1;

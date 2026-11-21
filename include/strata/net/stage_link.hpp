@@ -47,8 +47,8 @@ inline constexpr char kStageCkptMissing[] = "checkpoint not held: ";
 /// hellos' batch_slots (each side works it out and keeps it for the connection)
 inline constexpr int32_t kStageSlotMax = 64;
 /// The most prompt-chunk output buffers a worker may give serve_stage (StageBuffers::pf_out).  Two let one chunk's
-/// reply go out while the next chunk is read; a relay worker gives more, so that the replies of the chunks it has
-/// already passed on can wait on its next worker while it reads the next ones (strata-mesh bench/2026-11-21-read-path:
+/// reply go out while the next chunk is read; a relay worker may give more (STRATA_RELAY_REPLY_BUFS), so that the
+/// replies of the chunks it has already passed on can wait on its next worker while it reads the next ones (strata-mesh bench/2026-11-21-read-path:
 /// with two, a relay waited for each reply - its next worker's round trip and the send back - and that set the pace
 /// of a long prompt, about 900 ms a 2048-token chunk against 520-740 ms of work on any one card).
 inline constexpr int kStagePfOutMax = 4;

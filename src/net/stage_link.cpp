@@ -1775,6 +1775,15 @@ int serve_stage(const std::string& bind_addr, int port, const std::string& token
             if (!ok) err = *r.err;
             return ok;
         };
+        // the prompt chunks' replies already out, oldest first, without waiting (false: one failed - the link is
+        // lost, the connection ends; err has why).  A failed send is found here, not only when a later chunk needs
+        // its buffer or another message waits for every reply
+        auto pf_reap = [&]() -> bool {
+            while (!pf_replies.empty() &&
+                   pf_replies.front().done.wait_for(std::chrono::seconds(0)) == std::future_status::ready)
+                if (!pf_retire()) return false;
+            return true;
+        };
         // every reply going out is out: the prompt chunks' (in order), then a late window's
         auto replies_out = [&]() -> bool {
             bool ok = true;
@@ -1878,6 +1887,11 @@ int serve_stage(const std::string& bind_addr, int port, const std::string& token
                 if (stop != nullptr && *stop) {
                     in.closed = true;
                     in.err = "the worker is stopping";
+                    return true;
+                }
+                if (!pf_reap()) {   // a prompt chunk's reply failed while no message came: the connection ends
+                    in.closed = true;
+                    in.err = err;
                     return true;
                 }
                 // the idle time starts when the last message is read and its reply is out (a relay's reply can wait
@@ -2069,16 +2083,19 @@ int serve_stage(const std::string& bind_addr, int port, const std::string& token
                 bool ok;
                 // this chunk's output buffer: the one whose reply went out n_pf_out chunks ago (the replies after it
                 // use the others).  The replies before that one went first (they keep their order)
-                bool replies_ok = true;
+                bool replies_ok = pf_reap();
                 while (replies_ok && (int) pf_replies.size() >= n_pf_out) replies_ok = pf_retire();
                 if (!replies_ok) { keep = false; break; }   // (a reply failed: the link is lost)
+                // this worker's own time for the chunk starts here (the wait for a free buffer is its next worker's
+                // or the link's, not its own: the main process and stage_tune.py read it as this worker's work)
+                const auto t_work = Clock::now();
                 float* const out = buf.pf_out[out_buf];
                 if (!pending_err.empty() || !pos_err.empty()) { e = take_pending(); ok = false; }
                 else ok = h.prefill(in.tok64.data(), T, in.h.b, in.h.c & 0xff, skip, buf.pf_in[in.slot], out, e);
                 release();   // the chunk is read (its rows were uploaded before `prefill` returned)
                 if (!ok) { keep = reply_error(e); break; }
                 pos = in.h.b + T;
-                const double work_ms = ms_since(t0);
+                const double work_ms = ms_since(t_work);
                 stats.ms_decode += in.decode_ms;
                 if (remote_timing()) {
                     char conv[80] = "";
@@ -2102,8 +2119,12 @@ int serve_stage(const std::string& bind_addr, int port, const std::string& token
                 std::shared_future<bool> prev;
                 if (!pf_replies.empty()) prev = pf_replies.back().done;
                 pr.done = std::async(std::launch::async, [fd, r, src, back_rows, D, out, T, skip, fmt = rows_fmt, &pf_tx,
-                                                          &h, prev, perr = pr.err, penc = pr.encode_ms] {
-                    if (prev.valid() && !prev.get()) {
+                                                          &h, prev, perr = pr.err, penc = pr.encode_ms]() mutable {
+                    // (the reply before it is let go once waited for: a finished one's state - and the one before it,
+                    // and so on - is not held for as long as this one's is)
+                    const bool prev_ok = !prev.valid() || prev.get();
+                    prev = std::shared_future<bool>();
+                    if (!prev_ok) {
                         // the reply before it failed (the link is lost, the connection ends): not this one either
                         *perr = "an earlier prompt chunk's reply failed";
                         return false;
