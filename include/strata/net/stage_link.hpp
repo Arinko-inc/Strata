@@ -46,6 +46,12 @@ inline constexpr char kStageCkptMissing[] = "checkpoint not held: ";
 /// slots a SlotCommit lists, and the bound of a slot number.  A link uses slots [0, n) only, n = the fewer of the two
 /// hellos' batch_slots (each side works it out and keeps it for the connection)
 inline constexpr int32_t kStageSlotMax = 64;
+/// The most prompt-chunk output buffers a worker may give serve_stage (StageBuffers::pf_out).  Two let one chunk's
+/// reply go out while the next chunk is read; a relay worker gives more, so that the replies of the chunks it has
+/// already passed on can wait on its next worker while it reads the next ones (strata-mesh bench/2026-11-21-read-path:
+/// with two, a relay waited for each reply - its next worker's round trip and the send back - and that set the pace
+/// of a long prompt, about 900 ms a 2048-token chunk against 520-740 ms of work on any one card).
+inline constexpr int kStagePfOutMax = 4;
 /// SlotRun's flags (header b), bit 0: keep every row - the worker commits the window right behind it and no SlotCommit
 /// follows for it.  Every other bit must be 0 (a side that sends a later bit checks the peer's hello first).
 inline constexpr int64_t kStageSlotKeepAll = 1;
@@ -387,12 +393,13 @@ struct StageHandlers {
     /// rows in: StageBuffers::run_in; rows out: run_out
     std::function<bool(int T, const int32_t* tokens, int64_t pos0, std::string& err)> run;
     std::function<bool(int n_keep, std::string& err)> commit;
-    /// rows in: `rows_in` (one of StageBuffers::pf_in[2]); rows out: `rows_out` (one of pf_out[2], all T rows).
+    /// rows in: `rows_in` (one of StageBuffers::pf_in[2]); rows out: `rows_out` (one of pf_out[], all T rows).
     /// `skip`: the rows the reply leaves out (the main process does not read them)
     std::function<bool(const int64_t* tokens, int64_t T, int64_t pos0, int64_t flags, int64_t skip, const float* rows_in,
                        float* rows_out, std::string& err)> prefill;
     /// optional (a relay worker): fills a chunk's rows_out [skip, T) just before its reply goes out, on the replying
-    /// thread, in chunk order - the serving thread reads the next chunk meanwhile.  A failure sends an error instead.
+    /// thread, in chunk order - the serving thread reads the next chunks meanwhile (as many as StageBuffers::pf_out
+    /// has buffers, less one).  A failure sends an error instead.
     std::function<bool(float* rows_out, int64_t T, int64_t skip, std::string& err)> prefill_reply;
     /// `keep`: the checkpoint ids the main process holds (prune the rest once the reset succeeded)
     std::function<bool(const std::vector<int64_t>& keep, std::string& err)> reset;
@@ -443,7 +450,10 @@ struct StageBuffers {
     float* run_out = nullptr;
     size_t run_floats = 0;      ///< capacity of each, floats
     float* pf_in[2] = {};       ///< chunk * D each: the receiving thread fills one while the other is read
-    float* pf_out[2] = {};      ///< chunk * D each: one chunk's rows go back while the next chunk's are written
+    /// chunk * D each: the chunks' replies go out from these while the next chunk's rows are written into another.
+    /// pf_out[0] and pf_out[1] are required; more (up to kStagePfOutMax, set in order) let more replies be out at
+    /// once - serve_stage uses the leading ones that are set
+    float* pf_out[kStagePfOutMax] = {};
     size_t pf_floats = 0;
     int64_t handoff_floats = 0; ///< floats per verify row
     int64_t pf_row_floats = 0;  ///< floats per prompt row (D)
