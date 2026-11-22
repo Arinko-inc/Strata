@@ -225,7 +225,7 @@ static int run_gr(const std::string& pack, const std::vector<int>& layers, const
                 const Diff n = diff(a2.data(), a3.data(), a2.size());
                 if (n.maxabs / (n.maxref + 1e-30) >= w0.maxabs / (w0.maxref + 1e-30)) w0 = n;
             }
-            std::printf("    int8 rdna vs int8 default, every output: %s\n", dstr(w0).c_str());
+            std::printf("gr T%d: int8 rdna vs int8 default, every output: %s\n", T, dstr(w0).c_str());
         }
         ck(cudaMemset(bo, 0, 8 * N * 4), "bo0");   // timing: the in-place R update idempotent
         ck(cudaMemcpy(R, hR.data(), hR.size() * 4, cudaMemcpyHostToDevice), "R");
@@ -260,7 +260,7 @@ static int run_mmvq(const std::string& gguf, const std::vector<int>& layers, con
                     if (suf.rfind("hc_", 0) == 0 || suf.rfind("ssm_alpha", 0) == 0 || suf.rfind("ssm_beta", 0) == 0) continue;   // BF16 in the pack
                     if (t.type != 12 && t.type != 13 && t.type != 14 && t.type != 6 && t.type != 8) continue;
                     const int nin = (int) t.shape[0], nout = (int) t.shape[1];
-                    if (nin % 256 != 0) continue;
+                    if (nin % ((t.type == 6 || t.type == 8) ? 32 : 256) != 0) continue;   // K-quants: whole superblocks
                     const std::string key = suf + " " + t.type_name() + " " + std::to_string(nin) + "->" + std::to_string(nout);
                     if (!at.count(key)) { at[key] = ms.size(); ms.push_back({key, (int) t.type, nin, nout, {}, K::native_mmvq_weight_bytes((int) t.type, nin, nout)}); }
                     M& m = ms[at[key]];

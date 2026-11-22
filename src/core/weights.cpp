@@ -522,13 +522,17 @@ void WeightTable::hc_q8_names(int64_t n_layers, std::set<std::string>& out) {
                 out.insert("blk." + std::to_string(l) + "." + h + m + ".weight");
 }
 
-bool WeightTable::load_hc_q8(const std::string& pack_dir, uint64_t& bytes, std::string& err) {
+bool WeightTable::load_hc_q8(const std::string& pack_dir, uint64_t& bytes, std::string& err, int64_t layer_lo, int64_t layer_hi) {
     bytes = 0;
     std::vector<WeightRef*> todo;
     for (auto& [name, w] : table_) {
         const bool hc = name.find(".hc_attn_down.") != std::string::npos || name.find(".hc_attn_up.") != std::string::npos ||
                         name.find(".hc_ffn_down.") != std::string::npos || name.find(".hc_ffn_up.") != std::string::npos;
         if (!hc || w.resident) continue;
+        if (name.rfind("blk.", 0) == 0) {   // a remote stage: its own layers only (the others' would take VRAM for nothing)
+            const int64_t l = std::atoll(name.c_str() + 4);
+            if (l < layer_lo || l >= layer_hi) continue;
+        }
         // the pack holds BF16 either promoted to f32 (4 B/elem) or as it is in the GGUF (a native pack, 2 B/elem)
         if (w.kind != WeightKind::Bf16InF32 || w.ne0 % 32 != 0 ||
             (w.src_bytes != (uint64_t) w.elements * 4 && w.src_bytes != (uint64_t) w.elements * 2)) {

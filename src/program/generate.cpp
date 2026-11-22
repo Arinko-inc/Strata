@@ -4660,7 +4660,9 @@ int main(int argc, char** argv) {
     }
     if (hc_q8) {
         uint64_t qb = 0;
-        if (!wt.load_hc_q8(o.pack, qb, err)) { std::fprintf(stderr, "strata generate: %s\n", err.c_str()); return 1; }
+        // a remote stage (main or worker) converts its own layers' projections only
+        const bool own_only = remote_main || stage_worker;
+        if (!wt.load_hc_q8(o.pack, qb, err, own_only ? own_lo : 0, own_only && own_hi >= 0 ? own_hi : INT64_MAX)) { std::fprintf(stderr, "strata generate: %s\n", err.c_str()); return 1; }
         std::fprintf(stderr, "strata generate: STRATA_HC_REQ8: hyper-connection projections as int8 + fp32/32 scales, "
                              "%llu MiB\n", (unsigned long long) (qb >> 20));
     }

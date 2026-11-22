@@ -142,7 +142,9 @@ public:
     /// STRATA_HC_Q8: the hyper-connection projections (`blk.*.hc_{attn,ffn}_{down,up}.weight`) the loader SKIPPED
     /// are read from the pack, quantized to int8 + one fp32 scale per 32 values, and uploaded to their own device
     /// allocation (`q8_scale` set).  Returns the bytes uploaded in `bytes`.
-    bool load_hc_q8(const std::string& pack_dir, uint64_t& bytes, std::string& err);
+    /// Only the layers [layer_lo, layer_hi): a remote stage holds the projections of its own layers only.
+    bool load_hc_q8(const std::string& pack_dir, uint64_t& bytes, std::string& err, int64_t layer_lo = 0,
+                    int64_t layer_hi = INT64_MAX);
     /// The tensor names `load_hc_q8` converts, for the loader's skip set.
     static void hc_q8_names(int64_t n_layers, std::set<std::string>& out);
     const std::map<std::string, WeightRef>& all() const { return table_; }
