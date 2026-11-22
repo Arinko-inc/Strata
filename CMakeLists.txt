@@ -2452,6 +2452,11 @@ if(STRATA_NATIVE_EXPERTS)
     target_include_directories(native_expert_parity PRIVATE ${_strata_gpu_include_directories})
     # strata_engine: the --load-check mode runs the engine's start-up checks (NativeDense, check_experts_gguf)
     target_link_libraries(native_expert_parity PRIVATE strata_engine strata_kernels strata_kernels_cpu strata_artifact ${_strata_gpu_runtime_target})
+    # STRATA_EXPERT_Q4KQ5 (src/kernels/cuda/q4k_q5_experts.cuh): Q4_K gate/up + Q5_0 down decode experts on a model's
+    # own layers, each variant against the old kernels byte for byte, and timed
+    add_executable(q4k_q5_expert_bench src/kernels/q4k_q5_expert_bench.cpp)
+    target_include_directories(q4k_q5_expert_bench PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(q4k_q5_expert_bench PRIVATE strata_kernels strata_kernels_cpu strata_artifact ${_strata_gpu_runtime_target})
     add_executable(native_expert_bench src/kernels/native_expert_bench.cpp)
     target_include_directories(native_expert_bench PRIVATE ${_strata_gpu_include_directories})
     target_link_libraries(native_expert_bench PRIVATE strata_kernels strata_kernels_cpu strata_artifact ${_strata_gpu_runtime_target})

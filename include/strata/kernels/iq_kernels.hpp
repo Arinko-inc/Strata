@@ -97,6 +97,12 @@ void native_expert_nib_set_variant(int v);
 /// false when v is not a gu-proto id (>= 10) or the type has none.
 bool native_expert_nib_variant_attr(int v, int gu_type, int* regs, int* local_bytes, int* blocks_per_sm);
 
+/// Q4_K gate/up + Q5_0 down layers (n_embd 2560, n_ff 640): the kernels `native_expert_grouped` runs for them, as
+/// STRATA_EXPERT_Q4KQ5 (src/kernels/cuda/q4k_q5_experts.cuh: 0 the old kernels, 1 gate/up, 2 down, 3 both; the
+/// bench's 997..999 only read the blobs); < 0 = the environment's, else the card's default.
+void native_expert_set_q4kq5(int v);
+int native_expert_q4kq5();
+
 /// The bench only: the AMD kernel layout (STRATA_EXP_MODE values; -1 = the environment's) and the phase
 /// (0 all, 1 gate/up + SwiGLU + quantize, 2 down, 3 gate/up only).
 void native_expert_set_mode(int mode, int phase);

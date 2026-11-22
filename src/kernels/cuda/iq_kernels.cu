@@ -6243,6 +6243,8 @@ bool native_expert_expdec_takes(const NativeExpertLayout& L, bool& gu, bool& dow
     return gu || down;
 }
 
+#include "q4k_q5_experts.cuh"   // STRATA_EXPERT_Q4KQ5: Q4_K gate/up + Q5_0 down (orca Q4_K_S)
+
 void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long* grp_ptr, const int32_t* grp_start,
                            const int32_t* n_groups, const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups,
                            int64_t cap_entries, const void* x_q8_1, void* scratch, float* out, void* stream,
@@ -6275,6 +6277,15 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
         else s26_launch_l<true, true, 4, 4, true, true>(L, cap_groups, s, grp_ptr, grp_start, n_groups, ent_dst, ent_tok, X, gate, up, h,
                                                         hq, out, (long long) cap_entries * L.n_ff);
         check("native_expert_grouped (v2)");
+        return;
+    }
+    // Q4_K gate/up + Q5_0 down (orca Q4_K_S), q4k_q5_experts.cuh.  A call that strides its groups (grid_groups
+    // 1..cap - 1: a verify window's PCIe call, usually without a group) keeps the old launch
+    if (q4kq5_layout(L) && !g_grouped_v1 && !g_old_kernels && (grid_groups <= 0 || grid_groups >= cap_groups) &&
+        q4kq5_variant() > 0) {
+        q4kq5_launch(q4kq5_variant(), g_exp_phase, L, cap_groups, cap_entries, s, grp_ptr, grp_start, n_groups, ent_dst,
+                     ent_tok, X, gate, up, hq, out);
+        check("native_expert_grouped (q4k/q5_0)");
         return;
     }
     // stream B: UD-Q4_K_XL's Q4_K / Q5_K gate/up and Q5_1 / Q8_0 down (see S27 above)
