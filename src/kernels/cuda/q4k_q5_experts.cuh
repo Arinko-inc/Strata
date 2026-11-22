@@ -182,7 +182,12 @@ int q4kq5_default() {
 #endif
 }
 int q4kq5_variant() {
-    if (g_q4kq5 == -2) g_q4kq5 = q4kq5_default();
+    if (g_q4kq5 == -2) {
+        g_q4kq5 = q4kq5_default();
+        std::fprintf(stderr, "strata: Q4_K / Q5_0 decode experts: STRATA_EXPERT_Q4KQ5=%d (%s)\n", g_q4kq5,
+                     g_q4kq5 <= 0 ? "the per-entry kernels" : g_q4kq5 == 3 ? "8-lane down rows, grouped gate/up" :
+                     g_q4kq5 == 2 ? "8-lane down rows" : g_q4kq5 == 1 ? "grouped gate/up" : "bench");
+    }
     return g_q4kq5;
 }
 bool q4kq5_layout(const NativeExpertLayout& L) {

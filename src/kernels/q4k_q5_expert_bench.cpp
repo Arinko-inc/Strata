@@ -165,7 +165,8 @@ int main(int argc, char** argv) {
     }
     cudaDeviceProp prop{};
     QB_CK(cudaGetDeviceProperties(&prop, 0));
-    std::printf("device 0: %s; plans %d, trials %d\n", prop.name, plans, trials);
+    std::printf("device 0: %s; plans %d, trials %d; the card's default STRATA_EXPERT_Q4KQ5 %d\n", prop.name, plans, trials,
+                K::native_expert_q4kq5());
     const int64_t H = 2560, FF = 640;
     constexpr int kTokMax = 8;
     int failures = 0;
