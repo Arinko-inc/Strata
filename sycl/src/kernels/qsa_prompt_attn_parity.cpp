@@ -310,6 +310,16 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16, 2
         diff = std::max(diff, (double) std::fabs(o[i] - nw[i]));
         scale = std::max(scale, (double) std::fabs(o[i]));
     }
+    {   // the outputs whose bits differ (a kernel meant to give the old kernel's bits: STRATA_ATTN_ESIMD)
+        size_t nd = 0;
+        double mr = 0;
+        for (size_t i = 0; i < o.size(); ++i)
+            if (std::memcmp(&o[i], &nw[i], 4) != 0) {
+                ++nd;
+                mr = std::max(mr, std::fabs((double) o[i] - nw[i]) / std::max(1e-30, std::fabs((double) o[i])));
+            }
+        std::printf("BITS %zu of %zu outputs differ from the old kernel (max rel %.3g)\n", nd, o.size(), mr);
+    }
     // 3. speed
     dpct::event_ptr e0, e1;
     e0 = new sycl::event();

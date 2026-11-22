@@ -245,6 +245,7 @@ foreach(k IN LISTS _kernel_cu)
 endforeach()
 strata_resolve(_kernels ${_kernel_files} src/kernels/ngram.cpp src/ngram/ple_reader.cpp src/platform/direct_file.cpp)
 list(APPEND _kernels ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/cuda/qsa_prompt_attn_xmx.dp.cpp)   # port-only: the XMX prompt attention
+list(APPEND _kernels ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/cuda/qsa_prompt_attn_esimd.dp.cpp)   # port-only: STRATA_ATTN_ESIMD's prompt attention (Battlemage; a stub with STRATA_I8_NO_ESIMD)
 list(APPEND _kernels ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/cuda/q4kq5_down_esimd.dp.cpp)   # port-only: STRATA_EXPERT_Q4KQ5=1's ESIMD down rows (Battlemage; a stub with STRATA_I8_NO_ESIMD)
 add_library(strata_kernels STATIC ${_kernels})
 target_include_directories(strata_kernels PRIVATE ${STRATA_ROOT}/third_party/ggml)
