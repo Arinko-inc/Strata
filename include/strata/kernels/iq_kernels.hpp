@@ -102,8 +102,8 @@ bool native_expert_nib_variant_attr(int v, int gu_type, int* regs, int* local_by
 void native_expert_set_mode(int mode, int phase);
 
 /// Q4_K gate/up + Q5_0 down layers: the kernels `native_expert_grouped` runs for them, as STRATA_EXPERT_Q4KQ5 (the
-/// SYCL port's values: a sum of bits, sycl/src/kernels/cuda/iq_kernels.dp.cpp; 0 the old kernels); < 0 = the
-/// environment's.  Defined by the SYCL port only on this branch.
+/// SYCL port's values, sycl/src/kernels/cuda/iq_kernels.dp.cpp: 0 the old kernels, 1 the ESIMD down rows, 2 the lane
+/// kernel with the Q5_0 split); < 0 = the environment's.  Defined by the SYCL port only on this branch.
 void native_expert_set_q4kq5(int v);
 int native_expert_q4kq5();
 

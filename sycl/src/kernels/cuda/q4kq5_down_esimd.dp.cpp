@@ -1,15 +1,22 @@
-// STRATA_EXPERT_Q4KQ5's ESIMD down kernel (Battlemage): native_down_kernel<6, 8> (the decode window's Q5_0 down rows,
-// n_ff 640) with one hardware thread per weight row instead of 8 work-items of a 32-wide sub-group.
+// STRATA_EXPERT_Q4KQ5=1's ESIMD down kernel (Battlemage): native_down_kernel<6, 8> (the decode window's Q5_0 down rows,
+// n_ff 640) with one hardware thread per 4 weight rows instead of 8 work-items of a 32-wide sub-group per row.
 //
 // The lane kernel's work-item `sub` of a row sums the dots k = sub, sub + 8, ... (k = 2 * block + half; 40 a row), each
 // read with per-lane gathers; the 8 sums then meet in lanes_sum<8>'s tree.  Here step j (0..4) takes the row's blocks
 // 4j..4j+3 (88 bytes, two 64-byte loads) and the entry's q8_1 blocks 4j..4j+3 (144 bytes, two 128-byte loads): its 8 dots
-// are the 8 lanes' j-th terms, so an 8-wide float register is the 8 lane sums.  The arithmetic is vec_dot_q5_0_q8_1's:
-//   sumi (int32, exact in any order) = the four dp4a of a dot;  term = d5 * (sumi * d8 - 8 * s8);  lane += term
-//   out = ((l0 + l4) + (l2 + l6)) + ((l1 + l5) + (l3 + l7))                                      (lanes_sum<8>)
-// `FMA` is how the compiler built `sumi * d8 - 8 * s8` in the lane kernel: fused (fma(sumi, d8, -(8 * s8)); 8 * s8 is
-// exact) or not; q4k_q5_expert_bench says which one gives the lane kernel's bits on this GPU.
-// The loads take dword-aligned addresses: a blob's base must be a multiple of 4 (the rows' offsets are).
+// are the 8 lanes' j-th terms, so an 8-wide float register is the 8 lane sums.  A group's entries share the row's
+// unpacked weights.  The arithmetic is vec_dot_q5_0_q8_1's as the device compiler builds it in the lane kernel:
+//   sumi (int32, exact in any order) = the four dp4a of a dot
+//   v    = fma(sumi, d8, -(8 * s8))            (the compiler contracts `sumi * d8 - 8 * s8`; 8 * s8 is exact)
+//   term = d5 * v, rounded on its own;  lane += term
+//   out  = ((l0 + l4) + (l2 + l6)) + ((l1 + l5) + (l3 + l7))                                      (lanes_sum<8>)
+// The ESIMD backend fuses a product into the add that follows it whether written as fma or not, so `term` goes through an
+// xor with a run-time zero before the add.  Of the four ways to build the two steps only this one gives the lane kernel's
+// bits on the B70 (oneAPI 2026.1; the other three differ in 0.1-63% of the outputs by an ulp or two); q4k_q5_expert_bench
+// checks it on a model's own layers, and has to be rerun after a compiler update.
+// 4 rows a thread: 1 row costs more dispatch (empty groups' threads too), 8 and 16 leave threads idle at one token.
+// The loads take dword-aligned addresses: a blob's base must be a multiple of 4 (the rows' offsets are; the engine's
+// blobs sit at multiples of the blob size or of 256 in allocations).
 #include <sycl/sycl.hpp>
 #include <sycl/ext/intel/esimd.hpp>
 #include <sycl/ext/intel/experimental/grf_size_properties.hpp>
@@ -18,13 +25,15 @@
 #include "strata/kernels/iq_kernels.hpp"
 
 namespace strata::kernels {
-bool q4kq5_down_esimd(int variant, unsigned groups, void* stream, const unsigned long long* grp_ptr, const int32_t* grp_start,
+bool q4kq5_down_esimd_built();
+bool q4kq5_down_esimd(unsigned groups, void* stream, const unsigned long long* grp_ptr, const int32_t* grp_start,
                       const int32_t* n_groups, const int32_t* ent_dst, const void* hq, const NativeExpertLayout& L, float* out);
 }
 
 #ifdef STRATA_I8_NO_ESIMD
 namespace strata::kernels {
-bool q4kq5_down_esimd(int, unsigned, void*, const unsigned long long*, const int32_t*, const int32_t*, const int32_t*, const void*,
+bool q4kq5_down_esimd_built() { return false; }
+bool q4kq5_down_esimd(unsigned, void*, const unsigned long long*, const int32_t*, const int32_t*, const int32_t*, const void*,
                       const NativeExpertLayout&, float*) { return false; }
 }  // namespace strata::kernels
 #else
@@ -33,7 +42,7 @@ namespace {
 using namespace sycl::ext::intel::esimd;
 using sycl::half;
 
-template <int IN, int RPT, int OUT> struct Q4kq5DownTag;
+struct Q4kq5DownTag;
 
 SYCL_ESIMD_FUNCTION inline simd<float, 8> fma8(simd<float, 8> a, simd<float, 8> b, simd<float, 8> c) {
     return simd<float, 8>(__builtin_elementwise_fma(a.data(), b.data(), c.data()));
@@ -48,14 +57,13 @@ SYCL_ESIMD_FUNCTION inline simd<float, 8> twice(simd<float, 4> v) {
 
 constexpr int kRow = 440, kStep = 88, kHRow = 720;   // a Q5_0 row of 640, 4 of its blocks; an entry's q8_1 row
 
-// IN / OUT: how `sumi * d8 - 8 * s8` and `lane + d5 * (...)` are built: 0 as written (the compiler's choice), 1 fma,
-// 2 the product rounded on its own (it goes through an xor with a run-time zero, so no later pass can fuse it)
-template <int IN, int RPT, int OUT>
+constexpr int RPT = 4;   // rows per hardware thread
+
 void launch(sycl::queue& q, unsigned groups, const unsigned long long* grp_ptr, const int32_t* grp_start,
             const int32_t* n_groups, const int32_t* ent_dst, const uint8_t* hq, size_t down_off, int n_embd, float* out) {
     auto props = sycl::ext::oneapi::experimental::properties{sycl::ext::intel::experimental::grf_size<256>};
     q.submit([&](sycl::handler& h) {
-        h.parallel_for<Q4kq5DownTag<IN, RPT, OUT>>(sycl::range<2>((size_t) groups, (size_t) (n_embd / RPT)), props, [=](sycl::id<2> id) SYCL_ESIMD_KERNEL {
+        h.parallel_for<Q4kq5DownTag>(sycl::range<2>((size_t) groups, (size_t) (n_embd / RPT)), props, [=](sycl::id<2> id) SYCL_ESIMD_KERNEL {
             const int ng = *n_groups;
             const int gy = (int) id[0];
             if (gy >= ng) return;
@@ -140,26 +148,13 @@ void launch(sycl::queue& q, unsigned groups, const unsigned long long* grp_ptr, 
                             simd<float, 4> d8q = d8h, s8q = s8h;
                             const simd<float, 8> d8 = twice(d8q), s8 = twice(s8q);
                             const simd<float, 8> u = s8 * 8.0f;
-                            simd<float, 8> v;
-                            if constexpr (IN == 1) v = fma8(f, d8, -u);
-                            else if constexpr (IN == 2) {
-                                simd<float, 8> pr = f * d8;
-                                simd<uint32_t, 8> pb = pr.template bit_cast_view<uint32_t>();
-                                pb = pb ^ zz;
-                                simd<float, 8> pp = pb.template bit_cast_view<float>();
-                                v = pp - u;
-                            } else v = f * d8 - u;
-                            if constexpr (OUT == 1) acc = fma8(D5[j], v, acc);
-                            else if constexpr (OUT == 2) {
-                                simd<float, 8> pr = D5[j] * v;
-                                simd<uint32_t, 8> pb = pr.template bit_cast_view<uint32_t>();
-                                pb = pb ^ zz;
-                                simd<float, 8> pp = pb.template bit_cast_view<float>();
-                                acc = acc + pp;
-                            } else {
-                                const simd<float, 8> term = D5[j] * v;
-                                acc = acc + term;
-                            }
+                            const simd<float, 8> v = fma8(f, d8, -u);
+                            // d5 * v rounded on its own: the xor with a run-time zero keeps it out of the add
+                            simd<float, 8> pr = D5[j] * v;
+                            simd<uint32_t, 8> pb = pr.template bit_cast_view<uint32_t>();
+                            pb = pb ^ zz;
+                            simd<float, 8> term = pb.template bit_cast_view<float>();
+                            acc = acc + term;
                         }
                         simd<float, 4> t4 = acc.template select<4, 1>(0) + acc.template select<4, 1>(4);
                         simd<float, 2> t2 = t4.template select<2, 1>(0) + t4.template select<2, 1>(2);
@@ -173,22 +168,12 @@ void launch(sycl::queue& q, unsigned groups, const unsigned long long* grp_ptr, 
 }
 }  // namespace
 
-bool q4kq5_down_esimd(int variant, unsigned groups, void* stream, const unsigned long long* grp_ptr, const int32_t* grp_start,
+bool q4kq5_down_esimd_built() { return true; }
+
+bool q4kq5_down_esimd(unsigned groups, void* stream, const unsigned long long* grp_ptr, const int32_t* grp_start,
                       const int32_t* n_groups, const int32_t* ent_dst, const void* hq, const NativeExpertLayout& L, float* out) {
-    if (L.d_type != 6 || L.n_ff != 640 || L.d_row != kRow || L.n_embd % 16 != 0 || variant < 1 || variant > 7) return false;
-    sycl::queue& q = *strata::q_of(stream);
-    const uint8_t* h = (const uint8_t*) hq;
-#define STRATA_Q4KQ5_E(IN, RPT, OUT) launch<IN, RPT, OUT>(q, groups, grp_ptr, grp_start, n_groups, ent_dst, h, L.down_off, (int) L.n_embd, out); break;
-    switch (variant) {
-        case 1: STRATA_Q4KQ5_E(1, 1, 2)
-        case 2: STRATA_Q4KQ5_E(1, 4, 2)
-        case 3: STRATA_Q4KQ5_E(2, 4, 1)
-        case 4: STRATA_Q4KQ5_E(2, 4, 2)
-        case 5: STRATA_Q4KQ5_E(1, 8, 2)
-        case 6: STRATA_Q4KQ5_E(1, 16, 2)
-        default: STRATA_Q4KQ5_E(1, 2, 2)
-    }
-#undef STRATA_Q4KQ5_E
+    if (L.d_type != 6 || L.n_ff != 640 || L.d_row != kRow || L.n_embd % RPT != 0) return false;
+    launch(*strata::q_of(stream), groups, grp_ptr, grp_start, n_groups, ent_dst, (const uint8_t*) hq, L.down_off, (int) L.n_embd, out);
     return true;
 }
 }  // namespace strata::kernels

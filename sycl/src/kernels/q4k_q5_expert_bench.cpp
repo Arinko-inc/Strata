@@ -3,10 +3,11 @@
 // variant 0, every output byte for byte, and each one's time.  The SYCL twin of src/kernels/q4k_q5_expert_bench.cpp.
 //
 //     q4k_q5_expert_bench <any shard.gguf> <layer[,layer...]> [--t 1,2,3,4] [--share 0,50] [--plans 100]
-//                         [--trials 7] [--vs 2,6,...] [--phases 0|1] [--alias K] [--graph 1|0] [--cmp 1|0]
+//                         [--trials 7] [--vs 1,2] [--phases 0|1] [--alias K] [--graph 1|0] [--cmp 1|0] [--ref V] [--grid N]
 //
-// --vs: STRATA_EXPERT_Q4KQ5 values (a sum of bits: 1 gate/up sub-group 16, 2 down split, 4 down sub-group 16, 8 no
-// root sync, 16 fused gate/up + SwiGLU).
+// --vs: STRATA_EXPERT_Q4KQ5 values (1 the ESIMD down rows, 2 the lane kernel with the Q5_0 split).  --ref V compares
+// with variant V's outputs instead of 0's.  --grid N: the launches' group rows (native_expert_grouped's grid_groups;
+// 0 = one per possible group, N < groups strides as the verify window's PCIe call does).
 // A plan is a verify window's VRAM call: T rows of top-10 routing over the layer's 512 experts (`share` % of a row's
 // experts are the previous row's), groups in first-appearance order, entries in row order.  A window of two slots
 // with one row each is two T = 1 calls, which is what the T = 1 timing issues back to back.
@@ -145,12 +146,12 @@ int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
     if (argc < 3) {
         std::fprintf(stderr, "usage: q4k_q5_expert_bench <shard.gguf> <layer[,layer]> [--t 1,2,3,4] [--share 0,50] [--plans 100] "
-                             "[--trials 7] [--vs 2,...] [--phases 0|1] [--alias K] [--graph 1|0] [--cmp 1|0]\n");
+                             "[--trials 7] [--vs 1,2] [--phases 0|1] [--alias K] [--graph 1|0] [--cmp 1|0] [--ref V] [--grid N]\n");
         return 2;
     }
     const std::vector<int> layers = ints(argv[2]);
-    std::vector<int> Ts = {1, 2, 3, 4}, shares = {0, 50}, vs = {2};
-    int plans = 100, trials = 7, phases = 0, graph = 1, cmp_on = 1, ref_v = 0;   // --ref V: compare with variant V's outputs
+    std::vector<int> Ts = {1, 2, 3, 4}, shares = {0, 50}, vs = {1, 2};
+    int plans = 100, trials = 7, phases = 0, graph = 1, cmp_on = 1, ref_v = 0, grid = 0;   // --ref V: compare with variant V's outputs
     for (int i = 3; i + 1 < argc; i += 2) {
         const std::string a = argv[i];
         if (a == "--t") Ts = ints(argv[i + 1]);
@@ -163,6 +164,7 @@ int main(int argc, char** argv) {
         else if (a == "--graph") graph = std::atoi(argv[i + 1]);
         else if (a == "--cmp") cmp_on = std::atoi(argv[i + 1]);
         else if (a == "--ref") ref_v = std::atoi(argv[i + 1]);
+        else if (a == "--grid") grid = std::atoi(argv[i + 1]);
         else { std::fprintf(stderr, "unknown option %s\n", a.c_str()); return 2; }
     }
     std::unique_ptr<strata::GgufModel> model;
@@ -177,9 +179,9 @@ int main(int argc, char** argv) {
     const char* e1 = std::getenv("STRATA_KQ_GU_LANES");
     const char* e2 = std::getenv("STRATA_DOWN_LANES");
     const char* e3 = std::getenv("STRATA_GU_LANES");
-    std::printf("device: %s; plans %d, trials %d, graph %d, alias %d; STRATA_EXPERT_Q4KQ5 of the environment %d; "
+    std::printf("device: %s; plans %d, trials %d, graph %d, alias %d, grid %d; STRATA_EXPERT_Q4KQ5 of the environment %d; "
                 "STRATA_KQ_GU_LANES %s STRATA_GU_LANES %s STRATA_DOWN_LANES %s; local_mem %zu, max wg %zu\n",
-                s->get_device().get_info<sycl::info::device::name>().c_str(), plans, trials, graph, g_alias,
+                s->get_device().get_info<sycl::info::device::name>().c_str(), plans, trials, graph, g_alias, grid,
                 K::native_expert_q4kq5(), e1 ? e1 : "-", e3 ? e3 : "-", e2 ? e2 : "-",
                 (size_t) s->get_device().get_info<sycl::info::device::local_mem_size>(),
                 (size_t) s->get_device().get_info<sycl::info::device::max_work_group_size>());
@@ -250,7 +252,7 @@ int main(int argc, char** argv) {
                 const size_t ob = (size_t) cap * H * 4;
                 auto call = [&](const Plan& p, bool empty = false) {
                     K::native_expert_grouped(L, p.d_ptr, p.d_start, empty ? d_zero : p.d_ng, p.d_dst, p.d_tok, cap, cap, dxq, dscr,
-                                             dout, s, 0);
+                                             dout, s, grid);
                 };
                 std::string cmp;
                 if (cmp_on) {

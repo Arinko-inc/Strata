@@ -4640,34 +4640,32 @@ void native_expert_set_kq_split(bool on) { g_kq_split = on; }
 bool iq_old_kernels() { return g_old_kernels; }
 
 // ---------------------------------------------------------------- STRATA_EXPERT_Q4KQ5 (SYCL port, Xe2 / B70)
-// Q4_K gate/up + Q5_0 down layers in native_expert_grouped (the decode window's experts).  A sum of bits, default 0
-// (the kernels above); every bit keeps each output's integer and float operations and their order (q4k_q5_expert_bench
-// compares the outputs with variant 0's byte for byte on a model's own layers):
-//    1  gate/up: the same lane kernel compiled for sub-groups of 16 (Xe2's native width) instead of 32
-//    2  down: a group's 2-4 entries read and unpack each Q5_0 weight part once (the split KqSplit has for Q5_1)
-//    4  down: sub-groups of 16
-//    8  the three launches without the use_root_sync property
-//   16  gate/up + SwiGLU + q8_1 in one launch: a work-group computes 32 gate rows and their 32 up rows of a group's
-//       entries into local memory and stores the q8_1 block they make (one launch less per call; bits 1 is ignored)
-//   32 * n  gate/up: n = 1, 2, 3: 4, 2, 1 threads per row instead of 8 (row_dot_vl; before the bits above)
-//  128 * n  down: the same, with the split of bit 2
-// A value outside 0..511 is refused at start.
-extern int g_exp_phase;
-// q4kq5_down_esimd.dp.cpp: the down launch on ESIMD (variant 1..4); false when the build or the layer has none
-bool q4kq5_down_esimd(int variant, unsigned groups, void* stream, const unsigned long long* grp_ptr, const int32_t* grp_start,
+// The down launch of Q4_K gate/up + Q5_0 down layers (n_ff 640) in native_expert_grouped, the decode window's experts:
+//    0  (default) native_down_kernel<6, 8>: 8 work-items a row, every entry reads and unpacks the row again
+//    1  the ESIMD kernel (q4kq5_down_esimd.dp.cpp): one hardware thread per 4 rows, block loads instead of gathers
+//    2  the lane kernel with a group's 2-4 entries reading and unpacking each Q5_0 weight part once (the split KqSplit
+//       has for Q5_1)
+// Both keep every output's integer and float operations and their order: q4k_q5_expert_bench compares them with 0 byte
+// for byte on a model's own layers (rerun it after a compiler update: value 1 relies on how the compiler contracts
+// vec_dot_q5_0_q8_1's float expression).  Gate/up and the SwiGLU pass are the kernels above in every value: on the
+// B70 sub-groups of 16, fewer threads per row, no use_root_sync and a fused gate/up + SwiGLU launch were all slower
+// (strata-mesh bench/2026-11-22-b70exp; the code is in this branch's history, f3e2b64b3).
+// Any other value, or 1 in a build without ESIMD, is refused at start.
+// q4kq5_down_esimd.dp.cpp: the launch; false when the build has no ESIMD or the layer is not n_ff 640 Q5_0
+bool q4kq5_down_esimd_built();
+bool q4kq5_down_esimd(unsigned groups, void* stream, const unsigned long long* grp_ptr, const int32_t* grp_start,
                       const int32_t* n_groups, const int32_t* ent_dst, const void* hq, const NativeExpertLayout& L, float* out);
 namespace {
 int q4kq5_parse() {
     const char* e = std::getenv("STRATA_EXPERT_Q4KQ5");
     if (!e || !*e) return 0;
-    char* end = nullptr;
-    const long v = std::strtol(e, &end, 10);
-    if (*end != '\0' || v < 0 || v > 8191) {
-        std::fprintf(stderr, "STRATA_EXPERT_Q4KQ5=%s: a sum of 1 (gate/up sub-group 16), 2 (down split), 4 (down sub-group 16), "
-                             "8 (no root sync), 16 (fused gate/up + SwiGLU), 0..31\n", e);
+    const bool ok = (e[0] == '0' || e[0] == '1' || e[0] == '2') && e[1] == '\0';
+    if (!ok || (e[0] == '1' && !q4kq5_down_esimd_built())) {
+        std::fprintf(stderr, "STRATA_EXPERT_Q4KQ5=%s: 0 (the lane kernels), 1 (ESIMD down rows%s) or 2 (lane kernel, Q5_0 split)\n", e,
+                     q4kq5_down_esimd_built() ? "" : "; not in this build");
         std::exit(1);
     }
-    return (int) v;
+    return e[0] - '0';
 }
 const int g_q4kq5_env = q4kq5_parse();
 int g_q4kq5 = -1;   // native_expert_set_q4kq5 (the bench); < 0: the environment's
@@ -4726,12 +4724,12 @@ __dpct_inline__ void row_dot_q50(const uint8_t* row, const block_q8_1* const* xs
 #pragma unroll
     for (int e = 0; e < E; ++e) out[e] = lanes_sum<LANES>(s[e]);
 }
-// native_down_kernel<6, LN> with (SPLIT) a group's entries taken 4 and 2 at a time through row_dot_q50
-template <int LN, bool SPLIT>
+// native_down_kernel<6, 8> with a group's entries taken 4 and 2 at a time through row_dot_q50
 __dpct_inline__ void q4kq5_down_kernel(
     const unsigned long long *__restrict__ grp_ptr, const int32_t *__restrict__ grp_start,
     const int32_t *__restrict__ n_groups, const int32_t *__restrict__ ent_dst, const block_q8_1 *__restrict__ hq,
     NativeExpertLayout L, float *__restrict__ out) {
+    constexpr int LN = 8;
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
     const int ng = *n_groups;
     const int rib = item_ct1.get_local_id(2) / LN, sub = item_ct1.get_local_id(2) % LN;
@@ -4743,22 +4741,20 @@ __dpct_inline__ void q4kq5_down_kernel(
         const uint8_t* wr = (const uint8_t*) grp_ptr[g] + off;
         const int e0 = grp_start[g], e1 = grp_start[g + 1];
         int e = e0;
-        if constexpr (SPLIT) {
-            for (; e + 4 <= e1; e += 4) {
-                const block_q8_1* xs[4] = {hq + (size_t) e * hb, hq + (size_t) (e + 1) * hb, hq + (size_t) (e + 2) * hb, hq + (size_t) (e + 3) * hb};
-                float o[4];
-                row_dot_q50<LN, 4>(wr, xs, nb, sub, o);
-                if (sub == 0)
+        for (; e + 4 <= e1; e += 4) {
+            const block_q8_1* xs[4] = {hq + (size_t) e * hb, hq + (size_t) (e + 1) * hb, hq + (size_t) (e + 2) * hb, hq + (size_t) (e + 3) * hb};
+            float o[4];
+            row_dot_q50<LN, 4>(wr, xs, nb, sub, o);
+            if (sub == 0)
 #pragma unroll
-                    for (int i = 0; i < 4; ++i) out[(size_t) ent_dst[e + i] * L.n_embd + r] = o[i];
-            }
-            if (e + 2 <= e1) {
-                const block_q8_1* xs[2] = {hq + (size_t) e * hb, hq + (size_t) (e + 1) * hb};
-                float o[2];
-                row_dot_q50<LN, 2>(wr, xs, nb, sub, o);
-                if (sub == 0) { out[(size_t) ent_dst[e] * L.n_embd + r] = o[0]; out[(size_t) ent_dst[e + 1] * L.n_embd + r] = o[1]; }
-                e += 2;
-            }
+                for (int i = 0; i < 4; ++i) out[(size_t) ent_dst[e + i] * L.n_embd + r] = o[i];
+        }
+        if (e + 2 <= e1) {
+            const block_q8_1* xs[2] = {hq + (size_t) e * hb, hq + (size_t) (e + 1) * hb};
+            float o[2];
+            row_dot_q50<LN, 2>(wr, xs, nb, sub, o);
+            if (sub == 0) { out[(size_t) ent_dst[e] * L.n_embd + r] = o[0]; out[(size_t) ent_dst[e + 1] * L.n_embd + r] = o[1]; }
+            e += 2;
         }
         for (; e < e1; ++e) {
             const float v = row_dot_lanes<6, LN>(wr, hq + (size_t) e * hb, nb, sub);
@@ -4766,329 +4762,20 @@ __dpct_inline__ void q4kq5_down_kernel(
         }
     }
 }
-
-// swiglu_q8_1_entries_kernel's product, rounded on its own as there
-__dpct_inline__ float q4kq5_swiglu(float g, float u) {
-#pragma clang fp contract(off)
-    return (g / (1.0f + sycl::native::exp(-g))) * u;
-}
-// E entries of one group, q8_1 block b of each: the 32 gate rows and the 32 up rows (8 lanes a row, the chunking and
-// the dots of row_entries<12, 8>), then the first sub-group makes each entry's block as swiglu_q8_1_entries_kernel does
-template <int E>
-__dpct_inline__ void q4kq5_fused_chunk(const uint8_t* blob, const NativeExpertLayout& L, const block_q8_1* __restrict__ xq,
-                                       const int32_t* __restrict__ ent_tok, int e, int b, float* slm,
-                                       block_q8_1* __restrict__ hq) {
-    auto it = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
-    const int lid = (int) it.get_local_id(2), rib = lid / 8, sub = lid % 8;
-    const int nb = (int) (L.n_embd / Fmt<12>::qk), xb = (int) (L.n_embd / 32);
-    const block_q8_1* xs[E];
-#pragma unroll
-    for (int i = 0; i < E; ++i) xs[i] = xq + (size_t) ent_tok[e + i] * xb;
-#pragma unroll
-    for (int half = 0; half < 2; ++half) {
-        const uint8_t* wr = blob + (half ? L.up_off : 0) + (size_t) (b * 32 + rib) * L.gu_row;
-        float o[E];
-        if constexpr (E == 1) o[0] = row_dot_lanes<12, 8>(wr, xs[0], nb, sub);
-        else row_dot_ksplit<12, 8, E>(wr, xs, nb, sub, o);
-        if (sub == 0)
-#pragma unroll
-            for (int i = 0; i < E; ++i) slm[i * 64 + half * 32 + rib] = o[i];
-    }
-    it.barrier(sycl::access::fence_space::local_space);
-    if (lid < 32) {
-#pragma unroll
-        for (int i = 0; i < E; ++i) {
-            const float h = q4kq5_swiglu(slm[i * 64 + lid], slm[i * 64 + 32 + lid]);
-            q8_1_store(h, hq, (long long) (e + i) * L.n_ff + (long long) b * 32 + lid);
-        }
-    }
-    it.barrier(sycl::access::fence_space::local_space);
-}
-__dpct_inline__ void q4kq5_gu_fused_kernel(
-    const unsigned long long *__restrict__ grp_ptr, const int32_t *__restrict__ grp_start,
-    const int32_t *__restrict__ n_groups, const int32_t *__restrict__ ent_tok, const block_q8_1 *__restrict__ xq,
-    NativeExpertLayout L, block_q8_1 *__restrict__ hq) {
-    auto it = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
-    const int ng = *n_groups;
-    if ((int) it.get_group(1) >= ng) return;   // uniform over the work-group, before any barrier
-    auto& slm = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[4 * 64]>(it.get_group());
-    const int b = (int) it.get_group(2);
-    for (int g = (int) it.get_group(1); g < ng; g += (int) it.get_group_range(1)) {
-        const uint8_t* blob = (const uint8_t*) grp_ptr[g];
-        const int e0 = grp_start[g], e1 = grp_start[g + 1];
-        int e = e0;
-        for (; e + 4 <= e1; e += 4) q4kq5_fused_chunk<4>(blob, L, xq, ent_tok, e, b, &slm[0], hq);
-        if (e + 2 <= e1) { q4kq5_fused_chunk<2>(blob, L, xq, ent_tok, e, b, &slm[0], hq); e += 2; }
-        for (; e < e1; ++e) q4kq5_fused_chunk<1>(blob, L, xq, ent_tok, e, b, &slm[0], hq);
-    }
-}
-
-// Threads per row (TPR = 8, 4, 2, 1) apart from the 8 lanes of a row's sum: a thread holds 8 / TPR of the row's 8
-// lane sums (lanes t, t + TPR, ...: each its own k order), adds them in the order lanes_sum<8> does (lane l with lane
-// l ^ 4, then ^ 2, then ^ 1) and the threads of the row finish that tree: the same float operations on the same
-// values as row_dot_ksplit<TY, 8, E>, with 8 / TPR times as many dots per thread and TPR / 8 as many threads.
-// q50_load with the fifth bits spread by one multiply (bit j of a nibble to bit 0 of byte j: the partial products
-// land on distinct bits, so no carry) instead of four shifts and masks: the same vi0 / vi1
-__dpct_inline__ Q50W q50_load_mul(const void* __restrict__ vbq, int kbx, int iqs) {
-    const block_q5_0* b = (const block_q5_0*) vbq + kbx;
-    Q50W r;
-    const unsigned qh = (unsigned) get_int_b2(b->qh, 0);
-#pragma unroll
-    for (int i = 0; i < VDR_Q5_0; ++i) {
-        const int vl = get_int_b2(b->qs, iqs + i);
-        const unsigned vh = qh >> (4 * (iqs + i));
-        r.vi0[i] = (vl & 0x0F0F0F0F) | (int) ((((vh & 0xFu) * 0x00204081u) & 0x01010101u) << 4);
-        r.vi1[i] = ((vl >> 4) & 0x0F0F0F0F) | (int) (((((vh >> 16) & 0xFu) * 0x00204081u) & 0x01010101u) << 4);
-    }
-    r.d5 = sycl::vec<sycl::half, 1>(b->d).convert<float, sycl::rounding_mode::automatic>()[0];
-    return r;
-}
-template <int TY> struct VlSplit : KqSplit<TY> {};
-template <> struct VlSplit<6> {
-    using W = Q50W;
-    __dpct_inline__ static W load(const void* __restrict__ vbq, int kbx, int iqs) { return q50_load(vbq, kbx, iqs); }
-    __dpct_inline__ static float apply(const W& r, const block_q8_1* __restrict__ bq8_1, int iqs) { return q50_apply(r, bq8_1, iqs); }
-};
-template <> struct VlSplit<1006> {   // Q5_0 with q50_load_mul
-    using W = Q50W;
-    __dpct_inline__ static W load(const void* __restrict__ vbq, int kbx, int iqs) { return q50_load_mul(vbq, kbx, iqs); }
-    __dpct_inline__ static float apply(const W& r, const block_q8_1* __restrict__ bq8_1, int iqs) { return q50_apply(r, bq8_1, iqs); }
-};
-template <int TY, int TPR, int E>
-__dpct_inline__ void row_dot_vl(const uint8_t* row, const block_q8_1* const* xs, int nb, int t, float* out) {
-    using F = Fmt<TY == 1006 ? 6 : TY>;
-    using K = VlSplit<TY>;
-    constexpr int VL = 8 / TPR;
-    float s[E][VL];
-#pragma unroll
-    for (int e = 0; e < E; ++e)
-#pragma unroll
-        for (int v = 0; v < VL; ++v) s[e][v] = 0.f;
-    const int calls = nb * F::ipb;
-    for (int k0 = 0; k0 < calls; k0 += 8) {
-#pragma unroll
-        for (int v = 0; v < VL; ++v) {
-            const int k = k0 + t + v * TPR;
-            if (k < calls) {
-                const int kbx = k / F::ipb, iqs = F::step * (k % F::ipb);
-                const typename K::W w = K::load(row, kbx, iqs);
-#pragma unroll
-                for (int e = 0; e < E; ++e) s[e][v] += K::apply(w, xs[e] + kbx * (F::qk / 32), iqs);
-            }
-        }
-    }
-#pragma unroll
-    for (int e = 0; e < E; ++e) {
-#pragma unroll
-        for (int o = VL / 2; o > 0; o >>= 1)
-#pragma unroll
-            for (int v = 0; v < o; ++v) s[e][v] += s[e][v + o];
-        out[e] = lanes_sum<TPR>(s[e][0]);
-    }
-}
-template <int TPR>
-__dpct_inline__ void q4kq5_gu_vl_kernel(
-    const unsigned long long *__restrict__ grp_ptr, const int32_t *__restrict__ grp_start,
-    const int32_t *__restrict__ n_groups, const int32_t *__restrict__ ent_tok, const block_q8_1 *__restrict__ xq,
-    NativeExpertLayout L, float *__restrict__ gate, float *__restrict__ up) {
-    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
-    const int ng = *n_groups;
-    if ((int) item_ct1.get_group(1) >= ng) return;
-    const int rib = item_ct1.get_local_id(2) / TPR, t = item_ct1.get_local_id(2) % TPR;
-    const int row = item_ct1.get_group(2) * (256 / TPR) + rib;
-    if (row >= 2 * L.n_ff) return;
-    const bool is_up = row >= L.n_ff;
-    const int r = is_up ? row - (int) L.n_ff : row;
-    const size_t off = (is_up ? L.up_off : 0) + (size_t) r * L.gu_row;
-    const int nb = (int) (L.n_embd / Fmt<12>::qk), xb = (int) (L.n_embd / 32);
-    float* dst = (is_up ? up : gate) + r;
-    for (int g = (int) item_ct1.get_group(1); g < ng; g += (int) item_ct1.get_group_range(1)) {
-        const uint8_t* wr = (const uint8_t*) grp_ptr[g] + off;
-        const int e0 = grp_start[g], e1 = grp_start[g + 1];
-        int e = e0;
-        for (; e + 4 <= e1; e += 4) {
-            const block_q8_1* xs[4] = {xq + (size_t) ent_tok[e] * xb, xq + (size_t) ent_tok[e + 1] * xb,
-                                       xq + (size_t) ent_tok[e + 2] * xb, xq + (size_t) ent_tok[e + 3] * xb};
-            float o[4];
-            row_dot_vl<12, TPR, 4>(wr, xs, nb, t, o);
-            if (t == 0)
-#pragma unroll
-                for (int i = 0; i < 4; ++i) dst[(size_t) (e + i) * L.n_ff] = o[i];
-        }
-        if (e + 2 <= e1) {
-            const block_q8_1* xs[2] = {xq + (size_t) ent_tok[e] * xb, xq + (size_t) ent_tok[e + 1] * xb};
-            float o[2];
-            row_dot_vl<12, TPR, 2>(wr, xs, nb, t, o);
-            if (t == 0) { dst[(size_t) e * L.n_ff] = o[0]; dst[(size_t) (e + 1) * L.n_ff] = o[1]; }
-            e += 2;
-        }
-        for (; e < e1; ++e) {
-            const block_q8_1* xs[1] = {xq + (size_t) ent_tok[e] * xb};
-            float o[1];
-            row_dot_vl<12, TPR, 1>(wr, xs, nb, t, o);
-            if (t == 0) dst[(size_t) e * L.n_ff] = o[0];
-        }
-    }
-}
-template <int TPR, bool MU>
-__dpct_inline__ void q4kq5_down_vl_kernel(
-    const unsigned long long *__restrict__ grp_ptr, const int32_t *__restrict__ grp_start,
-    const int32_t *__restrict__ n_groups, const int32_t *__restrict__ ent_dst, const block_q8_1 *__restrict__ hq,
-    NativeExpertLayout L, float *__restrict__ out) {
-    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
-    const int ng = *n_groups;
-    const int rib = item_ct1.get_local_id(2) / TPR, t = item_ct1.get_local_id(2) % TPR;
-    const int r = item_ct1.get_group(2) * (256 / TPR) + rib;
-    if (r >= L.n_embd) return;
-    const size_t off = L.down_off + (size_t) r * L.d_row;
-    const int nb = (int) (L.n_ff / Fmt<6>::qk), hb = (int) (L.n_ff / 32);
-    for (int g = (int) item_ct1.get_group(1); g < ng; g += (int) item_ct1.get_group_range(1)) {
-        const uint8_t* wr = (const uint8_t*) grp_ptr[g] + off;
-        const int e0 = grp_start[g], e1 = grp_start[g + 1];
-        int e = e0;
-        for (; e + 4 <= e1; e += 4) {
-            const block_q8_1* xs[4] = {hq + (size_t) e * hb, hq + (size_t) (e + 1) * hb, hq + (size_t) (e + 2) * hb, hq + (size_t) (e + 3) * hb};
-            float o[4];
-            row_dot_vl<MU ? 1006 : 6, TPR, 4>(wr, xs, nb, t, o);
-            if (t == 0)
-#pragma unroll
-                for (int i = 0; i < 4; ++i) out[(size_t) ent_dst[e + i] * L.n_embd + r] = o[i];
-        }
-        if (e + 2 <= e1) {
-            const block_q8_1* xs[2] = {hq + (size_t) e * hb, hq + (size_t) (e + 1) * hb};
-            float o[2];
-            row_dot_vl<MU ? 1006 : 6, TPR, 2>(wr, xs, nb, t, o);
-            if (t == 0) { out[(size_t) ent_dst[e] * L.n_embd + r] = o[0]; out[(size_t) ent_dst[e + 1] * L.n_embd + r] = o[1]; }
-            e += 2;
-        }
-        for (; e < e1; ++e) {
-            const block_q8_1* xs[1] = {hq + (size_t) e * hb};
-            float o[1];
-            row_dot_vl<MU ? 1006 : 6, TPR, 1>(wr, xs, nb, t, o);
-            if (t == 0) out[(size_t) ent_dst[e] * L.n_embd + r] = o[0];
-        }
-    }
-}
-
-// one launch: work-groups of 256, sub-groups of SG, with (RS) or without the use_root_sync property
-template <typename Name, int SG, bool RS, typename F>
-void q4kq5_submit(dpct::queue_ptr s, const sycl::nd_range<3>& r, F f) {
-    auto props = sycl::ext::oneapi::experimental::properties{sycl::ext::oneapi::experimental::use_root_sync};
-    if constexpr (SG == 16) {
-        auto k = [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(16)]] { f(); };
-        if constexpr (RS) s->parallel_for<Name>(r, props, k);
-        else s->parallel_for<Name>(r, k);
-    } else {
-        auto k = [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] { f(); };
-        if constexpr (RS) s->parallel_for<Name>(r, props, k);
-        else s->parallel_for<Name>(r, k);
-    }
-}
-template <int LN, int SG, bool RS>
-void q4kq5_launch_gu(unsigned groups, dpct::queue_ptr s, const unsigned long long *grp_ptr, const int32_t *grp_start,
-                     const int32_t *n_groups, const int32_t *ent_tok, const block_q8_1 *X, const NativeExpertLayout &L,
-                     float *gate, float *up) {
-    const unsigned gx = (unsigned) ((2 * L.n_ff + 256 / LN - 1) / (256 / LN));
-    q4kq5_submit<dpct_kernel_name<class q4kq5_gu, dpct_kernel_scalar<LN>, dpct_kernel_scalar<SG>, dpct_kernel_scalar<RS>>, SG, RS>(
-        s, sycl::nd_range<3>(sycl::range<3>(1, groups, (size_t) gx * 256), sycl::range<3>(1, 1, 256)),
-        [=]() { native_gu_kernel<12, LN, true>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); });
-}
-template <bool SPLIT, int SG, bool RS>
-void q4kq5_launch_down(unsigned groups, dpct::queue_ptr s, const unsigned long long *grp_ptr, const int32_t *grp_start,
-                       const int32_t *n_groups, const int32_t *ent_dst, const block_q8_1 *hq, const NativeExpertLayout &L,
-                       float *out) {
-    const unsigned gx = (unsigned) ((L.n_embd + 31) / 32);
-    q4kq5_submit<dpct_kernel_name<class q4kq5_down, dpct_kernel_scalar<SPLIT>, dpct_kernel_scalar<SG>, dpct_kernel_scalar<RS>>, SG, RS>(
-        s, sycl::nd_range<3>(sycl::range<3>(1, groups, (size_t) gx * 256), sycl::range<3>(1, 1, 256)),
-        [=]() { q4kq5_down_kernel<8, SPLIT>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); });
-}
-template <bool RS>
-void q4kq5_launch_fused(unsigned groups, dpct::queue_ptr s, const unsigned long long *grp_ptr, const int32_t *grp_start,
-                        const int32_t *n_groups, const int32_t *ent_tok, const block_q8_1 *X, const NativeExpertLayout &L,
-                        block_q8_1 *hq) {
-    q4kq5_submit<dpct_kernel_name<class q4kq5_fused, dpct_kernel_scalar<RS>>, 32, RS>(
-        s, sycl::nd_range<3>(sycl::range<3>(1, groups, (size_t) (L.n_ff / 32) * 256), sycl::range<3>(1, 1, 256)),
-        [=]() { q4kq5_gu_fused_kernel(grp_ptr, grp_start, n_groups, ent_tok, X, L, hq); });
-}
-
-template <int TPR>
-void q4kq5_launch_gu_vl(unsigned groups, dpct::queue_ptr s, const unsigned long long *grp_ptr, const int32_t *grp_start,
-                        const int32_t *n_groups, const int32_t *ent_tok, const block_q8_1 *X, const NativeExpertLayout &L,
-                        float *gate, float *up) {
-    const unsigned gx = (unsigned) ((2 * L.n_ff + 256 / TPR - 1) / (256 / TPR));
-    q4kq5_submit<dpct_kernel_name<class q4kq5_gu_vl, dpct_kernel_scalar<TPR>>, 32, true>(
-        s, sycl::nd_range<3>(sycl::range<3>(1, groups, (size_t) gx * 256), sycl::range<3>(1, 1, 256)),
-        [=]() { q4kq5_gu_vl_kernel<TPR>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); });
-}
-template <int TPR, bool MU>
-void q4kq5_launch_down_vl(unsigned groups, dpct::queue_ptr s, const unsigned long long *grp_ptr, const int32_t *grp_start,
-                          const int32_t *n_groups, const int32_t *ent_dst, const block_q8_1 *hq, const NativeExpertLayout &L,
-                          float *out) {
-    const unsigned gx = (unsigned) ((L.n_embd + 256 / TPR - 1) / (256 / TPR));
-    q4kq5_submit<dpct_kernel_name<class q4kq5_down_vl, dpct_kernel_scalar<TPR>, dpct_kernel_scalar<MU>>, 32, true>(
-        s, sycl::nd_range<3>(sycl::range<3>(1, groups, (size_t) gx * 256), sycl::range<3>(1, 1, 256)),
-        [=]() { q4kq5_down_vl_kernel<TPR, MU>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); });
-}
-
-// the gate/up launch of variant `qv`: 0 not taken (the caller's own launch), 1 gate/up done, 2 gate/up + SwiGLU + q8_1 done
-int q4kq5_gu(int qv, unsigned groups, dpct::queue_ptr s, const unsigned long long *grp_ptr, const int32_t *grp_start,
-             const int32_t *n_groups, const int32_t *ent_tok, const block_q8_1 *X, const NativeExpertLayout &L,
-             float *gate, float *up, block_q8_1 *hq) {
-    if (!g_kq_split) return 0;
-    if (((qv >> 5) & 3) && kq_gu_lanes() == 8) {   // threads per row 4 / 2 / 1
-        switch ((qv >> 5) & 3) {
-            case 1: q4kq5_launch_gu_vl<4>(groups, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
-            case 2: q4kq5_launch_gu_vl<2>(groups, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
-            default: q4kq5_launch_gu_vl<1>(groups, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
-        }
-        return 1;
-    }
-    const bool rs = !(qv & 8);
-    if ((qv & 16) && kq_gu_lanes() == 8 && g_exp_phase != 3) {
-        if (rs) q4kq5_launch_fused<true>(groups, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, hq);
-        else q4kq5_launch_fused<false>(groups, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, hq);
-        return 2;
-    }
-    if (!(qv & 9)) return 0;
-    const int ln = kq_gu_lanes();
-    if (ln != 8 && ln != 16) return 0;
-#define STRATA_Q4KQ5_GU(LN) \
-    if (qv & 1) { \
-        if (rs) q4kq5_launch_gu<LN, 16, true>(groups, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); \
-        else q4kq5_launch_gu<LN, 16, false>(groups, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); \
-    } else q4kq5_launch_gu<LN, 32, false>(groups, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
-    if (ln == 8) { STRATA_Q4KQ5_GU(8) } else { STRATA_Q4KQ5_GU(16) }
-#undef STRATA_Q4KQ5_GU
-    return 1;
-}
+// the down launch of variant `qv` (1, 2): false = not taken (the caller's own launch)
 bool q4kq5_down(int qv, unsigned groups, dpct::queue_ptr s, const unsigned long long *grp_ptr, const int32_t *grp_start,
                 const int32_t *n_groups, const int32_t *ent_dst, const block_q8_1 *hq, const NativeExpertLayout &L,
                 float *out) {
-    if (down_lanes() != 8) return false;
-    if (((qv >> 10) & 7) && q4kq5_down_esimd((qv >> 10) & 7, groups, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out)) return true;
-    if ((qv >> 7) & 3) {   // threads per row 4 / 2 / 1 (with the split)
-#define STRATA_Q4KQ5_DV(MU) \
-        switch ((qv >> 7) & 3) { \
-            case 1: q4kq5_launch_down_vl<4, MU>(groups, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break; \
-            case 2: q4kq5_launch_down_vl<2, MU>(groups, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break; \
-            default: q4kq5_launch_down_vl<1, MU>(groups, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break; \
-        }
-        if (qv & 512) { STRATA_Q4KQ5_DV(true) } else { STRATA_Q4KQ5_DV(false) }
-#undef STRATA_Q4KQ5_DV
-        return true;
-    }
-    if (!(qv & 14)) return false;
-    const bool rs = !(qv & 8);
-#define STRATA_Q4KQ5_D(SPLIT) \
-    if (qv & 4) { \
-        if (rs) q4kq5_launch_down<SPLIT, 16, true>(groups, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); \
-        else q4kq5_launch_down<SPLIT, 16, false>(groups, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); \
-    } else { \
-        if (rs) q4kq5_launch_down<SPLIT, 32, true>(groups, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); \
-        else q4kq5_launch_down<SPLIT, 32, false>(groups, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); \
-    }
-    if (qv & 2) { STRATA_Q4KQ5_D(true) } else { STRATA_Q4KQ5_D(false) }
-#undef STRATA_Q4KQ5_D
+    if (down_lanes() != 8) return false;   // STRATA_DOWN_LANES asks for other sums: the lane kernels
+    if (qv == 1) return q4kq5_down_esimd(groups, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+    if (qv != 2) return false;
+    const unsigned gx = (unsigned) ((L.n_embd + 31) / 32);
+    auto exp_props = sycl::ext::oneapi::experimental::properties{sycl::ext::oneapi::experimental::use_root_sync};
+    s->parallel_for<dpct_kernel_name<class q4kq5_down_split>>(
+        sycl::nd_range<3>(sycl::range<3>(1, groups, (size_t) gx * 256), sycl::range<3>(1, 1, 256)), exp_props,
+        [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] {
+            q4kq5_down_kernel(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+        });
     return true;
 }
 }  // namespace
@@ -6090,9 +5777,6 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     const int64_t gy = (v1 || grid_groups <= 0 || grid_groups > cap_groups) ? cap_groups : grid_groups;
     const dpct::dim3 ggu((unsigned)((2 * L.n_ff + kExpertRows - 1) / kExpertRows),
                          (unsigned)gy);
-    // STRATA_EXPERT_Q4KQ5: Q4_K gate/up + Q5_0 down layers only (0: the kernels below)
-    const int qv = (L.gu_type == 12 && L.d_type == 6 && L.had_block == 0 && !v1 && L.n_ff % 32 == 0) ? native_expert_q4kq5() : 0;
-    int q_done = 0;
 #if defined(STRATA_HIP_GFX906)
     const int em0 = exp_mode();
 #endif
@@ -6143,8 +5827,6 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     } else
 #undef STRATA_GU_AMD
 #endif
-    if (qv && (q_done = q4kq5_gu(qv, (unsigned) gy, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, hq)) != 0) {
-    } else
     switch (L.gu_type) {
 #define STRATA_GU(T) case T: launch_gu<T>(ggu, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
         STRATA_GU_FMTS(STRATA_GU)
@@ -6166,14 +5848,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     const bool sw_v1 = v1;
 #endif
     // APR: Hadamard-folded down weights take the rotated h, so h exists as floats first (the separate passes)
-    if (q_done == 2) {   // STRATA_EXPERT_Q4KQ5 16: the gate/up launch stored hq
-    } else if (qv & 8) {   // swiglu_q8_1_entries_kernel without the use_root_sync property
-            s->parallel_for<dpct_kernel_name<class swiglu_q8_1_entries_kernel_q4kq5>>(
-                sycl::nd_range<3>(sycl::range(1, 1, (unsigned)((nh + 255) / 256)) * sycl::range(1, 1, 256), sycl::range(1, 1, 256)),
-                [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
-                    swiglu_q8_1_entries_kernel(gate, up, grp_start, n_groups, (int)L.n_ff, hq);
-                });
-    } else if (sw_v1 || L.had_block > 0) {
+    if (sw_v1 || L.had_block > 0) {
             {
                 auto exp_props = sycl::ext::oneapi::experimental::properties{
                     sycl::ext::oneapi::experimental::use_root_sync};
@@ -6255,7 +5930,9 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     } else
 #undef STRATA_D_AMD
 #endif
-    if (qv && q4kq5_down(qv, (unsigned) gy, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out)) {
+    // STRATA_EXPERT_Q4KQ5: Q4_K gate/up + Q5_0 down layers only (0: the kernels below)
+    if (L.gu_type == 12 && L.d_type == 6 && L.had_block == 0 && !v1 && native_expert_q4kq5() != 0 &&
+        q4kq5_down(native_expert_q4kq5(), (unsigned) gy, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out)) {
     } else
     switch (L.d_type) {
 #define STRATA_DOWN(T) case T: launch_down<T>(gd, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;

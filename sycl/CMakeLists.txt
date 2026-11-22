@@ -245,7 +245,7 @@ foreach(k IN LISTS _kernel_cu)
 endforeach()
 strata_resolve(_kernels ${_kernel_files} src/kernels/ngram.cpp src/ngram/ple_reader.cpp src/platform/direct_file.cpp)
 list(APPEND _kernels ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/cuda/qsa_prompt_attn_xmx.dp.cpp)   # port-only: the XMX prompt attention
-list(APPEND _kernels ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/cuda/q4kq5_down_esimd.dp.cpp)   # port-only: STRATA_EXPERT_Q4KQ5's ESIMD down rows (Battlemage)
+list(APPEND _kernels ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/cuda/q4kq5_down_esimd.dp.cpp)   # port-only: STRATA_EXPERT_Q4KQ5=1's ESIMD down rows (Battlemage; a stub with STRATA_I8_NO_ESIMD)
 add_library(strata_kernels STATIC ${_kernels})
 target_include_directories(strata_kernels PRIVATE ${STRATA_ROOT}/third_party/ggml)
 target_link_libraries(strata_kernels PUBLIC strata_core)
@@ -483,7 +483,7 @@ if(STRATA_SYCL_PARITY)
     target_include_directories(native_expert_parity PRIVATE ${STRATA_ROOT}/third_party/ggml)
     target_link_libraries(native_expert_parity PRIVATE strata_kernels strata_kernels_cpu)
     # STRATA_EXPERT_Q4KQ5's variants against variant 0 on a model's own Q4_K / Q5_0 layers, byte for byte, and timed:
-    #   q4k_q5_expert_bench <any shard.gguf> <layer[,layer]> [--vs 2,6,...] [--phases 1] ...
+    #   q4k_q5_expert_bench <any shard.gguf> <layer[,layer]> [--vs 1,2] [--phases 1] ...
     add_executable(q4k_q5_expert_bench ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/q4k_q5_expert_bench.cpp)
     target_include_directories(q4k_q5_expert_bench PRIVATE ${STRATA_ROOT}/third_party/ggml)
     target_link_libraries(q4k_q5_expert_bench PRIVATE strata_kernels strata_kernels_cpu)
