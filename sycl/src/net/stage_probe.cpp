@@ -157,13 +157,14 @@ struct Probe {
     bool vision = false, batch = false;
     int batch_slots = 1;
     int decode = 32;
+    int64_t max_context = 8192;
     StageClient link;
 
     bool connect(std::string& err) {
         StageHello mine = g.peer;   // geometry, pack and K/V as the worker's
         mine.protocol = kStageProtocol;
         mine.max_t = kW;
-        mine.max_context = 8192;
+        mine.max_context = max_context;
         mine.chunk = kChunk;
         mine.tail_skip = 0;
         mine.vision = vision ? 1 : 0;
@@ -361,6 +362,8 @@ int main(int argc, char** argv) {
     std::string expect_refusal;
     bool slots = false, expect_differ = false;
     int windows = 32;
+    int64_t bench = 0;   // --bench N: a prompt of N tokens (noise rows), each chunk's time and hash; --reps R times
+    int reps = 1;
     for (int i = 2; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&]() -> const char* {
@@ -376,8 +379,11 @@ int main(int argc, char** argv) {
         else if (a == "--slots") slots = true;
         else if (a == "--expect-differ") expect_differ = true;
         else if (a == "--windows") windows = std::atoi(next());
+        else if (a == "--bench") bench = std::atoll(next());
+        else if (a == "--reps") reps = std::atoi(next());
         else { std::fprintf(stderr, "unknown option %s\n", a.c_str()); return 2; }
     }
+    if (bench > 0) pr.max_context = (bench + 8191) / 8192 * 8192;
     if (N < kChunk + 64 || N > 8000) { std::fprintf(stderr, "--n: 2112..8000 (two prompt chunks)\n"); return 2; }
     std::string err;
     if (!discover(pr.addr, pr.token, pr.g.peer, err)) {
@@ -409,6 +415,44 @@ int main(int argc, char** argv) {
                 pr.vision ? 1 : 0, pr.batch ? pr.batch_slots : 0, pr.g.peer.vision,
                 (long long) pr.g.peer.max_context, (int) pr.g.peer.batch_slots, (unsigned) pr.g.peer.batch_flags,
                 (pr.g.peer.batch_flags & kStageBatchSlotPositions) ? "yes" : "no");
+    if (bench > 0) {
+        // four chunks of noise rows, taken in turn; each chunk's wall time (send, the worker's compute, the reply) and the
+        // hash of its output rows.  The worker's own time per chunk is in its log (STRATA_REMOTE_TIMING=1,
+        // STRATA_PREFILL_TIMING=1).
+        const int kVar = 4;
+        std::mt19937 rng(seed);
+        std::normal_distribution<float> nd(0.0f, 1.0f);
+        std::uniform_int_distribution<int> td(1000, 100000);
+        std::vector<float> rows((size_t) (kVar * kChunk * pr.g.D));
+        for (float& v : rows) v = nd(rng);
+        std::vector<int64_t> tok((size_t) (kVar * kChunk));
+        for (auto& t : tok) t = td(rng);
+        std::vector<float> out((size_t) (kChunk * pr.g.D));
+        for (int rep = 0; rep < reps; ++rep) {
+            if (!pr.link.reset({}, err)) { std::fprintf(stderr, "stage_probe: %s\n", err.c_str()); return 1; }
+            uint64_t all = 1469598103934665603ull;
+            const auto t_all = Clock::now();
+            int i = 0;
+            for (int64_t c0 = 0; c0 < bench; c0 += kChunk, ++i) {
+                const int64_t T = std::min(kChunk, bench - c0);
+                const int v = i % kVar;
+                const auto t0 = Clock::now();
+                if (!pr.link.prefill_send(tok.data() + v * kChunk, T, c0, bench <= kChunk ? 1 : 0,
+                                          rows.data() + v * kChunk * pr.g.D, (size_t) pr.g.D, 0, err) ||
+                    !pr.link.prefill_recv(out.data(), (size_t) pr.g.D, T, 0, err)) {
+                    std::fprintf(stderr, "stage_probe: %s\n", err.c_str());
+                    return 1;
+                }
+                const double ms = ms_since(t0);
+                const uint64_t hsh = fnv(out.data(), (size_t) (T * pr.g.D) * 4);
+                all = fnv(&hsh, sizeof hsh, all);
+                std::printf("  bench rep %d chunk T=%lld at %lld: %.1f ms %016" PRIx64 "\n", rep, (long long) T, (long long) c0, ms, hsh);
+            }
+            std::printf("  bench rep %d: %lld tokens in %.0f ms, all %016" PRIx64 "\n", rep, (long long) bench, ms_since(t_all), all);
+            std::fflush(stdout);
+        }
+        return 0;
+    }
     if (slots) {
         const int64_t L0 = 1200, L1 = 1600;   // multiples of the indexer block: each window's blocks start at L + 4j
         const int K = windows;

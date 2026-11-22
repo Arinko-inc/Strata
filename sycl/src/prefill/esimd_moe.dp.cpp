@@ -56,6 +56,9 @@ size_t xq_bytes(const Layout& lo, int K) { return (size_t) lo.tile0[lo.n] * 8 * 
 size_t dx_bytes(const Layout& lo, int K) { return (size_t) lo.tile0[lo.n] * (K / 32) * 8 * sizeof(float); }
 bool workspace(const Layout&, int, int, Workspace&, void*) { return false; }
 void quantize_rows(const uint16_t*, const Layout&, int, int8_t*, float*, void*, float*) {}
+bool src_workspace(int64_t, int, SrcQ&, void*) { return false; }
+void quantize_src(const uint16_t*, int64_t, int, const SrcQ&, void*, bool) {}
+void place_rows(const SrcQ&, const int32_t*, const Layout&, int, int8_t*, float*, void*, float*) {}
 bool gate_up(int, const uint8_t* const*, size_t, int, const Layout&, int, const int8_t*, const float*, float*, void*, const float*) { return false; }
 void swiglu_quantize(const float*, const Layout&, int, int8_t*, float*, void*) {}
 bool down(int, const uint8_t* const*, size_t, int, const Layout&, int, const int8_t*, const float*, float*, void*) { return false; }
@@ -984,6 +987,8 @@ struct QArgs {
 };
 class QuantTag;
 class SwigluTag;
+class QuantSrcTag;
+class PlaceTag;
 
 }  // namespace
 
@@ -1124,6 +1129,115 @@ void quantize_rows(const uint16_t* X, const Layout& lo, int K, int8_t* Xq, float
                         simd<int, 4> s4 = s8.template select<4, 1>(0) + s8.template select<4, 1>(4);
                         sxv[r] = dd * (float) (s4[0] + s4[1] + s4[2] + s4[3]);
                     }
+                }
+                block_store<uint32_t, 8>(Xd + ((size_t) T * a.nkb + kb) * 64 + r * 8, qd);
+            }
+            block_store<float, 8>(dx + ((size_t) T * a.nkb + kb) * 8, dxv);
+            if (sx != nullptr) block_store<float, 8>(sx + ((size_t) T * a.nkb + kb) * 8, sxv);
+        });
+    });
+}
+
+// Quantize once (STRATA_I8_QONCE): a layer's rows are quantized where they are (one row of the chunk each, not one per routed
+// expert), and each group's tiles are filled by copying a row's codes, scales and sums to the places quantize_rows would have
+// written them.  A row's 32-block is quantized by the same arithmetic on the same FP16 values, so the tiles are the same bits.
+bool src_workspace(int64_t rows, int K, SrcQ& sq, void* stream) {
+    sycl::queue& q = *strata::q_of(stream);
+    static std::mutex mu;
+    struct St { SrcQ cur; size_t cap = 0; };   // bytes of q
+    static std::unordered_map<sycl::device, St> per_dev;
+    std::lock_guard<std::mutex> lk(mu);
+    St& st = per_dev[q.get_device()];
+    const size_t rows8 = (size_t) ((rows + 7) / 8 * 8);
+    const size_t need = rows8 * (size_t) K;
+    if (need > st.cap) {
+        q.wait();
+        if (st.cur.q) { sycl::free(st.cur.q, q); sycl::free(st.cur.d, q); sycl::free(st.cur.s, q); }
+        st.cur.q = sycl::malloc_device<int8_t>(need, q);
+        st.cur.d = sycl::malloc_device<float>(need / 32, q);
+        st.cur.s = sycl::malloc_device<float>(need / 32, q);
+        if (!st.cur.q || !st.cur.d || !st.cur.s) {
+            for (void* p : {(void*) st.cur.q, (void*) st.cur.d, (void*) st.cur.s}) if (p) sycl::free(p, q);
+            st.cur = SrcQ{}; st.cap = 0; sq = SrcQ{}; return false;
+        }
+        st.cap = need;
+    }
+    sq = st.cur;
+    return true;
+}
+
+void quantize_src(const uint16_t* X, int64_t rows, int K, const SrcQ& sq, void* stream, bool sums) {
+    if (rows <= 0) return;
+    sycl::queue& q = *strata::q_of(stream);
+    const int nkb = K / 32;
+    const half* Xh = reinterpret_cast<const half*>(X);
+    uint32_t* Qd = reinterpret_cast<uint32_t*>(sq.q);
+    float* dq = sq.d;
+    float* ss = sq.s;
+    const int nrows = (int) rows;
+    q.submit([&](sycl::handler& h) {
+        h.parallel_for<QuantSrcTag>(sycl::range<2>((size_t) ((rows + 7) / 8), (size_t) nkb), [=](sycl::id<2> id) SYCL_ESIMD_KERNEL {
+            const int T = (int) id[0], kb = (int) id[1];
+#pragma unroll
+            for (int r = 0; r < 8; ++r) {
+                const int row = T * 8 + r;
+                if (row < nrows) {
+                    // (the arithmetic of quantize_rows, statement for statement)
+                    simd<half, 32> xh = block_load<half, 32>(Xh + ((size_t) row) * K + kb * 32);
+                    simd<float, 32> x = xh;
+                    float amax = hmax<float>(abs(x));
+                    const float dd = amax / 127.f;
+                    const float id127 = amax > 0.f ? 127.f / amax : 0.f;
+                    simd<float, 32> y = x * id127;
+                    simd<float, 32> adj = 0.5f;
+                    adj.merge(simd<float, 32>(-0.5f), y < 0.f);
+                    simd<int, 32> qi = convert<int>(y + adj);
+                    simd<int8_t, 32> q8 = convert<int8_t>(qi);
+                    simd<uint32_t, 8> qd = q8.template bit_cast_view<uint32_t>();
+                    block_store<uint32_t, 8>(Qd + ((size_t) row * nkb + kb) * 8, qd);
+                    dq[(size_t) row * nkb + kb] = dd;
+                    if (sums) {
+                        simd<int, 16> s16 = qi.template select<16, 1>(0) + qi.template select<16, 1>(16);
+                        simd<int, 8> s8 = s16.template select<8, 1>(0) + s16.template select<8, 1>(8);
+                        simd<int, 4> s4 = s8.template select<4, 1>(0) + s8.template select<4, 1>(4);
+                        ss[(size_t) row * nkb + kb] = dd * (float) (s4[0] + s4[1] + s4[2] + s4[3]);
+                    }
+                }
+            }
+        });
+    });
+}
+
+void place_rows(const SrcQ& sq, const int32_t* src, const Layout& lo, int K, int8_t* Xq, float* dx, void* stream, float* sx) {
+    if (lo.tile0[lo.n] == 0) return;
+    sycl::queue& q = *strata::q_of(stream);
+    QArgs a{};
+    a.n = lo.n;
+    for (int i = 0; i <= lo.n; ++i) { a.row0[i] = lo.row0[i]; a.tile0[i] = lo.tile0[i]; }
+    a.nkb = K / 32;
+    a.ld = K;
+    const uint32_t* Qd = reinterpret_cast<const uint32_t*>(sq.q);
+    const float* dq = sq.d;
+    const float* ss = sq.s;
+    uint32_t* Xd = reinterpret_cast<uint32_t*>(Xq);
+    q.submit([&](sycl::handler& h) {
+        h.parallel_for<PlaceTag>(sycl::range<2>((size_t) lo.tile0[lo.n], (size_t) a.nkb), [=](sycl::id<2> id) SYCL_ESIMD_KERNEL {
+            const int T = (int) id[0], kb = (int) id[1];
+            int t0e = a.tile0[0], r0e = a.row0[0], r1e = a.row0[1];
+#pragma unroll
+            for (int i = 1; i < kMaxGroup; ++i)
+                if (i < a.n && T >= a.tile0[i]) { t0e = a.tile0[i]; r0e = a.row0[i]; r1e = a.row0[i + 1]; }
+            const int cnt = r1e - r0e;
+            simd<float, 8> dxv = 0.f, sxv = 0.f;
+#pragma unroll
+            for (int r = 0; r < 8; ++r) {
+                const int rl = (T - t0e) * 8 + r;
+                simd<uint32_t, 8> qd = 0u;
+                if (rl < cnt) {
+                    const size_t at = (size_t) src[r0e + rl] * a.nkb + kb;
+                    qd = block_load<uint32_t, 8>(Qd + at * 8);
+                    dxv[r] = dq[at];
+                    if (sx != nullptr) sxv[r] = ss[at];
                 }
                 block_store<uint32_t, 8>(Xd + ((size_t) T * a.nkb + kb) * 64 + r * 8, qd);
             }

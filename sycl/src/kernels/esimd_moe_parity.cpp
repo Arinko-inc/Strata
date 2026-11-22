@@ -295,6 +295,54 @@ static Result run_case(sycl::queue* q, dpct::blas::descriptor_ptr hd, int gt, in
     q->memcpy(hdX.data(), dX, hdX.size() * 4);
     q->memcpy(hsX.data(), sX, hsX.size() * 4);
     q->memcpy(hGU.data(), GU, hGU.size() * 4).wait();
+    // quantize once (STRATA_I8_QONCE): the rows quantized where they are (a source table X0, X0[perm[i]] = group row i) and
+    // placed by index must give quantize_rows' tiles, scales and sums bit for bit
+    {
+        std::vector<int32_t> perm((size_t) tot);
+        for (int i = 0; i < tot; ++i) perm[(size_t) i] = i;
+        for (int i = tot - 1; i > 0; --i) std::swap(perm[(size_t) i], perm[(size_t) (rng() % (uint32_t) (i + 1))]);
+        std::vector<uint16_t> hx0(hx.size());
+        for (int i = 0; i < tot; ++i) std::memcpy(&hx0[(size_t) perm[(size_t) i] * K], &hx[(size_t) i * K], (size_t) K * 2);
+        uint16_t* dx0 = sycl::malloc_device<uint16_t>(hx0.size(), *q);
+        int32_t* dsrc = sycl::malloc_device<int32_t>((size_t) tot + 16, *q);
+        int8_t* Xq2 = sycl::malloc_device<int8_t>(hXq.size(), *q);
+        float* dX2 = sycl::malloc_device<float>(hdX.size(), *q);
+        float* sX2 = sycl::malloc_device<float>(hsX.size(), *q);
+        q->memcpy(dx0, hx0.data(), hx0.size() * 2);
+        q->memcpy(dsrc, perm.data(), (size_t) tot * 4);
+        q->memset(Xq2, 0x55, hXq.size());
+        q->memset(dX2, 0x55, hdX.size() * 4);
+        q->memset(sX2, 0x55, hsX.size() * 4).wait();
+        i8::SrcQ sq;
+        bool okq = i8::src_workspace(tot, K, sq, q);
+        if (okq) {
+            i8::quantize_src(dx0, tot, K, sq, q, true);
+            i8::place_rows(sq, dsrc, lo, K, Xq2, dX2, q, sX2);
+            std::vector<int8_t> h2(hXq.size());
+            std::vector<float> d2(hdX.size()), s2(hsX.size());
+            q->memcpy(h2.data(), Xq2, h2.size());
+            q->memcpy(d2.data(), dX2, d2.size() * 4);
+            q->memcpy(s2.data(), sX2, s2.size() * 4).wait();
+            const bool same = std::memcmp(h2.data(), hXq.data(), h2.size()) == 0 &&
+                              std::memcmp(d2.data(), hdX.data(), d2.size() * 4) == 0 &&
+                              std::memcmp(s2.data(), hsX.data(), s2.size() * 4) == 0;
+            okq = same;
+            if (check || !same)
+                std::printf("  quantize once + place vs quantize_rows (%d rows, %zu code bytes, %zu scales, %zu sums): %s\n", tot,
+                            h2.size(), d2.size(), s2.size(), same ? "bitwise the same  OK" : "DIFFER  FAIL");
+            const double t_q0 = tm([&] { i8::quantize_rows(dxh, lo, K, Xq, dX, q, sX); });
+            const double t_s0 = tm([&] { i8::quantize_src(dx0, tot, K, sq, q, true); });
+            const double t_p0 = tm([&] { i8::place_rows(sq, dsrc, lo, K, Xq2, dX2, q, sX2); });
+            std::printf("  quantize once: quantize_rows %.1f us/group | quantize_src (the same %d rows) %.1f, place_rows %.1f\n", t_q0, tot,
+                        t_s0, t_p0);
+            i8::quantize_rows(dxh, lo, K, Xq, dX, q, sX);
+            q->wait();
+        } else {
+            std::printf("  quantize once: no workspace  FAIL\n");
+        }
+        ok = ok && okq;
+        sycl::free(dx0, *q); sycl::free(dsrc, *q); sycl::free(Xq2, *q); sycl::free(dX2, *q); sycl::free(sX2, *q);
+    }
     const int nkb = K / 32;
     auto xq_at = [&](int tile, int r, int k) { return (int) hXq[(((size_t) tile * nkb + k / 32) * 8 + r) * 32 + (k % 32)]; };
     auto dx_at = [&](int tile, int r, int kb) { return (double) hdX[((size_t) tile * nkb + kb) * 8 + r]; };

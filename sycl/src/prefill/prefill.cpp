@@ -291,6 +291,11 @@ inline bool i8_formats(int gu_type, int d_type) {
     static const bool kq = strata::prefill::i8::kq_on(std::getenv("STRATA_I8_KQ"));
     return strata::prefill::i8::formats_ok(gu_type, d_type, kq);
 }
+// STRATA_I8_QONCE: quantize a layer's rows once, before they are dealt to the experts (on unless it starts with '0').
+inline bool i8_qonce() {
+    static const bool on = [] { const char* e = std::getenv("STRATA_I8_QONCE"); return !(e != nullptr && e[0] == '0'); }();
+    return on;
+}
 // ring sizing happens before any queue is at hand: room for the int8 groups whenever the choice could be on
 inline int stage_slots() {
     const char* e = i8_env();
@@ -3555,6 +3560,8 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                     // The fused int8 products and the MMQ path do not rotate; they take only formats of unfolded layers.
                     const bool had_gu = lay.native && lay.fmt[(size_t) l].had_gu;
                     const bool had_d = lay.native && lay.fmt[(size_t) l].had_d;
+                    bool qonce = false;                      // this layer's rows were quantized once (STRATA_I8_QONCE), Xs is not filled
+                    strata::prefill::i8::SrcQ qonce_src;
                     const int had_block = lay.native ? lay.fmt[(size_t) l].had_block : 0;
                     const float* had_sx = had_gu ? m.had_sx[(size_t) l] : nullptr;
                     const float* had_sh = had_d ? m.had_sh[(size_t) l] : nullptr;
@@ -3804,9 +3811,24 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                                              m.bounds_host.size() * 4);
                             }
                         } else {
+                            // STRATA_I8_QONCE (default on; =0: off): a layer whose experts take the int8 products quantizes
+                            // its T rows once here, and each group's tiles are filled from them (i8::place_rows) - the same
+                            // bits as quantizing the gathered FP16 copy, without writing or reading that copy (T * K rows).
+                            // A group that takes the FP16 chain after all gathers its own rows (qonce_gather).
+                            qonce = i8_qonce() && lay.native && !had_gu && !had_d && strata::prefill::xmx::mode() != 2 &&
+                                    i8_mode(m.cs) != 0 && !use_mmq && m.Xs != nullptr &&
+                                    i8_formats(lay.fmt[(size_t) l].gu_type, lay.fmt[(size_t) l].d_type) &&
+                                    lay.fmt[(size_t) l].n_ff == 640 && lay.fmt[(size_t) l].n_embd == 2560 &&
+                                    strata::prefill::i8::available(m.cs) &&
+                                    strata::prefill::i8::src_workspace(T, (int) N, qonce_src, m.cs);
+                            if (qonce) {
+                                strata::prefill::i8::quantize_src(m.mixed_h, T, (int) N, qonce_src, m.cs,
+                                                                  lay.fmt[(size_t) l].gu_type == strata::prefill::i8::kTypeQ4K);
+                            } else {
                             gather_rows16(m.mixed_h, m.src_dev, m.Xs, T * K, N, m.cs);
                             // APR: Xs is this layer's private gathered copy (rotated in fp16 storage, fp32 arithmetic)
                             if (had_gu) strata::kernels::hadamard_rows_f16(m.Xs, T * K, N, had_block, had_sx, m.cs);
+                            }
                         }
                         // multi-GPU: the peer's share, enqueued before the primary's own experts so both cards work at once
                         peer_now = use_mmq && !order_peer.empty();
@@ -4298,6 +4320,14 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                                           lay.fmt[(size_t) l].n_ff == 640 && lay.fmt[(size_t) l].n_embd == 2560 &&
                                           strata::prefill::i8::available(m.cs);
                         const bool xmx2 = xmx2_only || i8on;
+                        if (qonce && !i8on) {   // (not expected: the two choices read the same switches) the FP16 copy after all
+                            gather_rows16(m.mixed_h, m.src_dev, m.Xs, T * K, N, m.cs);
+                            qonce = false;
+                        }
+                        // a group of a quantize-once layer that takes the FP16 chain: its rows of the FP16 copy, now
+                        auto qonce_gather = [&](int64_t r0, int64_t nr) {
+                            if (qonce) gather_rows16(m.mixed_h, m.src_dev + r0, m.Xs + r0 * N, nr, N, m.cs);
+                        };
                         if (i8_env() != nullptr && i8m != 0 && lay.native) {
                             static std::set<std::tuple<int, int, int, int, int>> said_fmt;
                             const auto& ff = lay.fmt[(size_t) l];
@@ -4358,7 +4388,8 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                                     pt.mark(kPfGemmGU, cs);
                                     if (i8::workspace(lo8, (int) N, f.n_ff, ws8, m.cs)) {
                                         float* sx8 = f.gu_type == i8::kTypeQ4K ? ws8.sx : nullptr;   // the activation sums only Q4_K's minimum needs
-                                        i8::quantize_rows(m.Xs + xg_r0 * N, lo8, (int) N, ws8.xq, ws8.dx, m.cs, sx8);
+                                        if (qonce) i8::place_rows(qonce_src, m.src_dev + xg_r0, lo8, (int) N, ws8.xq, ws8.dx, m.cs, sx8);
+                                        else i8::quantize_rows(m.Xs + xg_r0 * N, lo8, (int) N, ws8.xq, ws8.dx, m.cs, sx8);
                                         if (i8::gate_up(f.gu_type, xg_g, f.up_off, f.n_ff, lo8, (int) N, ws8.xq, ws8.dx, m.GU + xg_r0 * 1280, m.cs, sx8)) {
                                             i8::swiglu_quantize(m.GU + xg_r0 * 1280, lo8, f.n_ff, ws8.hq, ws8.dh, m.cs);
                                             pt.mark(kPfGemmD, cs);
@@ -4378,6 +4409,7 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                                         std::fprintf(stderr, "strata: the int8 expert kernels failed to launch (%s): the FP16 expert chain is used from here\n", ex.what());
                                 }
                                 if (!done8) {   // the FP16 chain: dequantize, two oneMKL GEMMs, SwiGLU, per expert
+                                    qonce_gather(xg_r0, nr);
                                     int64_t o = xg_r0;
                                     for (int i = 0; i < xg_n; ++i) {
                                         const int qd = i % DQ;
@@ -4712,7 +4744,7 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                             return c;
                         };
                         double mxs = 0, mxq = 0;
-                        const int64_t bxs = (!use_mmq && m.Xs) ? bad16(m.Xs, T * K * N, mxs) : -1;
+                        const int64_t bxs = (!use_mmq && m.Xs && !qonce) ? bad16(m.Xs, T * K * N, mxs) : -1;
                         const int64_t bdq = (!use_mmq && m.dq_gu[0]) ? bad16(m.dq_gu[0], (int64_t) 1280 * N, mxq) : -1;
                         static int64_t reported = -1;
                         if ((bgu || bdm || bbo || bh > 0) && reported != stats_.chunks)

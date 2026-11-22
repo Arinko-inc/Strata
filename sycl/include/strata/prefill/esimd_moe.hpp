@@ -87,6 +87,20 @@ bool workspace(const Layout& lo, int K, int n_ff, Workspace& ws, void* stream);
 /// FP16 rows X[row0[n]][K] -> int8 tiles + scales, and with `sx` non-null the scaled sums (same layout as dx).
 void quantize_rows(const uint16_t* X, const Layout& lo, int K, int8_t* Xq, float* dx, void* stream, float* sx = nullptr);
 
+/// Quantize once (STRATA_I8_QONCE).  A layer's `rows` FP16 rows X[rows][K] quantized where they are, each row once: codes q[row][K],
+/// scales d[row][K / 32] and (with `sums`) the scaled sums s[row][K / 32].  place_rows then fills a group's tiles from them: group row
+/// i is source row src[i] (the gather index of the FP16 path, from the group's first row), and Xq / dx / sx come out bit for bit as
+/// quantize_rows writes them from the gathered FP16 rows (the same arithmetic on the same values, pad rows zero).
+/// The buffers are grow-only and owned by the library, one set per device: one prompt path per device uses them, as `workspace`.
+struct SrcQ {
+    int8_t* q = nullptr;
+    float* d = nullptr;
+    float* s = nullptr;
+};
+bool src_workspace(int64_t rows, int K, SrcQ& sq, void* stream);
+void quantize_src(const uint16_t* X, int64_t rows, int K, const SrcQ& sq, void* stream, bool sums);
+void place_rows(const SrcQ& sq, const int32_t* src, const Layout& lo, int K, int8_t* Xq, float* dx, void* stream, float* sx = nullptr);
+
 /// GU[row][v] (FP32, row stride 2 * n_ff), v = 2 r gate row r, 2 r + 1 up row r (the interleave swiglu_interleaved reads), for the
 /// rows of the group.  blob[i] holds expert i's gate rows at 0 and its up rows at up_off (ggml rows, K a multiple of 256).
 /// Q4_K needs `sx` (quantize_rows' sums).  Returns false when the type / shape is not handled (the caller keeps its other path).
