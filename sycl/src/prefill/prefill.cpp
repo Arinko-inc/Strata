@@ -294,9 +294,11 @@ inline bool i8_formats(int gu_type, int d_type) {
 }
 // STRATA_SCORES_ESIMD's default: 0 = the warp kernel (until a variant is shown to give its bits), else the variant
 constexpr int kScoresEsimdDefault = 0;
-// STRATA_I8_QONCE: quantize a layer's rows once, before they are dealt to the experts (on unless it starts with '0').
+// STRATA_I8_QONCE=1: quantize a layer's rows once, before they are dealt to the experts.  Off by default: on the B70 it
+// measured the same as the per-group quantization (5.7万-token prompt 21.9 s vs 22.0 s), and its launch is outside the FP16
+// fallback (2026-11-22 review).
 inline bool i8_qonce() {
-    static const bool on = [] { const char* e = std::getenv("STRATA_I8_QONCE"); return !(e != nullptr && e[0] == '0'); }();
+    static const bool on = [] { const char* e = std::getenv("STRATA_I8_QONCE"); return e != nullptr && e[0] == '1'; }();
     return on;
 }
 // ring sizing happens before any queue is at hand: room for the int8 groups whenever the choice could be on
