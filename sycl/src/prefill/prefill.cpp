@@ -6,6 +6,7 @@
 #include "strata/copy_queue.hpp"
 #include "strata/prefill/xmx_moe.hpp"
 #include "strata/prefill/esimd_moe.hpp"
+#include "strata/prefill/esimd_scores.hpp"
 #include "strata/prefill/prefill.hpp"
 #include "strata/core/gguf_expert_source.hpp"
 #include "../../../src/prefill/mmq_resident_sort.hpp"
@@ -291,6 +292,8 @@ inline bool i8_formats(int gu_type, int d_type) {
     static const bool kq = strata::prefill::i8::kq_on(std::getenv("STRATA_I8_KQ"));
     return strata::prefill::i8::formats_ok(gu_type, d_type, kq);
 }
+// STRATA_SCORES_ESIMD's default: 0 = the warp kernel (until a variant is shown to give its bits), else the variant
+constexpr int kScoresEsimdDefault = 0;
 // STRATA_I8_QONCE: quantize a layer's rows once, before they are dealt to the experts (on unless it starts with '0').
 inline bool i8_qonce() {
     static const bool on = [] { const char* e = std::getenv("STRATA_I8_QONCE"); return !(e != nullptr && e[0] == '0'); }();
@@ -2297,11 +2300,11 @@ namespace {
 // are folded at every MoE layer's host sync, after which all of them have completed.
 enum PfPhase { kPfStart, kPfHc, kPfGdn, kPfQsa, kPfQsaIdx, kPfQsaSel, kPfQsaAttn, kPfRouter, kPfHostGroup, kPfGather,
                kPfWaitCopy, kPfDequant, kPfGemmGU, kPfGemmD, kPfCombine, kPfPle, kPfKvStage, kPfGdnConv, kPfGdnRec, kPfGdnOut,
-               kPfCount };
+               kPfQsaTopk, kPfCount };
 const char* const kPfNames[kPfCount] = {"embed+steps", "hc read", "gdn", "qsa proj", "qsa indexer", "qsa select",
                                         "qsa attn", "router+shared", "host grouping", "gather", "wait copy", "dequant",
                                         "gemm gate/up", "gemm down", "combine", "ple", "kv stage", "gdn conv+gates",
-                                        "gdn recurrence", "gdn out proj"};
+                                        "gdn recurrence", "gdn out proj", "qsa topk"};
 struct PfTimer {
     bool on = std::getenv("STRATA_PREFILL_TIMING") != nullptr;
     std::vector<dpct::event_ptr> ev;
@@ -2433,6 +2436,12 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
     // The direct successor's future lives on the Prefill object. Intermediate
     // stages therefore do not drain the complete remaining GPU chain here.
     double host_sync_ms = 0, host_chunk_ms = 0, host_setup_ms = 0;   // STRATA_PREFILL_TIMING: the host's share
+    // STRATA_PREFILL_TIMING, the expert grouping of each MoE layer: the host blocked until the GPU has the routed ids
+    // (grp_wait), the host's grouping from there to the first expert launch (grp_host: the GPU has nothing to do), and
+    // the host from there to the next layer's wait (grp_submit: the experts' and the next layer's launches)
+    double eg_wait_ms = 0, eg_host_ms = 0, eg_submit_ms = 0;
+    std::chrono::steady_clock::time_point eg_prev;
+    bool eg_prev_set = false;
     double grp_wait_ms = 0, grp_cpu_ms = 0;   // the per-layer grouping: the drain wait, the host's loops
     strata::kernels::QsaShapes s = core::qsa_shapes(g);
     // read once (STRATA_KV_PREFETCH=1/0: the next streamed layer's KV prefix is staged on its own stream)
@@ -3354,13 +3363,65 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                                                                                 strata::kernels::kStepNBid)] + 1;
                         // the scores on tensor cores (3xTF32: FP32-level, not bitwise); STRATA_SELECT_OLD=1: the warp kernel
                         static const bool old_sel = std::getenv("STRATA_SELECT_OLD") != nullptr;
+                        // Battlemage: the warp kernel's scores from one ESIMD thread per query and 16 blocks, the same bits
+                        // (prefill/esimd_scores.hpp).  STRATA_SCORES_ESIMD=0: the warp kernel; =1..3: a summation variant
+                        // (the default is the one that matches the warp kernel on the B70); STRATA_SCORES_CHECK=1 (debug):
+                        // every batch scored by the warp kernel and by each variant, the differing scores counted.
+                        static const int esc = [] {
+                            const char* v = std::getenv("STRATA_SCORES_ESIMD");
+                            return v != nullptr && v[0] != 0 ? std::atoi(v) : kScoresEsimdDefault;
+                        }();
+                        const strata::prefill::i8::ScoreSteps sst{strata::kernels::kStepCount, strata::kernels::kStepNKv,
+                                                                  strata::kernels::kStepNBid, (int) s.idx_dim, (int) s.idx_n_head,
+                                                                  (int) s.idx_block};
+                        if (static const bool chk = std::getenv("STRATA_SCORES_CHECK") != nullptr; chk) {
+                            static long long n_scores = 0, n_diff[4] = {};
+                            static double max_rel[4] = {};
+                            std::vector<float> ref((size_t) (nb * active)), got((size_t) (nb * active));
+                            auto fetch = [&](std::vector<float>& h) {
+                                for (int64_t qq = 0; qq < nb; ++qq)
+                                    m.cs->memcpy(h.data() + qq * active, m.sel_scores + qq * m.max_blocks, (size_t) active * 4);
+                                m.cs->wait();
+                            };
+                            m.cs->fill(m.sel_scores, -7.0f, (size_t) (nb * m.max_blocks));
+                            strata::kernels::qsa_block_scores(st.idx_pooled, st.idx_dead, m.q_idx + t0 * 512, steps0, nb,
+                                                              m.max_blocks, s, m.sel_scores, m.cs, active);
+                            fetch(ref);
+                            n_scores += nb * active;
+                            for (int v = 1; v <= 3; ++v) {
+                                m.cs->fill(m.sel_scores, -7.0f, (size_t) (nb * m.max_blocks));
+                                if (!strata::prefill::i8::block_scores(st.idx_pooled, st.idx_dead, m.q_idx + t0 * 512, steps0, sst,
+                                                                       nb, m.max_blocks, m.sel_scores, m.cs, active, v)) {
+                                    n_diff[v] = -1;
+                                    continue;
+                                }
+                                fetch(got);
+                                for (size_t i = 0; i < ref.size(); ++i)
+                                    if (std::memcmp(&ref[i], &got[i], 4) != 0) {
+                                        ++n_diff[v];
+                                        const double r = std::fabs((double) ref[i] - got[i]) / std::max(1e-30, std::fabs((double) ref[i]));
+                                        if (r > max_rel[v]) max_rel[v] = r;
+                                    }
+                            }
+                            if (t0 + nb >= T)
+                                std::fprintf(stderr, "strata prefill: scores check to %lld (qsa layer %d): %lld scores; differing from the warp "
+                                                     "kernel: variant 1 %lld (max rel %.2e), 2 %lld (%.2e), 3 %lld (%.2e)\n",
+                                             (long long) (p0 + T), (int) qsa_index, n_scores, n_diff[1], max_rel[1], n_diff[2], max_rel[2],
+                                             n_diff[3], max_rel[3]);
+                        }
+                        if (!old_sel && esc > 0 &&
+                            strata::prefill::i8::block_scores(st.idx_pooled, st.idx_dead, m.q_idx + t0 * 512, steps0, sst, nb,
+                                                              m.max_blocks, m.sel_scores, m.cs, active, esc)) {
+                        } else
                         if (old_sel || !strata::kernels::qsa_block_scores_tc(st.idx_pooled, st.idx_dead, m.q_idx + t0 * 512,
                                                                              steps0, nb, m.max_blocks, s, m.sel_scores,
                                                                              m.cs, active))
                             strata::kernels::qsa_block_scores(st.idx_pooled, st.idx_dead, m.q_idx + t0 * 512, steps0, nb,
                                                               m.max_blocks, s, m.sel_scores, m.cs, active);
+                        pt.mark(kPfQsaTopk, cs);   // ("qsa select" is the scores from here on)
                         strata::kernels::qsa_block_topk(m.sel_scores, steps0, nb, m.max_blocks, m.cap, s,
                                                         m.sel_ids + t0 * m.cap, m.cs, active);
+                        pt.mark(kPfQsaSel, cs);
                     }
                     // STRATA_SEL_OVERLAP (debug, D-1's question): how much do neighbouring queries' selections share?
                     // Per tile of 16 queries: the union of their selected cells against the sum of their widths.
@@ -3674,7 +3735,11 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                         // work), not the host: the watchdog's report says so (only its text changes)
                         core::progress_at("reading the prompt (batched): waiting for the GPU (attention, router) at layer",
                                           l, p0);
+                        const auto tg0 = Clock::now();
                         m.cs->wait();
+                        const auto tg1 = Clock::now();
+                        eg_wait_ms += std::chrono::duration<double, std::milli>(tg1 - tg0).count();
+                        if (eg_prev_set) eg_submit_ms += std::chrono::duration<double, std::milli>(tg0 - eg_prev).count();
                         core::progress_at("reading the prompt (batched): layer", l, p0);
                         pt.fold();
                         if (pe.on) {   // the peer's marks so far are done: the primary waited for its last rows
@@ -3780,6 +3845,9 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                         n_order = order.size();
                         const size_t mmq_gub = use_mmq ? mmq::matrix_bytes(mmq_gt, 1280, N) : 0;
                         const size_t mmq_db = use_mmq ? mmq::matrix_bytes(mmq_dt, N, 640) : 0;
+                        eg_prev = Clock::now();
+                        eg_prev_set = true;
+                        eg_host_ms += std::chrono::duration<double, std::milli>(eg_prev - tg1).count();
                         pt.mark(kPfGather, cs);
                         if (use_mmq) {
                             // step 2b: the layer's activations as q8_1 rows in expert order, straight from `mixed`
@@ -5080,6 +5148,12 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                      (long long) kv_prefetches);
     }
     stats_.ms_total += ms_since(t_start);
+    // STRATA_PREFILL_HOST_TIMING=1 (or STRATA_PREFILL_TIMING): the host's clock around each MoE layer's expert grouping, without
+    // the GPU marks (which cost about 120 ms a 2048-token chunk on the B70)
+    if (static const bool host_t = std::getenv("STRATA_PREFILL_HOST_TIMING") != nullptr; host_t || pt.on)
+        std::fprintf(stderr, "strata prefill timing: %lld tokens: expert grouping: the host waited for the GPU %.0f ms, grouped (GPU idle) "
+                             "%.0f ms, launched the experts and the next layer %.0f ms\n", (long long) n, eg_wait_ms,
+                     eg_host_ms, eg_submit_ms);
     if (pt.on) {
         pt.fold();
         double total = 0.0;
