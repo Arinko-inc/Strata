@@ -168,7 +168,13 @@ __global__ void __launch_bounds__(256) q4kq5_read_kernel(const unsigned long lon
 int g_q4kq5 = -2;   // -2: not read yet; native_expert_set_q4kq5 overrides
 int q4kq5_default() {
     const char* v = std::getenv("STRATA_EXPERT_Q4KQ5");
-    if (v != nullptr && v[0] != '\0') return std::atoi(v);
+    if (v != nullptr && v[0] != '\0') {
+        // 0..3 only: the read-only bench modes (997..999) are for native_expert_set_q4kq5 (q4k_q5_expert_bench), never
+        // the environment - they skip the expert outputs
+        const int x = std::atoi(v);
+        if (x >= 0 && x <= 3) return x;
+        std::fprintf(stderr, "strata: STRATA_EXPERT_Q4KQ5=%s is not 0..3 - ignored\n", v);
+    }
 #if defined(__HIPCC__) && !defined(STRATA_HIP_GFX906)
     // gfx11 (measured on gfx1100, RX 7900 XT): on.  Other cards: not measured, the old kernels.
     int dev = 0;
