@@ -380,8 +380,10 @@ bool qsa_prompt_attn_esimd(const float* q, const QsaAttnPools& pools, const int3
         Scratch& sc = per_q_scr[(const void*) &qu];
         const size_t need = (size_t) QB * per_q;
         if (sc.floats < need) {
-            if (sc.p != nullptr) { qu.wait(); sycl::free(sc.p, qu); sc.p = nullptr; sc.floats = 0; }
-            sc.p = (float*) sycl::malloc_device(need * sizeof(float), qu);
+            if (sc.p != nullptr) { qu.wait(); strata::device_alloc_unregister(sc.p); sycl::free(sc.p, qu); sc.p = nullptr; sc.floats = 0; }
+            // xe: a big allocation can get pages that the GPU's page table maps onto other pages; the guarded
+            // allocation checks it and moves the buffer (sycl_queue.hpp malloc_device_guarded, 32 MiB and up)
+            sc.p = (float*) strata::malloc_device_guarded(need * sizeof(float), qu, "ESIMD prompt attention scratch");
             if (sc.p == nullptr) return false;
             sc.floats = need;
         }
