@@ -4,6 +4,7 @@
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/kernels/cpu/expert.hpp"
 #include "strata/kernels/cpu/iq_avx512.hpp"
+#include "strata/kernels/cpu/kq_avx512.hpp"
 #include "strata/kernels/cpu/iq_avx2.hpp"
 #include "strata/kernels/cpu/iq_avx1.hpp"
 #include "strata/kernels/cpu/kq_avx2.hpp"
@@ -111,6 +112,51 @@ bool iq512_reference_ok(int type) {
     }
     memo[type] = ok;
     return ok;
+}
+
+// STRATA_KQ512=1 (opt-in; AVX-512 CPUs): Q4_K gate/up rows on the 512-bit dot (kq_avx512.cpp, from upstream 0.2.19's
+// dot_q4_K_q8_K_zmm).  Taken only if it gives this build's ggml-cpu dot's bits on synthetic rows (checked once), so the
+// rows are the same whichever dot runs; otherwise ggml's dot stays.
+bool kq512_ok() {
+#if defined(__x86_64__) || defined(_M_X64)
+    static const bool ok = [] {
+        const char* v = std::getenv("STRATA_KQ512");
+        if (v == nullptr || std::atoi(v) == 0 || !cpu_avx512_ok()) return false;
+        const ggml_type_traits_cpu* tr = traits(GGML_TYPE_Q4_K);
+        const ggml_type_traits_cpu* t8 = traits(GGML_TYPE_Q8_K);
+        bool same = false;
+        if (tr != nullptr && tr->vec_dot != nullptr && t8 != nullptr && t8->from_float != nullptr) {
+            constexpr int n = 2560, rows = 64;
+            const size_t rb = ggml_row_size(GGML_TYPE_Q4_K, n);
+            std::vector<uint8_t> w((size_t) rows * rb), act(ggml_row_size(GGML_TYPE_Q8_K, n));
+            uint32_t seed = 4242u;
+            auto rnd = [&seed] { seed = seed * 1664525u + 1013904223u; return seed >> 8; };
+            for (auto& b : w) b = (uint8_t) rnd();
+            for (int r = 0; r < rows; ++r)
+                for (size_t k = 0; k < (size_t) n / 256; ++k) {   // d, dmin: finite f16 of both signs
+                    uint8_t* d = &w[(size_t) r * rb + k * 144];
+                    d[1] = (uint8_t) ((d[1] & 0x80) | 0x2e);
+                    d[3] = (uint8_t) ((d[3] & 0x80) | 0x2c);
+                }
+            std::vector<float> x(n);
+            for (auto& xv : x) xv = ((float) (rnd() % 2001) - 1000.f) * 0.003f;
+            t8->from_float(x.data(), act.data(), n);
+            same = true;
+            for (int r = 0; r < rows; ++r) {
+                float a = 0.f, b = 0.f;
+                tr->vec_dot(n, &a, 0, w.data() + (size_t) r * rb, 0, act.data(), 0, 1);
+                kq512_dot_q4k_q8k(n, &b, w.data() + (size_t) r * rb, act.data());
+                if (std::memcmp(&a, &b, sizeof a) != 0) same = false;
+            }
+        }
+        std::fprintf(stderr, "strata: STRATA_KQ512=1 %s\n", same ? "active (Q4_K gate/up rows on the 512-bit dot, ggml's bits)"
+                                                                  : "NOT taken (its bits differ from this build's ggml dot)");
+        return same;
+    }();
+    return ok;
+#else
+    return false;
+#endif
 }
 
 // 0.2.5: the 512-bit exact rows (iq512x_rows) take one token of an IQ3_XXS / IQ3_S expert only if this build's ggml-cpu dot gives
@@ -498,6 +544,21 @@ void native_gu_rows_impl(const NativeFmt& f, const uint8_t* blob, const void* co
         nvfp4_256_gu_rows(blob, f.gu_row, f.up_off, n, act, nt, ff, r0, r1, sg, su);
         return;
     }
+#if defined(__x86_64__) || defined(_M_X64)
+    if (f.gu_type == (int) GGML_TYPE_Q4_K && f.tail_off == 0 && n % 256 == 0 && kq512_ok()) {   // STRATA_KQ512=1: the same bits
+        for (int r = r0; r < r1; ++r) {
+            const uint8_t* gr = blob + (size_t) r * f.gu_row;
+            const uint8_t* ur = blob + f.up_off + (size_t) r * f.gu_row;
+            for (int t = 0; t < nt; ++t) {
+                float g = 0.f, u = 0.f;
+                kq512_dot_q4k_q8k(n, &g, gr, act[t]);
+                kq512_dot_q4k_q8k(n, &u, ur, act[t]);
+                ff[t][r] = (g / (1.f + std::exp(-g))) * u;
+            }
+        }
+        return;
+    }
+#endif
     const ggml_vec_dot_t dot = traits(f.gu_type)->vec_dot;
     for (int r = r0; r < r1; ++r) {
         const uint8_t* gr = blob + (size_t) r * f.gu_row;
