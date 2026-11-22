@@ -5,6 +5,7 @@
 #include "strata/sycl_queue.hpp"
 #include "strata/prefill/kernels.hpp"
 #include "strata/prefill/gdn_xe.hpp"
+#include "strata/prefill/esimd_gdn.hpp"
 #include "strata/kernels/mrope.hpp"
 #include "strata/kernels/gfx_arch.hpp"
 #include "strata/kernels/router_top10.hpp"
@@ -2673,7 +2674,11 @@ void gdn_recurrence_variant(int variant, float* state, const float* h, const flo
     // variant 6 = the Xe sub-group recurrence + the unchanged norm kernel (gdn_recurrence: gdn_xe_on)
     const bool xe = T > 0 && !serial && variant == 6;
     if (xe && !gdn_xe_device(stream)) throw std::runtime_error("GDN Xe variant requires an Intel GPU with 16-lane sub-groups");
-    if (!xe && (serial || T <= 0 || variant == 2)) {
+    // variants 7 + 8 * n = the ESIMD recurrence (esimd_gdn.hpp, its form n = STRATA_GDN_ESIMD) + the unchanged norm kernel;
+    // a device or build without it takes the column kernels
+    const bool es = T > 0 && !serial && variant >= 7 && (variant & 7) == 7 &&
+                    gdn_rec_esimd(state, h, gate, beta, y, T, stream, variant >> 3);
+    if (!xe && !es && (serial || T <= 0 || variant == 2)) {
         /*
         DPCT1049: The work-group size passed to the SYCL kernel may exceed
         the limit. To get the device limit, query
@@ -2696,6 +2701,7 @@ void gdn_recurrence_variant(int variant, float* state, const float* h, const flo
         static const bool pipe = [] { const char* v = std::getenv("STRATA_GDN_PIPELINE"); return v == nullptr || std::atoi(v) != 0; }();
         if (xe) {
             detail::gdn_xe_launch(*strata::q_of(stream), state, h, gate, beta, y, T);
+        } else if (es) {
         } else
 #if !defined(__HIPCC__)
         if (pipe && gdn_keyhead_ok())   // the value heads of a key head in one thread (same bits)
@@ -2768,7 +2774,9 @@ void gdn_recurrence(float* state, const float* h, const float* gate, const float
     // (AMD builds only; the arch defaults set STRATA_GDN_HEAD=1 on gfx1151 and leave other cards on the earlier kernels)
     static const bool head = [] { const char* v = std::getenv("STRATA_GDN_HEAD"); return v != nullptr && std::atoi(v) != 0; }();
     static const bool serial = std::getenv("STRATA_GDN_REC_HEADS") != nullptr;
-    const int v = head && !serial ? 1 : (!serial && gdn_xe_on(stream)) ? 6 : 0;
+    // STRATA_GDN_ESIMD=n (Battlemage, off by default): the ESIMD recurrence, form n (esimd_gdn.hpp)
+    static const int esimd = [] { const char* e = std::getenv("STRATA_GDN_ESIMD"); return e ? std::atoi(e) : 0; }();
+    const int v = head && !serial ? 1 : (!serial && esimd > 0) ? 7 + 8 * esimd : (!serial && gdn_xe_on(stream)) ? 6 : 0;
     gdn_recurrence_variant(v, state, h, gate, beta, z, gamma, eps, y, y16, T, stream, ld16);
 }
 void route(const float* logits, int32_t* ids, float* weights, int64_t T, int64_t n_expert, void* stream) {

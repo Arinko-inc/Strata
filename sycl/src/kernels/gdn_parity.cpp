@@ -164,7 +164,9 @@ int prefill_case(int T, int seed, int repeats) {
         return elapsed / repeats;
     };
     const double base_ms = run(0, refst, refy, ref16);
-    const double xe_ms = run(6, gotst, goty, got16);
+    // GDN_PARITY_VARIANT=v: that variant against the baseline instead of 6 (7 + 8 * n: the ESIMD recurrence, form n)
+    const int vv = std::getenv("GDN_PARITY_VARIANT") ? std::atoi(std::getenv("GDN_PARITY_VARIANT")) : 6;
+    const double xe_ms = run(vv, gotst, goty, got16);
     size_t state_bad = 0, y_bad = 0, half_bad = 0;
     double max_abs = 0, max_rel = 0;
     auto compare = [&](const std::vector<float>& a, const std::vector<float>& b, size_t& mismatches) {
