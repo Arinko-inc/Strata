@@ -32,19 +32,22 @@ using namespace sycl::ext::intel::esimd;
 
 constexpr int DIM = 128, HEADS = 4, BLOCK = 4, NB = 16;
 
-template <int V> struct ScoresTag;
+template <int V, int GM> struct ScoresTag;
 
 SYCL_ESIMD_FUNCTION inline simd<float, 16> fma16(simd<float, 16> a, simd<float, 16> b, simd<float, 16> c) {
     return simd<float, 16>(__builtin_elementwise_fma(a.data(), b.data(), c.data()));
 }
 
-template <int V>
+// GM (variant + 8, + 16): the de-interleaved rows read by gathers.  A stride-4 `select` view of a loaded row kept in an array is not put
+// in a register - every product re-reads the strided region (found on the prompt attention, qsa_prompt_attn_esimd.dp.cpp).  Bit 0:
+// the query (once per thread); bit 1: the keys too (eight gathers per block instead of two loads).  The same values, the same sums.
+template <int V, int GM>
 void launch(sycl::queue& q, const float* pooled, const float* dead, const float* q_idx, const int32_t* steps, const ScoreSteps ss,
             int64_t nq, int64_t max_blocks, float* out, int64_t reach) {
     auto props = sycl::ext::oneapi::experimental::properties{sycl::ext::intel::experimental::grf_size<256>};
     const int count = ss.count, o_nkv = ss.n_kv, o_nbid = ss.n_bid;
     q.submit([&](sycl::handler& h) {
-        h.parallel_for<ScoresTag<V>>(sycl::range<2>((size_t) nq, (size_t) ((reach + NB - 1) / NB)), props, [=](sycl::id<2> id) SYCL_ESIMD_KERNEL {
+        h.parallel_for<ScoresTag<V, GM>>(sycl::range<2>((size_t) nq, (size_t) ((reach + NB - 1) / NB)), props, [=](sycl::id<2> id) SYCL_ESIMD_KERNEL {
             const int64_t qi = (int64_t) id[0];
             const int64_t b0 = (int64_t) id[1] * NB;
             const int32_t* st = steps + qi * count;
@@ -55,6 +58,14 @@ void launch(sycl::queue& q, const float* pooled, const float* dead, const float*
             const float* qp = q_idx + qi * (HEADS * DIM);
 #pragma unroll
             for (int hh = 0; hh < HEADS; ++hh) {
+                if constexpr ((GM & 1) != 0) {
+                    const simd<uint32_t, 16> o4(0u, 16u);
+#pragma unroll
+                    for (int c = 0; c < 4; ++c) {
+                        Ql[hh][c] = gather<float, 16>(qp + hh * DIM, o4 + (uint32_t) (4 * c));
+                        Qh[hh][c] = gather<float, 16>(qp + hh * DIM + 64, o4 + (uint32_t) (4 * c));
+                    }
+                } else {
                 simd<float, 64> a = block_load<float, 64>(qp + hh * DIM);
                 simd<float, 64> b = block_load<float, 64>(qp + hh * DIM + 64);
 #pragma unroll
@@ -62,18 +73,28 @@ void launch(sycl::queue& q, const float* pooled, const float* dead, const float*
                     Ql[hh][c] = a.template select<16, 4>(c);
                     Qh[hh][c] = b.template select<16, 4>(c);
                 }
+                }
             }
             for (int i = 0; i < NB; ++i) {
                 const int64_t b = b0 + i;
                 if (b > n_bid || b >= max_blocks) break;
                 const float* key = (b == n_bid) ? dead : pooled + b * DIM;
+                simd<float, 16> Kl[4], Kh[4];
+                if constexpr ((GM & 2) != 0) {
+                    const simd<uint32_t, 16> o4(0u, 16u);
+#pragma unroll
+                    for (int c = 0; c < 4; ++c) {
+                        Kl[c] = gather<float, 16>(key, o4 + (uint32_t) (4 * c));
+                        Kh[c] = gather<float, 16>(key + 64, o4 + (uint32_t) (4 * c));
+                    }
+                } else {
                 simd<float, 64> ka = block_load<float, 64>(key);
                 simd<float, 64> kb = block_load<float, 64>(key + 64);
-                simd<float, 16> Kl[4], Kh[4];
 #pragma unroll
                 for (int c = 0; c < 4; ++c) {
                     Kl[c] = ka.template select<16, 4>(c);
                     Kh[c] = kb.template select<16, 4>(c);
+                }
                 }
                 float score = 0.0f;
 #pragma unroll
@@ -122,12 +143,18 @@ void launch(sycl::queue& q, const float* pooled, const float* dead, const float*
 bool block_scores(const float* pooled, const float* dead, const float* q_idx, const int32_t* steps, const ScoreSteps& ss, int64_t nq,
                   int64_t max_blocks, float* scores, void* stream, int64_t active_blocks, int variant) {
     if (nq <= 0) return true;
-    if (variant < 1 || variant > 3 || ss.dim != DIM || ss.heads != HEADS || ss.block != BLOCK || !available(stream)) return false;
+    const int gm = variant >> 3;
+    variant &= 7;
+    if (gm < 0 || gm > 3 || variant < 1 || variant > 3 || ss.dim != DIM || ss.heads != HEADS || ss.block != BLOCK || !available(stream)) return false;
     sycl::queue& q = *strata::q_of(stream);
     const int64_t reach = active_blocks > 0 && active_blocks < max_blocks ? active_blocks : max_blocks;
-    if (variant == 1) launch<1>(q, pooled, dead, q_idx, steps, ss, nq, max_blocks, scores, reach);
-    else if (variant == 2) launch<2>(q, pooled, dead, q_idx, steps, ss, nq, max_blocks, scores, reach);
-    else launch<3>(q, pooled, dead, q_idx, steps, ss, nq, max_blocks, scores, reach);
+#define STRATA_SC_L(V, G) launch<V, G>(q, pooled, dead, q_idx, steps, ss, nq, max_blocks, scores, reach)
+    if (gm == 0) { if (variant == 1) STRATA_SC_L(1, 0); else if (variant == 2) STRATA_SC_L(2, 0); else STRATA_SC_L(3, 0); }
+    else if (variant != 2) return false;   // the gathered forms exist for the variant in use only
+    else if (gm == 1) STRATA_SC_L(2, 1);
+    else if (gm == 2) STRATA_SC_L(2, 2);
+    else STRATA_SC_L(2, 3);
+#undef STRATA_SC_L
     return true;
 }
 }  // namespace strata::prefill::i8
