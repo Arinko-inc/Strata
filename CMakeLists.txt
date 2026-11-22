@@ -488,6 +488,16 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                           src/ngram/ple_reader.cpp
                           src/platform/direct_file.cpp)
   target_link_libraries(strata_kernels PUBLIC strata_core strata_artifact)
+  if(STRATA_ENABLE_HIP)
+    # gfx11 (RDNA3) decode kernels ported from the community fork leisenx111/Strata-rdna3 (opt-in: STRATA_GR_RDNA,
+    # STRATA_RDNA_Q6K); AMD builtins (DPP, sudot4), so HIP only.  rdna_bench: their timings and differences against the
+    # default kernels at this model's shapes.
+    target_sources(strata_kernels PRIVATE src/kernels/cuda/rdna_gr.cu src/kernels/cuda/rdna_mmvq.cu)
+    add_executable(rdna_bench EXCLUDE_FROM_ALL src/kernels/rdna_bench.cpp)
+    set_source_files_properties(src/kernels/rdna_bench.cpp PROPERTIES LANGUAGE HIP)
+    target_include_directories(rdna_bench PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(rdna_bench PRIVATE strata_kernels strata_artifact strata_hip_runtime)
+  endif()
   # Exact gfx1100 prompt scorer (PR1825 method port): optional standalone test,
   # also available where the published source omits tests/.
   option(STRATA_PARITY_GFX1100_QSA_SCORES "Build the exact gfx1100 QSA score/ID check" OFF)

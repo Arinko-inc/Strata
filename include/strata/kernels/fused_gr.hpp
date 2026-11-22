@@ -70,6 +70,15 @@ constexpr int kFusedGrMaxT = 8;
 bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, void* stream,
                          unsigned long long* stamp_buf = nullptr, int stamp_i0 = 0);
 
+/// gfx11 (opt-in STRATA_GR_RDNA=1, rdna_gr.cu; from the community RDNA3 fork as upstream 0.2.19 took it): the multi
+/// read as a split-K down pass (8 half-stream slices) and a partial-folding up pass, on the BF16 projections or on
+/// STRATA_HC_Q8's int8 codes (s_down / s_up; then the activations are int8 per 32 too).  The same maths as
+/// fused_gr_read_multi, another summation order (not bitwise).  fused_gr_read_multi takes it by itself when the flag
+/// is set (not for the GGUF Q8_0 read).  HIP builds only.
+bool rdna_gr_enabled();
+void rdna_gr_read_multi(const FusedGrArgs* a, int n_tok, float* scratch, void* stream,
+                        unsigned long long* stamp_buf = nullptr, int stamp_i0 = 0);
+
 /// The bench only: the AMD latency-hidden kernels on (1) or off (0); -1 = STRATA_GR_FAST.
 void fused_gr_set_fast(int on);
 /// The multi read's variants (#315; not main's opt-in STRATA_GR_V3 read, which sums in another order), all computing

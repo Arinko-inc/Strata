@@ -144,6 +144,13 @@ void native_iq4_nl_f32(const void* weights, const float* x, void* scratch_q8_1,
 // and launch helpers; only the
 // capability query returns false.
 bool native_mmvq_supported(int ggml_type) noexcept;
+/// gfx1100 STRATA_RDNA_Q6K=1 (rdna_mmvq.cu, from the community RDNA3 fork): multi-column decode GEMVs, one wave per
+/// row, the weights of a superblock decoded once for every column.  The same products as the native kernels, another
+/// summation order (not bitwise).  false = not taken, nothing launched.  Q6_K: every column count; Q4_K (12) / Q5_K (13):
+/// from 4 columns (STRATA_RDNA_KQ_ALL: every count); IQ4_XS (23), IQ3_S (21).
+bool rdna_q6k_enabled();
+bool rdna_q6k_mmvq(const void* w, const void* xq, float* y, int n_in, int n_out, int ncols, void* stream);
+bool rdna_kq_mmvq(int type, const void* w, const void* xq, float* y, int n_in, int n_out, int ncols, void* stream);
 std::size_t native_mmvq_weight_bytes(int ggml_type, int n_in, int n_out);
 void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* y,
                  int n_in, int n_out, int ncols, void* stream);
