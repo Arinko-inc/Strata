@@ -49,7 +49,7 @@ using Clock = std::chrono::steady_clock;
 namespace {
 
 constexpr int64_t kImagePad = 248056;   // <|image_pad|> (the worker does not read it; the main process sends it)
-constexpr int64_t kChunk = 2048;
+int64_t kChunk = 2048;   // --chunk: the prompt chunk (the worker's --prefill must be at least this)
 constexpr int kW = 4;                   // the verify window's rows
 
 uint64_t fnv(const void* p, size_t n, uint64_t h = 1469598103934665603ull) {
@@ -380,10 +380,12 @@ int main(int argc, char** argv) {
         else if (a == "--expect-differ") expect_differ = true;
         else if (a == "--windows") windows = std::atoi(next());
         else if (a == "--bench") bench = std::atoll(next());
+        else if (a == "--chunk") kChunk = std::atoll(next());
         else if (a == "--reps") reps = std::atoi(next());
         else { std::fprintf(stderr, "unknown option %s\n", a.c_str()); return 2; }
     }
     if (bench > 0) pr.max_context = (bench + 8191) / 8192 * 8192;
+    if (bench > 0 && N < kChunk + 64) N = kChunk + 64;   // (--bench does not use N)
     if (N < kChunk + 64 || N > 8000) { std::fprintf(stderr, "--n: 2112..8000 (two prompt chunks)\n"); return 2; }
     std::string err;
     if (!discover(pr.addr, pr.token, pr.g.peer, err)) {
