@@ -8686,6 +8686,22 @@ int main(int argc, char** argv) {
         const int64_t rounded = per > std::numeric_limits<int64_t>::max() - 255 ? per : ((per + 255) / 256) * 256;
         return std::min(max_chunk, rounded);
     };
+    // STRATA_PREFILL_SHORT_CHUNK=<tokens> + STRATA_PREFILL_SHORT_MAX=<tokens> (both needed; the remote-stage MAIN process only): a
+    // segment of at most SHORT_MAX tokens is cut at SHORT_CHUNK (rounded down to 256) instead of --prefill, a longer one at
+    // --prefill.  With the stages started at a bigger --prefill (3072) this keeps today's chunk for short reads, and the
+    // bigger chunk, which is faster per token, for long ones.  Unset (the default): every read is cut as before.
+    static const int64_t short_chunk_env = [] {
+        const char* v = std::getenv("STRATA_PREFILL_SHORT_CHUNK");
+        return v != nullptr ? (int64_t) std::atoll(v) : (int64_t) 0;
+    }();
+    static const int64_t short_max_env = [] {
+        const char* v = std::getenv("STRATA_PREFILL_SHORT_MAX");
+        return v != nullptr ? (int64_t) std::atoll(v) : (int64_t) 0;
+    }();
+    auto length_chunk_cap = [&](int64_t tokens, int64_t cap) -> int64_t {
+        if (!remote_main) return cap;   // a worker lends for the chunk the main process sends; a local run has its own rules
+        return strata::program::prefill_plan::length_cap(tokens, cap, short_chunk_env, short_max_env);
+    };
     // #2824: the chunk a request of `tokens` reads in when the host-aware plan chose `plan` (< cap, the buffers' chunk = what the VRAM
     // scan picked).  A prompt that fits one chunk of `cap` keeps ONE chunk, as before (a single pass reads each expert once, so the
     // page cache cannot thrash, and splitting it would only add a pass); a longer one reads in n = ceil(tokens / plan) chunks of
@@ -12965,7 +12981,7 @@ int main(int argc, char** argv) {
             const auto t_ln = Clock::now();
             // what this segment needs, capped by the configured chunk: a request lends only what its own
             // prompt needs, so a large chunk costs a short prompt nothing
-            const int64_t want_full = planned_chunk(tokens, o.prefill_chunk, pf_plan_chunk);
+            const int64_t want_full = planned_chunk(tokens, length_chunk_cap(tokens, o.prefill_chunk), pf_plan_chunk);
             // #340: a short enough request reads in the stages' own S-token chunks (nothing lent)
             const int64_t want_seg = o.prefill_head_alias ? o.prefill_chunk
                                    : split_small > 0 && tokens <= split_small_max ? std::min(want_full, split_small)
@@ -13140,6 +13156,18 @@ int main(int argc, char** argv) {
             me.kv_type = g.n_qsa_layers() > 0 ? (int32_t) ss.qsa_states[ss.qsa_primary()].kv_mode : -1;
             me.max_context = o.max_context;
             me.chunk = sp.chunk();
+            // STRATA_PREFILL_SHORT_CHUNK: the hello names the SHORT chunk, so the workers lend their buffers for it (as for today's
+            // chunk) until a read longer than STRATA_PREFILL_SHORT_MAX sends bigger ones (a worker lends for max(chunk it is sent,
+            // the hello's)); the buffers stay sized for --prefill, which every worker must have been started with
+            if (remote_main) {
+                const int64_t hello_chunk = std::min<int64_t>(me.chunk, length_chunk_cap(1, me.chunk));
+                if (hello_chunk != me.chunk) {
+                    std::fprintf(stderr, "strata serve: remote stage: reads of up to %lld tokens are cut in %lld-token chunks, longer ones "
+                                         "in %lld (STRATA_PREFILL_SHORT_CHUNK / STRATA_PREFILL_SHORT_MAX)\n",
+                                 (long long) short_max_env, (long long) hello_chunk, (long long) me.chunk);
+                    me.chunk = hello_chunk;
+                }
+            }
             me.handoff_floats = HBF;
             me.tail_skip = (int32_t) strata::core::tail_skip_rank();   // a worker's: informational
             me.vision = o.vision ? 1 : 0;   // images: the worker's layers need the position table (StageMsg::Positions)

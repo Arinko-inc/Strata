@@ -148,6 +148,16 @@ inline int64_t balanced_chunk(int64_t tokens, int64_t cap, int64_t plan) {
     return best;
 }
 
+/// The chunk cap a read of `tokens` gets when the remote-stage main process picks it by the read's length
+/// (STRATA_PREFILL_SHORT_CHUNK / STRATA_PREFILL_SHORT_MAX): a read of at most `short_max` tokens is cut at `short_chunk` (rounded
+/// down to 256), a longer one at `cap` (the buffers' chunk, --prefill).  Either value unset (<= 0), a short chunk of 256 or less
+/// than 256 after rounding, or one that is not below `cap` leaves `cap` as it is - the rule is off and every read is cut as before.
+inline int64_t length_cap(int64_t tokens, int64_t cap, int64_t short_chunk, int64_t short_max) {
+    const int64_t sc = short_chunk / 256 * 256;
+    if (tokens <= 0 || cap <= 0 || sc < 256 || short_max <= 0 || sc >= cap) return cap;
+    return tokens > short_max ? cap : sc;
+}
+
 /// One log line: what was chosen, why, and the reads it expects per prompt.
 inline std::string describe(const Pick& p, const Host& h, int64_t tokens) {
     char b[768];

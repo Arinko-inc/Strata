@@ -123,6 +123,25 @@ int main() {
         CHECK(c <= 3840);
         CHECK(n <= (t + 3839) / 3840 + 1);
     }
+    // length_cap: STRATA_PREFILL_SHORT_CHUNK / _MAX (remote-stage main): a short read keeps the small chunk, a long one the buffers'
+    CHECK(length_cap(153, 3072, 2048, 4096) == 2048);
+    CHECK(length_cap(4096, 3072, 2048, 4096) == 2048);   // the limit itself still counts as short
+    CHECK(length_cap(4097, 3072, 2048, 4096) == 3072);
+    CHECK(length_cap(40000, 3072, 2048, 4096) == 3072);
+    CHECK(length_cap(4097, 3072, 2100, 4096) == 3072);
+    CHECK(length_cap(100, 3072, 2100, 4096) == 2048);    // the short chunk rounds down to 256
+    // off: not set, not below the cap, below 256 - the cap is returned for every length
+    for (int64_t t : {0, 1, 153, 2048, 4096, 4097, 80000}) {
+        CHECK(length_cap(t, 3072, 0, 4096) == 3072);
+        CHECK(length_cap(t, 3072, 2048, 0) == 3072);
+        CHECK(length_cap(t, 3072, 3072, 4096) == 3072);
+        CHECK(length_cap(t, 3072, 4096, 4096) == 3072);
+        CHECK(length_cap(t, 3072, 255, 4096) == 3072);
+        CHECK(length_cap(t, 3072, -1, -1) == 3072);
+    }
+    // with the rule on, a read's chunk is still rounded to 256 and at most the cap: 153 tokens read in 256 as before
+    CHECK(balanced_chunk(153, length_cap(153, 3072, 2048, 4096), 0) == 256);
+    CHECK(balanced_chunk(4177, length_cap(4177, 3072, 2048, 4096), 0) == 3072);
     std::printf("%s\n", failed ? "FAILED" : "prefill_plan_test: ok");
     return failed ? 1 : 0;
 }
