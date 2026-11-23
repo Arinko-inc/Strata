@@ -148,19 +148,13 @@ inline float fp8_magnitude(uint8_t c) {
     return v;
 }
 
-// A block's scale and the factor its values are multiplied by: a NaN or an infinity in it gives a NaN scale (the block
-// reads back as NaNs); a block of zeros (or of values below 1e-30, read back as zeros) gives 0 and 0.
-inline void fp8_scale(float amax, bool bad, float& scale, float& inv) {
-    if (bad) {
-        scale = std::numeric_limits<float>::quiet_NaN();
-        inv = 0.0f;
-    } else if (!(amax >= 1e-30f)) {
-        scale = 0.0f;
-        inv = 0.0f;
-    } else {
-        scale = amax / kFp8Max;
-        inv = kFp8Max / amax;
-    }
+// A block's scale: a NaN or an infinity in it gives a NaN scale (the block reads back as NaNs); a block of zeros (or of
+// values below 1e-30, read back as zeros) gives 0.  Its values are divided by the scale that is sent (not multiplied by a
+// rounded inverse), so a value halfway between two codes rounds to the even one by the scale the reader uses.
+inline float fp8_scale(float amax, bool bad) {
+    if (bad) return std::numeric_limits<float>::quiet_NaN();
+    if (!(amax >= 1e-30f)) return 0.0f;
+    return amax / kFp8Max;
 }
 
 void fp8_block_amax_scalar(const float* x, size_t n, float& amax, bool& bad) {
@@ -177,12 +171,13 @@ void fp8_encode_rows_scalar(const float* src, size_t rows, size_t width, unsigne
         unsigned char* q = d + 4 * nb;
         for (size_t b = 0; b < nb; ++b) {
             const size_t lo = b * kFp8B, n = std::min(kFp8B, width - lo);
-            float amax = 0.0f, scale, inv;
+            float amax = 0.0f;
             bool bad = false;
             fp8_block_amax_scalar(src + lo, n, amax, bad);
-            fp8_scale(amax, bad, scale, inv);
+            const float scale = fp8_scale(amax, bad);
             std::memcpy(d + 4 * b, &scale, 4);
-            for (size_t i = 0; i < n; ++i) q[lo + i] = fp8_code(src[lo + i] * inv);
+            if (scale > 0.0f) for (size_t i = 0; i < n; ++i) q[lo + i] = fp8_code(src[lo + i] / scale);
+            else std::memset(q + lo, 0, n);   // (zeros, or the NaN scale's block)
         }
     }
 }
@@ -302,24 +297,28 @@ STRATA_ROWS_AVX2 void fp8_encode_rows_avx2(const float* src, size_t rows, size_t
             }
             alignas(32) float m8[8];
             _mm256_store_ps(m8, mx);
-            float amax = 0.0f, scale, inv;
+            float amax = 0.0f;
             bool bad = _mm256_movemask_ps(badm) != 0;
             for (int k = 0; k < 8; ++k) amax = std::max(amax, m8[k]);
             fp8_block_amax_scalar(x + i, n - i, amax, bad);
-            fp8_scale(amax, bad, scale, inv);
+            const float scale = fp8_scale(amax, bad);
             std::memcpy(d + 4 * b, &scale, 4);
-            const __m256 vinv = _mm256_set1_ps(inv);
+            if (!(scale > 0.0f)) {   // (zeros, or the NaN scale's block)
+                std::memset(q + lo, 0, n);
+                continue;
+            }
+            const __m256 vsc = _mm256_set1_ps(scale);
             i = 0;
             for (; i + 32 <= n; i += 32) {
-                const __m256i c0 = fp8_code8(_mm256_mul_ps(_mm256_loadu_ps(x + i), vinv));
-                const __m256i c1 = fp8_code8(_mm256_mul_ps(_mm256_loadu_ps(x + i + 8), vinv));
-                const __m256i c2 = fp8_code8(_mm256_mul_ps(_mm256_loadu_ps(x + i + 16), vinv));
-                const __m256i c3 = fp8_code8(_mm256_mul_ps(_mm256_loadu_ps(x + i + 24), vinv));
+                const __m256i c0 = fp8_code8(_mm256_div_ps(_mm256_loadu_ps(x + i), vsc));
+                const __m256i c1 = fp8_code8(_mm256_div_ps(_mm256_loadu_ps(x + i + 8), vsc));
+                const __m256i c2 = fp8_code8(_mm256_div_ps(_mm256_loadu_ps(x + i + 16), vsc));
+                const __m256i c3 = fp8_code8(_mm256_div_ps(_mm256_loadu_ps(x + i + 24), vsc));
                 // the packs work within each 128-bit half (c0 0-3, c1 0-3, c2 0-3, c3 0-3 | the 4-7s): the dwords back
                 const __m256i p = _mm256_packus_epi16(_mm256_packus_epi32(c0, c1), _mm256_packus_epi32(c2, c3));
                 _mm256_storeu_si256((__m256i*) (q + lo + i), _mm256_permutevar8x32_epi32(p, order));
             }
-            for (; i < n; ++i) q[lo + i] = fp8_code(x[i] * inv);
+            for (; i < n; ++i) q[lo + i] = fp8_code(x[i] / scale);
         }
     }
 }

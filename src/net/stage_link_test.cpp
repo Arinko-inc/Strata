@@ -1347,6 +1347,19 @@ int main() {
                   "fp8: AVX2 writes the reference's bits (both ways), widths 1..10240 with partial blocks, nothing past");
             check(bound, "fp8: each value within half an E4M3 step of itself (relative 2^-4, or 2^-10 of the scale)");
             check(idem, "fp8: what was read encodes to the same codes (a relay re-encoding a reply changes no value)");
+            {   // halfway between two codes: to the even one by the scale that is sent (49 -> scale 0.109375 exactly;
+                // 43.75 / 0.109375 = 400, halfway between 384 (even) and 416: reads back 42, not 45.5)
+                std::vector<float> hx = {49.0f, 43.75f, -43.75f, 0.0f};
+                bool half = true;
+                for (const int isa : {0, 2}) {
+                    std::vector<unsigned char> he(stage_rows_bytes(StageRows::FP8, 1, hx.size()));
+                    std::vector<float> hd(hx.size());
+                    if (!detail::stage_fp8_encode_isa(isa, hx.data(), 1, hx.size(), he.data())) continue;
+                    (void) detail::stage_fp8_decode_isa(isa, he.data(), 1, hx.size(), hd.data());
+                    half = half && hd[0] == 49.0f && hd[1] == 42.0f && hd[2] == -42.0f && hd[3] == 0.0f;
+                }
+                check(half, "fp8: a value halfway between two codes goes to the even one (by the sent scale), both ways");
+            }
             // special blocks: a NaN and an infinity spoil their own block only; zeros stay zeros; the largest is exact
             std::vector<float> sx(4 * kStageFp8Block, 0.0f);
             for (size_t i = 0; i < sx.size(); ++i) sx[i] = (float) (i % 13) - 6.0f;
