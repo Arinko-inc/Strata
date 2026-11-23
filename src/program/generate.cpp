@@ -12936,6 +12936,7 @@ int main(int argc, char** argv) {
         // chunk was read (refill_early_issue), and host_res already names the slots; what is left is the wait and the
         // residency upload.  Every path that reads the cache or lends again comes through refill() first.
         bool refill_issued = false;
+        std::string refill_early_err;   // an early issue that failed part way: the next refill() reports it
         auto refill = [&](std::string& e) -> bool {
             const auto t_rf = Clock::now();
             int64_t n_lent = 0, n_parts = 0;
@@ -12943,6 +12944,17 @@ int main(int argc, char** argv) {
                 if (!p.lent.empty()) { n_lent += (int64_t) p.lent.size(); ++n_parts; }
             if (refill_issued) {
                 refill_issued = false;
+                // an early issue that failed part way left slots it never queued: not given back as if refilled -
+                // the error, as a refill that failed here would give (what was queued is waited for first)
+                if (!refill_early_err.empty()) {
+                    for (PfPart& p : pf_parts) {
+                        std::string we;
+                        if (!p.lent.empty()) (void) p.cache->sync_queued(we);
+                    }
+                    e = "stage worker: the early refill failed: " + refill_early_err;
+                    refill_early_err.clear();
+                    return false;
+                }
                 for (PfPart& p : pf_parts)
                     if (!p.lent.empty() && !refill_wait(p, e)) return false;
                 if (n_parts > 0) res_upload();
@@ -13616,10 +13628,11 @@ int main(int argc, char** argv) {
                     // buffers, so the loan's device memory is free once run returns)
                     if (refill_early && only_chunk && !refill_early_issue(e)) {
                         // not this chunk's failure: its rows are read, and a relay's next worker still owes their reply (an error
-                        // here would leave that reply on the link).  What was queued is waited for at the next refill(), which
-                        // reports a failed copy queue there, as a refill at the window would
+                        // here would leave that reply on the link).  The next refill() waits for what was queued and
+                        // returns this error, as a refill that failed at the window would
                         std::fprintf(stderr, "strata stage worker: the early refill was not queued whole (%s): the next window "
-                                             "waits for what was\n", e.c_str());
+                                             "reports it\n", e.c_str());
+                        refill_early_err = e.empty() ? std::string("a copy could not be queued") : e;
                         e.clear();
                         refill_issued = true;
                     }
