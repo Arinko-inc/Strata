@@ -32,6 +32,14 @@ std::size_t native_q8_1_bytes(int n_in, int ncols = 1);
 // graph capture; captured graphs keep the kernels they captured.
 void native_mmvq_set_multi_exact(bool exact);
 void native_mmvq_set_q6k_wide(bool on);   // SYCL port: the 16-byte-load Q6_K kernel (default on)
+/// STRATA_MMVQ_ESIMD (SYCL port, Xe2): 1 = the ESIMD Q4_K kernel for 1-4 columns, bitwise the wide kernel (0, default).
+/// native_mmvq_set_esimd overrides the environment's value (the bench); q4k_mmvq_esimd is the kernel itself (false: nothing
+/// launched; rpt = rows per hardware thread, var < 0 = the engine's float expression).
+void native_mmvq_set_esimd(int v);
+int native_mmvq_esimd();
+bool q4k_mmvq_esimd_built();
+bool q4k_mmvq_esimd(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ncols, void* stream,
+                    int rpt, int var);
 void native_q6_k_mmvq_stride224(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ncols,
                                 void* stream);   // SYCL port: experiment, Q6_K blocks at a 224-byte stride
 bool native_mmvq_multi_exact();

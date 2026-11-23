@@ -247,6 +247,7 @@ strata_resolve(_kernels ${_kernel_files} src/kernels/ngram.cpp src/ngram/ple_rea
 list(APPEND _kernels ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/cuda/qsa_prompt_attn_xmx.dp.cpp)   # port-only: the XMX prompt attention
 list(APPEND _kernels ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/cuda/qsa_prompt_attn_esimd.dp.cpp)   # port-only: STRATA_ATTN_ESIMD's prompt attention (Battlemage; a stub with STRATA_I8_NO_ESIMD)
 list(APPEND _kernels ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/cuda/q4kq5_down_esimd.dp.cpp)   # port-only: STRATA_EXPERT_Q4KQ5=1's ESIMD down rows (Battlemage; a stub with STRATA_I8_NO_ESIMD)
+list(APPEND _kernels ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/cuda/q4k_mmvq_esimd.dp.cpp)   # port-only: STRATA_MMVQ_ESIMD=1's dense Q4_K GEMV for 1-4 columns (Battlemage; a stub with STRATA_I8_NO_ESIMD)
 add_library(strata_kernels STATIC ${_kernels})
 target_include_directories(strata_kernels PRIVATE ${STRATA_ROOT}/third_party/ggml)
 target_link_libraries(strata_kernels PUBLIC strata_core)
@@ -448,6 +449,10 @@ if(STRATA_SYCL_PARITY)
   target_link_libraries(mmvq_bench PRIVATE strata_kernels)
   add_executable(dense_bench ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/dense_bench.cpp)   # the decode window's dense GEMVs, graph, hash
   target_link_libraries(dense_bench PRIVATE strata_kernels)
+  # STRATA_MMVQ_ESIMD's kernel against the wide kernel on a model's own dense Q4_K matrices, bit for bit, and timed:
+  #   mmvq_esimd_bench <any shard.gguf> <layer[,layer]> [--t 1,2,3,4] [--rpt 1,2,4,8] [--var 0,..] [--trials 9]
+  add_executable(mmvq_esimd_bench ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/mmvq_esimd_bench.cpp)
+  target_link_libraries(mmvq_esimd_bench PRIVATE strata_kernels)
   add_executable(mmvq_sg_bench ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/mmvq_sg_bench.cpp)   # SIMD16 vs 32 decode mmvq
   target_link_libraries(mmvq_sg_bench PRIVATE strata_kernels)
   add_executable(q6k_align_bench ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/q6k_align_bench.cpp)   # Q6_K block alignment
