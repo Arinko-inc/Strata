@@ -17,6 +17,7 @@
 //        median over --trials in microseconds per call: the whole of shared_expert_multi as the engine calls it without
 //        STRATA_LFUSE / STRATA_VERIFY_QDEDUP, the same with the scalar gate left to the caller, and each launch alone.
 // The Q4_K gate / up read STRATA_MMVQ_LARGE_GRF and STRATA_MMVQ_ESIMD as the engine does: set them as its start script does.
+// Layers whose down projection is not Q5_0 of 640 inputs: no ESIMD configuration is run (cmp of shared_expert_multi only).
 // Exit 1 when any output differs.
 #define DPCT_PROFILING_ENABLED
 #include <sycl/sycl.hpp>
@@ -91,7 +92,6 @@ int main(int argc, char** argv) {
     if (!K::q5_0_mmvq_esimd_built()) { std::fprintf(stderr, "shexp_bench: the ESIMD kernel is not in this build\n"); return 2; }
     std::vector<Cfg> cfgs;
     for (int r : rpts) for (int v : vars) cfgs.push_back({r, v});
-    const int NCFG = (int) cfgs.size();
     std::unique_ptr<strata::GgufModel> model;
     try {
         model = std::make_unique<strata::GgufModel>(strata::GgufModel::open(argv[1]));
@@ -137,6 +137,16 @@ int main(int argc, char** argv) {
         }
         const size_t bg = K::native_mmvq_weight_bytes(gt, n_embd, n_ff), bu = K::native_mmvq_weight_bytes(ut, n_embd, n_ff),
                      bd = K::native_mmvq_weight_bytes(dt, n_ff, n_embd);
+        // the copies below read the mapping: a truncated shard is an error, not a read past its end
+        const strata::TensorInfo* tt[3] = {tg, tu, td};
+        const size_t ts[3] = {shg, shu, shd}, tb[3] = {bg, bu, bd};
+        const char* tn[3] = {"ffn_gate_shexp", "ffn_up_shexp", "ffn_down_shexp"};
+        for (int k = 0; k < 3; ++k)
+            if (!model->in_bounds(*tt[k], ts[k]) || strata::tensor_payload_bytes(*tt[k]) < tb[k]) {
+                std::fprintf(stderr, "shexp_bench: layer %d %s: the payload is truncated or short of %zu B (%s)\n", l, tn[k], tb[k],
+                             model->shard(ts[k]).path().c_str());
+                return 2;
+            }
         Layer y{};
         y.layer = l;
         y.wg = (uint8_t*) sycl::malloc_device(bg + 256, *s);
@@ -144,7 +154,7 @@ int main(int argc, char** argv) {
         y.wd = (uint8_t*) sycl::malloc_device(bd + 256, *s);
         y.xq = sycl::malloc_device(K::native_q8_1_bytes(n_embd, TMAX) + 256, *s);
         y.hq = sycl::malloc_device(K::native_q8_1_bytes(n_ff, TMAX) + 256, *s);
-        y.sq = sycl::malloc_device(K::native_q8_1_bytes(n_embd, TMAX) + 256, *s);
+        y.sq = sycl::malloc_device(K::native_q8_1_bytes(std::max(n_embd, n_ff), TMAX) + 256, *s);   // the input's q8_1, then the SwiGLU's
         y.gate = sycl::malloc_device<float>((size_t) TMAX * n_ff, *s);
         y.up = sycl::malloc_device<float>((size_t) TMAX * n_ff, *s);
         y.out = sycl::malloc_device<float>((size_t) TMAX * n_embd, *s);
@@ -161,8 +171,11 @@ int main(int argc, char** argv) {
     }
     if (L.empty()) { std::fprintf(stderr, "shexp_bench: no layer with a shared expert\n"); return 2; }
     const int M = (int) L.size();
-    std::printf("%d layers; the down projection is type %d (%s the ESIMD kernel's Q5_0 of 640 inputs)\n", M, dt,
-                dt == 6 && n_ff == 640 ? "" : "NOT");
+    const bool esimd_shape = dt == 6 && n_ff == 640;   // the ESIMD kernel reads Q5_0 rows of 640 inputs only
+    std::printf("%d layers; the down projection is type %d (%s the ESIMD kernel's Q5_0 of 640 inputs%s)\n", M, dt,
+                esimd_shape ? "" : "NOT", esimd_shape ? "" : ": no configuration compared or timed, shared_expert_multi only");
+    if (!esimd_shape) cfgs.clear();
+    const int NCFG = (int) cfgs.size();
     std::mt19937 rng(20261124);
     std::normal_distribution<float> nd(0.f, 1.f);
     std::vector<float> hx((size_t) TMAX * n_embd);

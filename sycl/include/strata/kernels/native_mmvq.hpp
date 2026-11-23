@@ -43,6 +43,9 @@ bool q4k_mmvq_esimd(const void* weights, const void* x_q8_1, float* y, int n_in,
 void native_q6_k_mmvq_stride224(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ncols,
                                 void* stream);   // SYCL port: experiment, Q6_K blocks at a 224-byte stride
 bool native_mmvq_multi_exact();
+/// SYCL port: true when STRATA_MMVQ_SG puts native_mmvq's multi-column lane kernels of this matrix on SIMD16 sub-groups
+/// (another order of the lane sums than the default 32-wide sub-group); iq4xs: an IQ4_XS matrix, n_out: its rows.
+bool native_mmvq_sg16(bool iq4xs, int n_out);
 
 // One quantization may serve multiple weight matrices sharing the same input.
 // Q8_1 stores FP16 scale and FP16 warp sum of the ORIGINAL float inputs; it does

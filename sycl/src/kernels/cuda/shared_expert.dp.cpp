@@ -223,7 +223,11 @@ bool shared_expert_native_bf16_enabled() { return native_bf16; }
 // The down projection of shared_expert_multi (Q5_0, 640 inputs, the decode window's 1-4 columns):
 //    0  native_mmvq (default)
 //    1  the ESIMD kernel (q5_0_mmvq_esimd.dp.cpp), every output bit for bit native_mmvq's (shexp_bench); a call it does
-//       not serve (another type or shape, 5-8 columns) goes to native_mmvq
+//       not serve (another type or shape, 5-8 columns) goes to native_mmvq, and so does every call while STRATA_MMVQ_SG
+//       puts native_mmvq's Q5_0 kernels of these rows on SIMD16 (the ESIMD kernel adds the lane sums in the default
+//       32-wide sub-group's order, native_mmvq_sg16).  One difference in sign only: a row whose every term is -0.0
+//       gives -0.0 where native_mmvq's sums from +0.0 give +0.0 (equal values; shexp_bench's memcmp would count it).
+//    Any other value, or 1 in a build without ESIMD, is refused at start (exit 1, as STRATA_MMVQ_ESIMD).
 namespace {
 constexpr int kShexpEsimdRpt = 2;   // weight rows per hardware thread (shexp_bench on the B70: 2 <= 1 < 4 < 8 in time)
 int shexp_esimd_parse() {
@@ -233,7 +237,7 @@ int shexp_esimd_parse() {
     if (!ok || (e[0] == '1' && !q5_0_mmvq_esimd_built())) {
         std::fprintf(stderr, "STRATA_SHEXP_ESIMD=%s: 0 (native_mmvq) or 1 (the ESIMD Q5_0 kernel%s)\n", e,
                      q5_0_mmvq_esimd_built() ? "" : "; not in this build");
-        std::exit(2);
+        std::exit(1);
     }
     return e[0] - '0';
 }
@@ -373,7 +377,7 @@ void shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, cons
         }
         native_quantize_q8_1(gate, nw.q8_1, (int) n_ff, n_tok, stream);
     }
-    if (!(g_shexp_esimd == 1 && nw.down_type == 6 &&
+    if (!(g_shexp_esimd == 1 && nw.down_type == 6 && !native_mmvq_sg16(false, (int) n_embd) &&
           q5_0_mmvq_esimd(nw.down_data, nw.q8_1, out, (int) n_ff, (int) n_embd, n_tok, stream, kShexpEsimdRpt, -1)))
         native_mmvq(nw.down_type, nw.down_data, nw.q8_1, out, (int) n_ff, (int) n_embd, n_tok, stream);
     if (gate_deferred) {   // the caller computed g (raw) with the router and scales `out` in the combine

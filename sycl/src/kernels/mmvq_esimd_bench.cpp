@@ -8,10 +8,11 @@
 // --rpt: rows per hardware thread of the ESIMD kernel (1, 2, 4, 8) + 400 * the loop's shape (0: four blocks per
 // iteration, 1: one block and rotating sums, 2: one block and a run-time offset) + 100: the 128-register file + 200: the
 // chained dp4a.  0: the engine's choice by the shape (through native_mmvq; STRATA_MMVQ_ESIMD_RPT / _LOOP apply).
-// --var: the float expression's shape (-1 the engine's; 0..9).  Every (rpt, var) pair is a configuration; they run on
-// this program's own copy of the kernel file, built with STRATA_Q4KE_EXP (q4k_mmvq_esimd_exp: the engine's kernels and
-// the experiment's variants; the library's copy has the engine's only).  The engine's way in (native_mmvq with
-// native_mmvq_set_esimd(1), the library's copy) is compared as well.
+// --var: the float expression's shape (-1 the engine's; 0..9).  Every (rpt, var) pair is a configuration.  The engine's
+// kernels (rows 1, 2, 4, 8 x LOOP 0, 2 with var -1: rpt 1 2 4 8 801 802 804 808) run the library's own q4k_mmvq_esimd, the
+// one the engine calls; the experiment's (any other rpt or var) run this program's own copy of the kernel file, built
+// with STRATA_Q4KE_EXP (q4k_mmvq_esimd_exp).  The cmp line names which ("engine" / "exp").  The engine's way in
+// (native_mmvq with native_mmvq_set_esimd(1)) is compared as well.
 // The matrices: the layers' Q4_K dense tensors by role (attn_qkv, attn_gate, ssm_out, ssm_alpha, ssm_beta of a GDN layer;
 // attn_q, attn_k, attn_v, attn_output of a QSA layer; ffn_gate_shexp, ffn_up_shexp of both).  Activations are normal
 // random vectors through native_quantize_q8_1, T columns.
@@ -60,6 +61,10 @@ std::vector<std::string> strs(const char* s) {
 }
 using GraphExec = sycl::ext::oneapi::experimental::command_graph<sycl::ext::oneapi::experimental::graph_state::executable>;
 struct Cfg { int rpt, var; };
+bool engine_cfg(const Cfg& c) {   // in the library's q4k_mmvq_esimd (q4k_mmvq_esimd.dp.cpp without STRATA_Q4KE_EXP)
+    const int rows = c.rpt % 400, loop = c.rpt / 400;
+    return c.var < 0 && (rows == 1 || rows == 2 || rows == 4 || rows == 8) && (loop == 0 || loop == 2);
+}
 struct Mat { int layer; uint8_t* w; };
 }  // namespace
 
@@ -152,8 +157,10 @@ int main(int argc, char** argv) {
                         K::native_mmvq_set_esimd(1);
                         K::native_mmvq(12, mats[m].w, xq, ym, n_in, n_out, T, s);
                         K::native_mmvq_set_esimd(0);
-                    } else if (!K::q4k_mmvq_esimd_exp(mats[m].w, xq, ym, n_in, n_out, T, s, cfgs[c].rpt, cfgs[c].var)) {
-                        std::fprintf(stderr, "q4k_mmvq_esimd_exp declined rpt %d var %d\n", cfgs[c].rpt, cfgs[c].var);
+                    } else if (!(engine_cfg(cfgs[c]) ? K::q4k_mmvq_esimd : K::q4k_mmvq_esimd_exp)(mats[m].w, xq, ym, n_in, n_out, T, s,
+                                                                                                cfgs[c].rpt, cfgs[c].var)) {
+                        std::fprintf(stderr, "%s declined rpt %d var %d\n", engine_cfg(cfgs[c]) ? "q4k_mmvq_esimd" : "q4k_mmvq_esimd_exp",
+                                     cfgs[c].rpt, cfgs[c].var);
                         std::exit(2);
                     }
                 }
@@ -184,8 +191,9 @@ int main(int argc, char** argv) {
                         std::printf("cmp %-14s %5d x %5d T=%d %2d layers  via native_mmvq (STRATA_MMVQ_ESIMD=1): %zu of %zu differ, max rel %.3e\n",
                                     name.c_str(), n_in, n_out, T, M, bad, ny * M, maxrel);
                     else
-                        std::printf("cmp %-14s %5d x %5d T=%d %2d layers  rpt %3d var %2d: %zu of %zu differ, max rel %.3e\n", name.c_str(),
-                                    n_in, n_out, T, M, cfgs[c].rpt, cfgs[c].var, bad, ny * M, maxrel);
+                        std::printf("cmp %-14s %5d x %5d T=%d %2d layers  rpt %3d var %2d %-6s: %zu of %zu differ, max rel %.3e\n",
+                                    name.c_str(), n_in, n_out, T, M, cfgs[c].rpt, cfgs[c].var, engine_cfg(cfgs[c]) ? "engine" : "exp", bad,
+                                    ny * M, maxrel);
                 }
             }
             if (time_on) {
