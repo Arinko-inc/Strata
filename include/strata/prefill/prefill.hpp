@@ -267,6 +267,14 @@ public:
     /// process - its rows for the next `run` (host, pinned; one chunk) and whether the main prompt is one chunk.
     void set_hand_in(const float* rows) { hand_in_ = rows; }
     void set_single_chunk(bool on) { single_chunk_ = on; }
+    /// REMOTE STAGE (the main process): the windows (or the reply's first window) start at `pos` right after this
+    /// read - the chunk that ends there tells the workers so (flags bit 1, kRemoteWindowNext), and every chunk says
+    /// this process tells it (bit 2, kRemoteWindowTold).  -1: what follows is not a window (another batched part).
+    /// STRATA_REMOTE_WINDOW_BIT=0: neither bit (an A/B; a worker then falls back on the single-chunk bit).
+    void set_window_at(int64_t pos) { window_at_ = pos; }
+    /// REMOTE STAGE, a relay worker: bits 1-2 of the chunk it reads, passed on with that chunk to the next worker
+    void set_hand_flags(int64_t flags) { hand_flags_ = flags & (kRemoteWindowNext | kRemoteWindowTold); }
+    static constexpr int64_t kRemoteWindowNext = 2, kRemoteWindowTold = 4;
 
     /// The CPU expert pool (decode's, idle while a prompt is read). With STRATA_PREFILL_CPU_SHARE set, a chunk below
     /// stream_all_min() tokens - an agent's tool output - hands it the non-resident experts routed by at most MAXT of
@@ -325,6 +333,8 @@ private:
     Prefill* next_ = nullptr;
     Prefill* helper_ = nullptr;         ///< set_stage_helper
     bool single_chunk_ = false;         ///< a later stage: the prompt is one chunk (set by the stage before)
+    int64_t window_at_ = -1;            ///< set_window_at
+    int64_t hand_flags_ = 0;            ///< set_hand_flags
     int64_t stopped_at_ = -1;           ///< stop_at_chunk ended the last run after this many tokens (-1: it read all)
     int64_t kva_floor_ = 0;             ///< kva_floor()
     bool pipe_chunked_ = false;         ///< a later stage: the chunks came from a --prefill-pipe plan (set likewise)
