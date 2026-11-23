@@ -141,7 +141,7 @@ int main(int argc, char** argv) {
                     if (c < 0) {
                         K::native_mmvq_set_esimd(0);
                         K::native_mmvq(12, mats[m].w, xq, ym, n_in, n_out, T, s);
-                    } else if (c == (int) cfgs.size()) {
+                    } else if (c == (int) cfgs.size() || cfgs[c].rpt == 0) {   // --rpt 0: the engine's choice by the shape
                         K::native_mmvq_set_esimd(1);
                         K::native_mmvq(12, mats[m].w, xq, ym, n_in, n_out, T, s);
                         K::native_mmvq_set_esimd(0);

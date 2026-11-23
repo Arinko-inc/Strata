@@ -3734,8 +3734,11 @@ void native_iq4_xs_f32(const void* weights, const float* x, void* scratch_q8_1,
 // ---------------------------------------------------------------- STRATA_MMVQ_ESIMD (SYCL port, Xe2 / B70)
 // The dense Q4_K GEMV of the decode window's 1-4 columns:
 //    0  (default) the wide kernel above (a 32-wide sub-group per row, per-lane gathers)
-//    1  the ESIMD kernel (q4k_mmvq_esimd.dp.cpp): one hardware thread per STRATA_MMVQ_ESIMD_RPT rows (1, 2, 4 or 8;
-//       default 4), block loads, a column's activations unpacked once for the thread's rows
+//    1  the ESIMD kernel (q4k_mmvq_esimd.dp.cpp): one hardware thread per STRATA_MMVQ_ESIMD_RPT rows, block loads, a
+//       column's activations unpacked once for the thread's rows.  Matrices of fewer than 2048 rows stay on the wide
+//       kernel (its launch is cheaper: 4-7 us against 4.5-15 us on the B70, 2026-11-24).  STRATA_MMVQ_ESIMD_RPT:
+//       1, 2, 4 or 8 for every matrix; unset or 0: 2, and 1 for 1 or 4 columns of a matrix of at most 2560 inputs
+//       and 8192 rows (the B70's measurements of orca's layers 30-47: bench/2026-11-24-b70gemv)
 // 1 keeps every output's integer and float operations and their order: mmvq_esimd_bench compares it with the wide
 // kernel bit for bit on a model's own matrices (rerun it after a compiler update: it relies on how the compiler
 // contracts WideQ4K::apply's float expression).  Any other value, or 1 in a build without ESIMD, is refused at start.
@@ -3756,10 +3759,10 @@ int mmvq_esimd_parse() {
 }
 int mmvq_esimd_rpt_parse() {
     const char* e = std::getenv("STRATA_MMVQ_ESIMD_RPT");
-    if (!e || !*e) return 4;
+    if (!e || !*e) return 0;
     const int v = std::atoi(e);
-    if (v != 1 && v != 2 && v != 4 && v != 8) {
-        std::fprintf(stderr, "STRATA_MMVQ_ESIMD_RPT=%s: 1, 2, 4 or 8 rows per hardware thread\n", e);
+    if ((v != 0 && v != 1 && v != 2 && v != 4 && v != 8) || e[1] != '\0') {
+        std::fprintf(stderr, "STRATA_MMVQ_ESIMD_RPT=%s: 1, 2, 4 or 8 rows per hardware thread, or 0 (by the shape)\n", e);
         std::exit(1);
     }
     return v;
@@ -3769,6 +3772,13 @@ const int g_mmvq_esimd_rpt = mmvq_esimd_rpt_parse();
 int g_mmvq_esimd = -1;   // native_mmvq_set_esimd (the bench); < 0: the environment's
 }  // namespace
 void native_mmvq_set_esimd(int v) { g_mmvq_esimd = v; }
+namespace {
+constexpr int kEsimdMinRows = 2048;
+int mmvq_esimd_rpt(int n_in, int n_out, int ncols) {
+    if (g_mmvq_esimd_rpt) return g_mmvq_esimd_rpt;
+    return ((ncols == 1 || ncols == 4) && n_in <= 2560 && n_out <= 8192) ? 1 : 2;
+}
+}  // namespace
 int native_mmvq_esimd() { return g_mmvq_esimd >= 0 ? g_mmvq_esimd : g_mmvq_esimd_env; }
 
 void native_q4_k_mmvq(const void* weights, const void* x_q8_1, float* y,
@@ -3779,8 +3789,8 @@ void native_q4_k_mmvq(const void* weights, const void* x_q8_1, float* y,
     validate_pointer(x_q8_1);
     validate_pointer(y);
     validate_stream(stream);
-    if (ncols <= 4 && native_mmvq_esimd() == 1 &&
-        q4k_mmvq_esimd(weights, x_q8_1, y, n_in, n_out, ncols, stream, g_mmvq_esimd_rpt, -1)) { launch_check(); return; }
+    if (ncols <= 4 && native_mmvq_esimd() == 1 && (g_mmvq_esimd_rpt || n_out >= kEsimdMinRows) &&
+        q4k_mmvq_esimd(weights, x_q8_1, y, n_in, n_out, ncols, stream, mmvq_esimd_rpt(n_in, n_out, ncols), -1)) { launch_check(); return; }
     if (try_wide<WideQ4K>(weights, x_q8_1, y, n_in, n_out, ncols, stream)) { launch_check(); return; }
     STRATA_WAVE_MMVQ(Q4KTraits)
     if (ncols > 1) {
