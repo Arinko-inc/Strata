@@ -12938,7 +12938,7 @@ int main(int argc, char** argv) {
         // chunk was read (refill_early_issue), and host_res already names the slots; what is left is the wait and the
         // residency upload.  Every path that reads the cache or lends again comes through refill() first.
         bool refill_issued = false;
-        std::string refill_early_err;   // an early issue that failed part way: the next refill() reports it
+        std::string refill_early_err;   // an early issue that failed part way: the next refill() refills the loan again
         auto refill = [&](std::string& e) -> bool {
             const auto t_rf = Clock::now();
             int64_t n_lent = 0, n_parts = 0;
@@ -12946,19 +12946,21 @@ int main(int argc, char** argv) {
                 if (!p.lent.empty()) { n_lent += (int64_t) p.lent.size(); ++n_parts; }
             if (refill_issued) {
                 refill_issued = false;
-                // an early issue that failed part way left slots it never queued: not given back as if refilled -
-                // the error, as a refill that failed here would give (what was queued is waited for first)
-                if (!refill_early_err.empty()) {
+                // an early issue that failed part way left slots it never queued (the loan list is whole): what was
+                // queued lands first, then the whole loan is refilled here the usual way (the same blobs into the
+                // same slots again), so nothing of the failure outlives this call
+                const bool redo = !refill_early_err.empty();
+                if (redo) {
+                    std::fprintf(stderr, "strata stage worker: the early refill failed (%s): refilling the loan again\n",
+                                 refill_early_err.c_str());
+                    refill_early_err.clear();
                     for (PfPart& p : pf_parts) {
                         std::string we;
                         if (!p.lent.empty()) (void) p.cache->sync_queued(we);
                     }
-                    e = "stage worker: the early refill failed: " + refill_early_err;
-                    refill_early_err.clear();
-                    return false;
                 }
                 for (PfPart& p : pf_parts)
-                    if (!p.lent.empty() && !refill_wait(p, e)) return false;
+                    if (!p.lent.empty() && !(redo ? refill_one(p, e) : refill_wait(p, e))) return false;
                 if (n_parts > 0) res_upload();
                 if (trace && n_parts > 0) {
                     std::fprintf(stderr, "strata trace: refilled %lld slots on %lld stage(s) (queued early): waited "
@@ -13631,9 +13633,9 @@ int main(int argc, char** argv) {
                     if (refill_early && only_chunk && !refill_early_issue(e)) {
                         // not this chunk's failure: its rows are read, and a relay's next worker still owes their reply (an error
                         // here would leave that reply on the link).  The next refill() waits for what was queued and
-                        // returns this error, as a refill that failed at the window would
+                        // refills the whole loan again the usual way
                         std::fprintf(stderr, "strata stage worker: the early refill was not queued whole (%s): the next window "
-                                             "reports it\n", e.c_str());
+                                             "refills it\n", e.c_str());
                         refill_early_err = e.empty() ? std::string("a copy could not be queued") : e;
                         e.clear();
                         refill_issued = true;
