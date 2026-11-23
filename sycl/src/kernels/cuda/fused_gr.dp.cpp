@@ -10,6 +10,7 @@
 #include "strata/sycl_queue.hpp"
 #include "strata/core/emulate.hpp"
 #include "strata/kernels/fused_gr.hpp"
+#include "strata/kernels/fused_gr_req8.hpp"
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/verify_kernels.hpp"
 
@@ -1786,6 +1787,14 @@ bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
     }
     m.xn = xn_scratch;
     m.T = n_tok;
+    // SYCL port, STRATA_HC_REQ8=1: the caller passed the int8 tables (fused_gr_req8.hpp) - the ESIMD read
+    if (a[0].s_down != nullptr && a[0].s_up != nullptr) {
+        if (!fused_gr_req8_read_multi(a, n_tok, stream, stamp_buf, stamp_i0)) {
+            std::fprintf(stderr, "fused_gr_read_multi: int8 projections without the ESIMD read in this build\n");
+            std::exit(1);
+        }
+        return false;
+    }
     dpct::queue_ptr st = strata::q_of(stream);
     // STRATA_GR_V3=1: the two-kernel read above (another summation order - opt-in)
     static const bool v3 = [] { const char* v = std::getenv("STRATA_GR_V3"); return v != nullptr && std::atoi(v) != 0; }();
