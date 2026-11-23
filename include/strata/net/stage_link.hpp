@@ -149,12 +149,18 @@ static_assert(offsetof(StageHello, build) == 80 && offsetof(StageHello, batch_sl
 /// bf16 halves the bytes and rounds each value to 8 significant bits (round to nearest even, as the GPU kernels do).
 /// The engine's buffers stay fp32 on both sides: the link converts as it sends and reads.  A format that loses
 /// precision is the main process's choice (STRATA_REMOTE_ROWS); a worker lists every one it has.
-enum class StageRows : uint32_t { F32 = 0, BF16 = 1 };
-inline constexpr uint32_t kStageRowsAll = (1u << (uint32_t) StageRows::F32) | (1u << (uint32_t) StageRows::BF16);
+/// fp8 (strata-mesh 2026-11-23): each row as blocks of kStageFp8Block values, each block one fp32 scale (its largest
+/// magnitude / 448) and one OCP E4M3 byte a value (round to nearest even, 3 significant bits; the block's largest
+/// value is exact up to the scale's rounding).  A row's bytes: its scales first, then its values.  A block with a NaN or
+/// an infinity reads back as NaNs.  About 52 % of bf16's bytes.
+enum class StageRows : uint32_t { F32 = 0, BF16 = 1, FP8 = 2 };
+inline constexpr uint32_t kStageRowsAll =
+    (1u << (uint32_t) StageRows::F32) | (1u << (uint32_t) StageRows::BF16) | (1u << (uint32_t) StageRows::FP8);
+inline constexpr size_t kStageFp8Block = 128;   ///< values a scale (fp8 rows)
 /// The format of a link whose two hellos list `a` and `b`: the narrowest in both (fp32 when no other is).
 StageRows stage_rows_agreed(uint32_t a, uint32_t b);
 const char* stage_rows_name(StageRows f);
-/// "fp32" / "bf16" (as STRATA_REMOTE_ROWS names them); false for another name
+/// "fp32" / "bf16" / "fp8" (as STRATA_REMOTE_ROWS names them); false for another name
 bool stage_rows_parse(const std::string& name, StageRows& f);
 /// Bytes of `rows` rows of `width` floats each in format `f`.
 size_t stage_rows_bytes(StageRows f, size_t rows, size_t width);
@@ -167,6 +173,10 @@ namespace detail {
 /// false (nothing written) when this build or CPU lacks it
 bool stage_bf16_encode_isa(int isa, const float* src, size_t n, void* dst);
 bool stage_bf16_decode_isa(int isa, const void* src, size_t n, float* dst);
+/// (tests, benchmarks) the fp8 conversion of `rows` rows of `width` values (stage_rows_bytes(FP8, rows, width) bytes),
+/// with one instruction set: 0 value by value, 2 AVX2 (1 is value by value too); false when this build or CPU lacks it
+bool stage_fp8_encode_isa(int isa, const float* src, size_t rows, size_t width, void* dst);
+bool stage_fp8_decode_isa(int isa, const void* src, size_t rows, size_t width, float* dst);
 /// the one stage_rows_encode / _decode use
 int stage_rows_isa();
 }  // namespace detail
