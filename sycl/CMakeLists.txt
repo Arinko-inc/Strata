@@ -500,7 +500,7 @@ if(STRATA_SYCL_PARITY)
     add_executable(gr_req8_bench ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/gr_req8_bench.cpp)
     target_link_libraries(gr_req8_bench PRIVATE strata_kernels strata_kernels_cpu)
     # the shared expert's launches one by one, and STRATA_SHEXP_ESIMD's Q5_0 down against native_mmvq, bit for bit and timed:
-    #   shexp_bench <any shard.gguf> <layer[,layer]> [--t 1,2,3,4] [--rpt 4] [--var -1] [--trials 9] [--phases 1|0]
+    #   shexp_bench <any shard.gguf> <layer[,layer]> [--t 1,2,3,4] [--rpt 2] [--var -1] [--trials 9] [--phases 1|0]
     add_executable(shexp_bench ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/shexp_bench.cpp)
     target_link_libraries(shexp_bench PRIVATE strata_kernels)
     # Gyro (APR) trellis experts on real GGUF tensors: tq_sycl_parity <pack> <model.gguf> [layer ...]

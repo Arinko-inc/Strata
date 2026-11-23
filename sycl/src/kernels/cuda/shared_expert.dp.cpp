@@ -224,9 +224,8 @@ bool shared_expert_native_bf16_enabled() { return native_bf16; }
 //    0  native_mmvq (default)
 //    1  the ESIMD kernel (q5_0_mmvq_esimd.dp.cpp), every output bit for bit native_mmvq's (shexp_bench); a call it does
 //       not serve (another type or shape, 5-8 columns) goes to native_mmvq
-// STRATA_SHEXP_ESIMD_RPT: weight rows per hardware thread (1, 2, 4, 8; default kShexpEsimdRpt).
 namespace {
-constexpr int kShexpEsimdRpt = 4;
+constexpr int kShexpEsimdRpt = 2;   // weight rows per hardware thread (shexp_bench on the B70: 2 <= 1 < 4 < 8 in time)
 int shexp_esimd_parse() {
     const char* e = std::getenv("STRATA_SHEXP_ESIMD");
     if (!e || !e[0]) return 0;
@@ -238,18 +237,7 @@ int shexp_esimd_parse() {
     }
     return e[0] - '0';
 }
-int shexp_esimd_rpt_parse() {
-    const char* e = std::getenv("STRATA_SHEXP_ESIMD_RPT");
-    if (!e || !e[0]) return kShexpEsimdRpt;
-    const int v = std::atoi(e);
-    if (v != 1 && v != 2 && v != 4 && v != 8) {
-        std::fprintf(stderr, "STRATA_SHEXP_ESIMD_RPT=%s: 1, 2, 4 or 8 rows per hardware thread\n", e);
-        std::exit(2);
-    }
-    return v;
-}
 int g_shexp_esimd = shexp_esimd_parse();
-const int g_shexp_esimd_rpt = shexp_esimd_rpt_parse();
 }  // namespace
 int shared_expert_esimd() { return g_shexp_esimd; }
 void shared_expert_set_esimd(int v) { g_shexp_esimd = v; }
@@ -386,7 +374,7 @@ void shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, cons
         native_quantize_q8_1(gate, nw.q8_1, (int) n_ff, n_tok, stream);
     }
     if (!(g_shexp_esimd == 1 && nw.down_type == 6 &&
-          q5_0_mmvq_esimd(nw.down_data, nw.q8_1, out, (int) n_ff, (int) n_embd, n_tok, stream, g_shexp_esimd_rpt, -1)))
+          q5_0_mmvq_esimd(nw.down_data, nw.q8_1, out, (int) n_ff, (int) n_embd, n_tok, stream, kShexpEsimdRpt, -1)))
         native_mmvq(nw.down_type, nw.down_data, nw.q8_1, out, (int) n_ff, (int) n_embd, n_tok, stream);
     if (gate_deferred) {   // the caller computed g (raw) with the router and scales `out` in the combine
         /*

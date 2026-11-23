@@ -2,11 +2,11 @@
 // by launch, and STRATA_SHEXP_ESIMD's Q5_0 down kernel (q5_0_mmvq_esimd.dp.cpp) against native_mmvq on a model's own
 // layers: every output bit for bit, and each one's time.
 //
-//     shexp_bench <any shard.gguf> <layer[,layer...]> [--t 1,2,3,4] [--rpt 4] [--var -1] [--trials 9] [--reps 3]
+//     shexp_bench <any shard.gguf> <layer[,layer...]> [--t 1,2,3,4] [--rpt 2] [--var -1] [--trials 9] [--reps 3]
 //                 [--phases 1|0] [--cmp 1|0] [--time 1|0]
 //
-// --rpt: weight rows per hardware thread of the ESIMD kernel (1, 2, 4, 8).  --var: the kernel's variant (-1 the engine's;
-// in an experiment build the float expression's shape 0..2, + 10 with the activations unpacked once a thread).  Every
+// --rpt: weight rows per hardware thread of the ESIMD kernel (2; 1, 4, 8 in a -DSTRATA_Q50E_EXP build).  --var: the kernel's
+// variant (-1 the engine's; 0 / 10: the activations unpacked per row / once a thread; 1, 2 in an experiment build).  Every
 // (rpt, var) pair is a configuration.
 // The weights are the layers' ffn_gate_shexp / ffn_up_shexp / ffn_down_shexp; the scalar gate's vector is random (its
 // values only scale the output).  The input is T normal random rows; the down kernels read the q8_1 image that the
@@ -64,12 +64,12 @@ struct Layer {
 int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
     if (argc < 3) {
-        std::fprintf(stderr, "usage: shexp_bench <shard.gguf> <layer[,layer]> [--t 1,2,3,4] [--rpt 4] [--var -1] [--trials 9] "
+        std::fprintf(stderr, "usage: shexp_bench <shard.gguf> <layer[,layer]> [--t 1,2,3,4] [--rpt 2] [--var -1] [--trials 9] "
                              "[--reps 3] [--phases 1|0] [--cmp 1|0] [--time 1|0]\n");
         return 2;
     }
     const std::vector<int> layers = ints(argv[2]);
-    std::vector<int> Ts = {1, 2, 3, 4}, rpts = {4}, vars = {-1};
+    std::vector<int> Ts = {1, 2, 3, 4}, rpts = {2}, vars = {-1};
     int trials = 9, reps = 3, phases_on = 1, cmp_on = 1, time_on = 1;
     for (int i = 3; i + 1 < argc; i += 2) {
         const std::string a = argv[i];

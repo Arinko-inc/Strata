@@ -168,7 +168,8 @@ SYCL_ESIMD_FUNCTION inline float fold(simd<float, 8> t0, simd<float, 8> t1, simd
     return s0 + s1;
 }
 
-// HOIST 1: the columns' activations are unpacked once a thread (registers); 0: per row (as q4kq5_down_esimd does per entry)
+// HOIST 1: the columns' activations are unpacked once a thread (registers); 0: per row (as q4kq5_down_esimd does per entry).
+// VAR 1 (the product f * d8 rounded on its own) and 2 (d5 * v fused into the add) do not give the lane kernel's bits.
 template <int NC, int RPT, int VAR, int HOIST>
 void launch(sycl::queue& q, const uint8_t* w, const uint32_t* x, float* y, int n_out) {
     const size_t threads = (size_t) (n_out / RPT);
@@ -216,9 +217,7 @@ void launch(sycl::queue& q, const uint8_t* w, const uint32_t* x, float* y, int n
     });
 }
 
-#define STRATA_Q50E_EXP 1   // the experiment's variants (rows per thread, the float expression's shapes, the hoist)
-constexpr int kVar = 0;     // the engine's variant: var = the expression's shape + 10 * HOIST
-
+// -DSTRATA_Q50E_EXP: the experiment's variants too (rows per thread 1 / 4 / 8, the float expression's other shapes)
 template <int RPT, int VAR, int HOIST>
 bool launch_nc(sycl::queue& q, const uint8_t* w, const uint32_t* x, float* y, int n_out, int ncols) {
     switch (ncols) {
@@ -240,14 +239,15 @@ bool q5_0_mmvq_esimd(const void* weights, const void* x_q8_1, float* y, int n_in
     sycl::queue& q = *strata::q_of(stream);
     const auto* w = (const uint8_t*) weights;
     const auto* x = (const uint32_t*) x_q8_1;
-    if (var < 0) var = kVar;
+    // the engine's variant (var < 0): 2 rows a thread; 2-4 columns unpack the activations once a thread, 1 column per row
+    // (B70, 18 layers, us per call, native_mmvq -> this: T=1 20.7 -> 4.0, T=2 16.0 -> 4.9, T=3 18.2 -> 5.8, T=4 20.9 -> 6.5)
+    if (var < 0) var = ncols > 1 ? 10 : 0;
 #define STRATA_Q50E(RP, VA, HO) if (rpt == RP && var == VA + 10 * HO) return launch_nc<RP, VA, HO>(q, w, x, y, n_out, ncols);
+    STRATA_Q50E(2, 0, 0) STRATA_Q50E(2, 0, 1)
 #ifdef STRATA_Q50E_EXP
-    STRATA_Q50E(1, 0, 0) STRATA_Q50E(2, 0, 0) STRATA_Q50E(4, 0, 0) STRATA_Q50E(8, 0, 0)
-    STRATA_Q50E(1, 0, 1) STRATA_Q50E(2, 0, 1) STRATA_Q50E(4, 0, 1) STRATA_Q50E(8, 0, 1)
+    STRATA_Q50E(1, 0, 0) STRATA_Q50E(4, 0, 0) STRATA_Q50E(8, 0, 0)
+    STRATA_Q50E(1, 0, 1) STRATA_Q50E(4, 0, 1) STRATA_Q50E(8, 0, 1)
     STRATA_Q50E(4, 1, 0) STRATA_Q50E(4, 2, 0)
-#else
-    STRATA_Q50E(4, 0, 0)
 #endif
 #undef STRATA_Q50E
     return false;
