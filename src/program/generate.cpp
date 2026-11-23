@@ -13549,6 +13549,9 @@ int main(int argc, char** argv) {
                 };
                 hs.commit = [&](int n_keep, std::string& e) -> bool {
                     const WkBusy busy("stage worker commit");
+                    // (STRATA_WK_REFILL_EARLY: adapt() below reads host_res and writes victim slots, so copies still landing in
+                    // the slots of a loan given back early are waited for first; today a window's hs.run always does it before)
+                    if (refill_issued && !refill(e)) return false;
                     if (stage_relay && !next_link.commit(n_keep, e)) return false;   // the next worker commits meanwhile
                     if (!ver.commit(n_keep, e) || !ver.wait_commit(e)) return false;
                     // the adaptive tier on this worker's layers, every adapt_every windows (the main process has its own)
@@ -13923,6 +13926,9 @@ int main(int argc, char** argv) {
                 };
                 // the adaptive tier on this worker's layers, counted per commit as hs.commit counts
                 auto wk_after_commit = [&](std::string& e) -> bool {
+                    // (STRATA_WK_REFILL_EARLY: adapt() below reads host_res and writes victim slots, so copies still landing in
+                    // the slots of a loan given back early are waited for first; today a window's hs.run always does it before)
+                    if (refill_issued && !refill(e)) return false;
                     if (!drive.d.usage.empty() && o.adapt_every > 0 && (++wk_rounds % o.adapt_every) == 0 && !adapt()) {
                         e = "stage worker: an adaptive refill failed";
                         return false;
