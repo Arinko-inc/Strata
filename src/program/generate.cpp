@@ -13572,7 +13572,9 @@ int main(int argc, char** argv) {
                     mine_next.tail_skip = (int32_t) strata::core::tail_skip_rank();   // the main process's, as above
                     mine_next.vision = main_vision;   // the main process's (a worker started with --vision has it)
                     mine_next.ckpt_max = main_ckpt_max;
-                    mine_next.row_formats = main_rows;   // (the main process's: until its hello, fp32)
+                    // (the main process's: until its hello, fp32), less any format this build lacks: the next link's
+                    // format must be one this relay can write (a newer main process may list a newer one)
+                    mine_next.row_formats = main_rows & strata::net::kStageRowsAll;
                     std::memcpy(mine_next.token, stage_token.data(), stage_token.size());
                     for (int i = 0;; ++i) {
                         // each try can block (a connect's SYN tries, the hello's reply): its own allowance (as in
