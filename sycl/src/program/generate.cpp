@@ -9462,7 +9462,10 @@ int main(int argc, char **argv) try {
                     return v && v[0] != '0';
                 }();
                 const bool only_chunk = (flags & 1) != 0;
-                if (!lend(lend_single && only_chunk ? T : std::max<int64_t>(T, lend_chunk), e)) return false;
+                // (only where lend() takes T's loan whole: the loan is not monotonic in the chunk (#2090), and a smaller chunk
+                // that needs more slots than may be lent would be halved below T - then the hello's loan, as before)
+                const bool lend_own = lend_single && only_chunk && T < lend_chunk && lend_whole(T);
+                if (!lend(lend_own ? T : std::max<int64_t>(T, lend_chunk), e)) return false;
                 // a chunk the buffers do not cover would leave rows out: an error, not a wrong reply
                 if (sp.chunk() < T) {
                     e = "this worker lends the prompt path buffers for " + std::to_string(sp.chunk()) +
