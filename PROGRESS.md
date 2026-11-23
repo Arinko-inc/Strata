@@ -22,7 +22,21 @@
 - `native_mmvq.dp.cpp`: `STRATA_MMVQ_ESIMD_LOOP`(0/1、未設定は形で選ぶ)。**形で選ぶ規則 `mmvq_esimd_loop` / `mmvq_esimd_rpt` は仮(WIP)。窓の計測で決める**
 - 計測器: `--rpt` に 401・402・404・408(LOOP 1)、801…(LOOP 2)を渡せる
 
+## 仕掛けたもの(2026-11-24 06:25)
+- trainsv で `~/wt/b70t4-run1.sh` が nohup で窓を待っている(1分おきに `/home/arinko/b/gpu-window` を見る。120 分で出なければ終わる)。`~/wt/b70t4-logs/READY` は置いた(中身 `b70t4-run1.sh 20`)
+- 窓が開くと、人手なしで次の3本を順に流す(各 400 秒で打ち切り、窓の残りが 420 秒を切ると飛ばす)。流れた順と終了コードは `~/wt/b70t4-logs/run1.status`(最後の行が `done`)
+  1. `a-loop1.txt`: 層 30〜47 × T=1〜4 × `--rpt 1,2,401,402,404,408`(LOOP 0 の 1・2 行と LOOP 1 の 1・2・4・8 行)。ビット比較と µs
+  2. `b-loop2.txt`: 同じく `--rpt 2,801,802,804,808`(LOOP 2)
+  3. `c-t4.txt`: T=3,4 だけ、`--rpt 1,2,401,402,404,801,802,804`、15 回、時間だけ
+- 使う exe: `~/wt/b70t4/build-sycl/mmvq_esimd_bench`(d978b3cec のソース)。同じビルドの `strata` は 112,811,832 バイト・sha256 757d06f60f1a5f2d(土台 121,054,048 バイト。形で選ぶ規則が仮のままなので、本番用ではない)
+
+## 結果の読み方
+- `grep "differ" a-loop1.txt b-loop2.txt | grep -v " 0 of "` が空で、末尾が `mmvq_esimd_bench: 0 failures` ならビット一致
+- `grep "^time"` の行: `wide`(本番の基準)と各 `rpt N` の µs/呼び出し。`grep "^sum"` は T ごとの 18 層合計で、wide に対して何 ms 縮むか。**いまの本番の選び方に当たるのは rpt 2(小さい行列の 1 列・4 列は rpt 1)**。それと rpt 402 などを比べる
+- 原因の切り分け: attn_qkv の T=4 で rpt 402 が rpt 2(約 55 µs)より速く、3 列からの伸びが 2→3 列と同じ程度(+6 µs 前後)ならコードの大きさ。rpt 402 が遅いままで 802 だけ速ければ RA の種類
+- ssm_alpha(48 行)の行は、スレッド1本あたりの時間を見るのに使う(行列が小さいので起動の固定分 + 1本の実行時間)
+
 ## 次の手
-1. ビルドが通ったら `~/wt/b70t4-logs/READY` を置き、`~/wt/b70t4-run1.sh` を裏で起こして窓を待つ
-2. 窓で a-loop1 / b-loop2 / c-t4 の結果を見て、形で選ぶ規則を決めて作り直し、`--rpt 0,2`(エンジンの選び方)で 132 通りの差 0 と µs を取る。`STRATA_MMVQ_ESIMD_LOOP=0` で元の時間に戻ることも見る
-3. exe の大きさ(土台 121,054,048 バイト)と sha256 を記録、コミット
+1. 窓の結果から、形(n_in・n_out・列数)ごとに一番速い「行数 × LOOP」を選び、`native_mmvq.dp.cpp` の `mmvq_esimd_loop` / `mmvq_esimd_rpt`(いまは仮: LOOP は既定 0)を決める。LOOP 2 を採るなら `q4k_mmvq_esimd.dp.cpp` の末尾で LOOP 2 を `#ifdef STRATA_Q4KE_EXP` の外に出し、採らない LOOP を中に入れる
+2. 作り直して(`~/wt/b70t4.sh strata stage_probe mmvq_esimd_bench`、約 7〜12 分)、2回目の窓で `--rpt 0,2`(エンジンの選び方。`b70t4-run1.sh now d-auto $ALL --rpt 0,2 --trials 11`)の 132 通りの差 0 と µs を取る。`STRATA_MMVQ_ESIMD_LOOP=0` を付けて元の時間(d-auto-1.txt の rpt 0)に戻ることも見る。READY を置き直す(中身に「2回目」)
+3. exe の大きさと sha256 を記録、コミット、報告
