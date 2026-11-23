@@ -30,6 +30,7 @@
 #include "strata/kernels/s2_gemv_q8.hpp"
 #include "strata/kernels/s_gemv.hpp"
 #include "strata/kernels/native_mmvq.hpp"
+#include "strata/kernels/q5_0_mmvq_esimd.hpp"
 
 #include <cmath>
 #include <climits>
@@ -218,6 +219,29 @@ __dpct_inline__ void moe_combine_kernel(const float *__restrict__ parts,
 void shared_expert_set_native_bf16(bool enabled) { native_bf16 = enabled; }
 bool shared_expert_native_bf16_enabled() { return native_bf16; }
 
+// ---------------------------------------------------------------- STRATA_SHEXP_ESIMD (SYCL port, Xe2 / B70)
+// The down projection of shared_expert_multi (Q5_0, 640 inputs, the decode window's 1-4 columns):
+//    0  native_mmvq (default)
+//    1  the ESIMD kernel (q5_0_mmvq_esimd.dp.cpp), every output bit for bit native_mmvq's (shexp_bench); a call it does
+//       not serve (another type or shape, 5-8 columns) goes to native_mmvq
+namespace {
+constexpr int kShexpEsimdRpt = 2;   // weight rows per hardware thread (shexp_bench on the B70: 2 <= 1 < 4 < 8 in time)
+int shexp_esimd_parse() {
+    const char* e = std::getenv("STRATA_SHEXP_ESIMD");
+    if (!e || !e[0]) return 0;
+    const bool ok = (e[0] == '0' || e[0] == '1') && e[1] == '\0';
+    if (!ok || (e[0] == '1' && !q5_0_mmvq_esimd_built())) {
+        std::fprintf(stderr, "STRATA_SHEXP_ESIMD=%s: 0 (native_mmvq) or 1 (the ESIMD Q5_0 kernel%s)\n", e,
+                     q5_0_mmvq_esimd_built() ? "" : "; not in this build");
+        std::exit(2);
+    }
+    return e[0] - '0';
+}
+int g_shexp_esimd = shexp_esimd_parse();
+}  // namespace
+int shared_expert_esimd() { return g_shexp_esimd; }
+void shared_expert_set_esimd(int v) { g_shexp_esimd = v; }
+
 namespace {
 __dpct_inline__ void scale_rows_kernel(float *__restrict__ out,
                                        const float *__restrict__ g, int n) {
@@ -349,7 +373,9 @@ void shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, cons
         }
         native_quantize_q8_1(gate, nw.q8_1, (int) n_ff, n_tok, stream);
     }
-    native_mmvq(nw.down_type, nw.down_data, nw.q8_1, out, (int) n_ff, (int) n_embd, n_tok, stream);
+    if (!(g_shexp_esimd == 1 && nw.down_type == 6 &&
+          q5_0_mmvq_esimd(nw.down_data, nw.q8_1, out, (int) n_ff, (int) n_embd, n_tok, stream, kShexpEsimdRpt, -1)))
+        native_mmvq(nw.down_type, nw.down_data, nw.q8_1, out, (int) n_ff, (int) n_embd, n_tok, stream);
     if (gate_deferred) {   // the caller computed g (raw) with the router and scales `out` in the combine
         /*
         DPCT1010: SYCL uses exceptions to report errors and does not use the
