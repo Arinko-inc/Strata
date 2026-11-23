@@ -1,11 +1,10 @@
 // sycl/src/kernels/gr_req8_bench.cpp - SYCL port: STRATA_HC_REQ8's ESIMD hyper-connection read (fused_gr_req8) against
 // the default BF16 read (fused_gr_read_multi) on a model's own projections.
-//   gr_req8_bench <any shard.gguf> <layer[,layer...]> [--t 1,2,3,4] [--calls 50] [--trials 7] [--graph 1|0]
+//   gr_req8_bench <pack dir> <layer[,layer...]> [--t 1,2,3,4] [--calls 50] [--trials 7] [--graph 1|0]
 // Per layer and half (hc_attn, hc_ffn) and T: the largest relative error of each output against the BF16 read
 // (max |a - b| / max |b| over the output's values of all tokens) and the time of one read (--calls reads in ONE
 // command graph, as the engine's window is; the median of --trials, the two reads alternating).  The inputs are
 // random rows with the pending write folded (apply), as the engine's reads are.
-#include "strata/artifact/gguf_reader.hpp"
 #include "strata/core/weights.hpp"
 #include "strata/kernels/fused_gr.hpp"
 #include "strata/kernels/fused_gr_req8.hpp"
@@ -16,6 +15,9 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
+#include <map>
+#include <sstream>
 #include <memory>
 #include <random>
 #include <string>
@@ -41,7 +43,7 @@ static double median(std::vector<double> v) { std::sort(v.begin(), v.end()); ret
 
 int main(int argc, char** argv) {
     if (argc < 3) {
-        std::fprintf(stderr, "usage: gr_req8_bench <shard.gguf> <layer[,layer]> [--t 1,2,3,4] [--calls 50] [--trials 7] [--graph 1|0]\n");
+        std::fprintf(stderr, "usage: gr_req8_bench <pack dir> <layer[,layer]> [--t 1,2,3,4] [--calls 50] [--trials 7] [--graph 1|0]\n");
         return 2;
     }
     const std::vector<int> layers = ints(argv[2]);
@@ -55,13 +57,21 @@ int main(int argc, char** argv) {
         else if (a == "--graph") graph = std::atoi(argv[i + 1]);
         else { std::fprintf(stderr, "unknown option %s\n", a.c_str()); return 2; }
     }
-    std::unique_ptr<strata::GgufModel> model;
-    try {
-        model = std::make_unique<strata::GgufModel>(strata::GgufModel::open(argv[1]));
-    } catch (const std::exception& ex) {
-        std::fprintf(stderr, "gr_req8_bench: %s\n", ex.what());
-        return 2;
+    struct Ent { int kind; uint64_t off, bytes; };
+    std::map<std::string, Ent> index;
+    const std::string pack = argv[1];
+    std::FILE* dense = std::fopen((pack + "/dense.bin").c_str(), "rb");
+    {
+        std::ifstream in(pack + "/index.txt");
+        std::string line;
+        while (std::getline(in, line)) {
+            std::istringstream ls(line);
+            std::string name;
+            long long file, kind, off, bytes;
+            if (ls >> name >> file >> kind >> off >> bytes) index[name] = Ent{(int) kind, (uint64_t) off, (uint64_t) bytes};
+        }
     }
+    if (dense == nullptr || index.empty()) { std::fprintf(stderr, "gr_req8_bench: %s is not a pack (index.txt, dense.bin)\n", pack.c_str()); return 2; }
     g_q = dpct::get_current_device().create_queue(true);
     dpct::queue_ptr s = g_q;
     const char* es = std::getenv("STRATA_HC_REQ8_S");
@@ -91,25 +101,31 @@ int main(int argc, char** argv) {
         for (int half = 0; half < 2; ++half) {
             const std::string pfx = "blk." + std::to_string(l) + (half == 0 ? ".hc_attn_" : ".hc_ffn_");
             const char* roles[4] = {"norm", "down", "up", "inject"};
-            const strata::TensorInfo* t[4] = {};
-            size_t sh[4] = {};
+            // the pack's index.txt: name file kind src_off src_bytes off bytes ne0 ne1 ...; the BF16 tensors are raw (2 B/elem)
+            std::vector<char> buf[4];
+            const uint64_t want[4] = {(uint64_t) D * 4, (uint64_t) LR * D * 2, (uint64_t) D * LR * 2, (uint64_t) HC * D * 2};
+            const int want_kind[4] = {2, 4, 4, 4};
             bool ok = true;
             for (int r = 0; r < 4; ++r) {
-                t[r] = model->find(pfx + roles[r] + ".weight", &sh[r]);
-                if (!t[r]) ok = false;
+                const auto it = index.find(pfx + roles[r] + ".weight");
+                if (it == index.end() || it->second.kind != want_kind[r] || it->second.bytes != want[r]) {
+                    std::printf("  %s: %s kind %d %llu B\n", roles[r], it == index.end() ? "missing" : "found",
+                                it == index.end() ? -1 : it->second.kind, (unsigned long long) (it == index.end() ? 0 : it->second.bytes));
+                    ok = false;
+                    continue;
+                }
+                buf[r].resize(want[r]);
+                if (std::fseek(dense, (long) it->second.off, SEEK_SET) != 0 || std::fread(buf[r].data(), 1, want[r], dense) != want[r]) ok = false;
             }
-            if (!ok || t[0]->elements() != (uint64_t) D || t[1]->elements() != (uint64_t) LR * D || t[2]->elements() != (uint64_t) D * LR ||
-                t[3]->elements() != (uint64_t) HC * D || std::string(t[1]->type_name()) != "BF16" ||
-                std::string(t[2]->type_name()) != "BF16" || std::string(t[3]->type_name()) != "BF16" ||
-                std::string(t[0]->type_name()) != "F32") {
+            if (!ok) {
                 std::printf("layer %d %s: tensors missing or not F32 / BF16 of the compiled shapes\n", l, pfx.c_str());
                 ++failures;
                 continue;
             }
-            const float* h_norm = (const float*) model->shard(sh[0]).tensor_data(*t[0]);
-            const uint16_t* h_down = (const uint16_t*) model->shard(sh[1]).tensor_data(*t[1]);
-            const uint16_t* h_up = (const uint16_t*) model->shard(sh[2]).tensor_data(*t[2]);
-            const uint16_t* h_inj = (const uint16_t*) model->shard(sh[3]).tensor_data(*t[3]);
+            const float* h_norm = (const float*) buf[0].data();
+            const uint16_t* h_down = (const uint16_t*) buf[1].data();
+            const uint16_t* h_up = (const uint16_t*) buf[2].data();
+            const uint16_t* h_inj = (const uint16_t*) buf[3].data();
             float* d_norm = dput(h_norm, (size_t) D);
             uint16_t* d_down = dput(h_down, (size_t) LR * D);
             uint16_t* d_up = dput(h_up, (size_t) D * LR);
