@@ -12958,7 +12958,13 @@ int main(int argc, char** argv) {
                     }
                 }
                 for (PfPart& p : pf_parts)
-                    if (!p.lent.empty() && !(redo ? refill_one(p, e) : refill_wait(p, e))) return false;
+                    if (!p.lent.empty() && !(redo ? refill_one(p, e) : refill_wait(p, e))) {
+                        // still owed: the next refill() (and lend(), which comes through it) refills the loan again
+                        // instead of reusing slots copies may still be landing in
+                        refill_issued = true;
+                        refill_early_err = e.empty() ? std::string("the refill failed") : e;
+                        return false;
+                    }
                 if (n_parts > 0) res_upload();
                 if (trace && n_parts > 0) {
                     std::fprintf(stderr, "strata trace: refilled %lld slots on %lld stage(s) (queued early): waited "
