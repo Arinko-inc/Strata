@@ -249,6 +249,7 @@ list(APPEND _kernels ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/cuda/qsa_prompt_att
 list(APPEND _kernels ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/cuda/q4kq5_down_esimd.dp.cpp)   # port-only: STRATA_EXPERT_Q4KQ5=1's ESIMD down rows (Battlemage; a stub with STRATA_I8_NO_ESIMD)
 list(APPEND _kernels ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/cuda/q4k_mmvq_esimd.dp.cpp)   # port-only: STRATA_MMVQ_ESIMD=1's dense Q4_K GEMV for 1-4 columns (Battlemage; a stub with STRATA_I8_NO_ESIMD)
 list(APPEND _kernels ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/cuda/fused_gr_req8.dp.cpp)   # port-only: STRATA_HC_REQ8=1's int8 hyper-connection read on ESIMD (Battlemage; a stub with STRATA_I8_NO_ESIMD)
+list(APPEND _kernels ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/cuda/q5_0_mmvq_esimd.dp.cpp)   # port-only: STRATA_SHEXP_ESIMD=1's dense Q5_0 GEMV for the shared expert's down, 1-4 columns (Battlemage; a stub with STRATA_I8_NO_ESIMD)
 add_library(strata_kernels STATIC ${_kernels})
 target_include_directories(strata_kernels PRIVATE ${STRATA_ROOT}/third_party/ggml)
 target_link_libraries(strata_kernels PUBLIC strata_core)
@@ -498,6 +499,10 @@ if(STRATA_SYCL_PARITY)
     #   gr_req8_bench <pack dir> <layer[,layer]> [--t 1,2,3,4]
     add_executable(gr_req8_bench ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/gr_req8_bench.cpp)
     target_link_libraries(gr_req8_bench PRIVATE strata_kernels strata_kernels_cpu)
+    # the shared expert's launches one by one, and STRATA_SHEXP_ESIMD's Q5_0 down against native_mmvq, bit for bit and timed:
+    #   shexp_bench <any shard.gguf> <layer[,layer]> [--t 1,2,3,4] [--rpt 4] [--var -1] [--trials 9] [--phases 1|0]
+    add_executable(shexp_bench ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/shexp_bench.cpp)
+    target_link_libraries(shexp_bench PRIVATE strata_kernels)
     # Gyro (APR) trellis experts on real GGUF tensors: tq_sycl_parity <pack> <model.gguf> [layer ...]
     add_executable(tq_sycl_parity ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/tq_sycl_parity.cpp)
     target_include_directories(tq_sycl_parity PRIVATE ${STRATA_ROOT}/third_party/ggml)
