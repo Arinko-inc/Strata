@@ -161,7 +161,7 @@ SYCL_ESIMD_FUNCTION inline float fold(simd<float, 8> t0, simd<float, 8> t1, simd
     const simd<float, 8> a = t0 + t4;
     const simd<float, 8> p0 = a + t2;
     const simd<float, 8> p1 = t1 + t3;
-    const simd<float, 8> u = p0 + p1;
+    simd<float, 8> u = p0 + p1;
     simd<float, 4> t4s = u.template select<4, 1>(0) + u.template select<4, 1>(4);
     simd<float, 2> t2s = t4s.template select<2, 1>(0) + t4s.template select<2, 1>(2);
     const float s0 = t2s[0], s1 = t2s[1];
