@@ -62,7 +62,9 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cmath>
 #include <cstring>
+#include <limits>
 #include <mutex>
 #include <random>
 #include <string>
@@ -1281,8 +1283,91 @@ int main() {
               "the narrowest format both list, fp32 when no other (a format this build lacks: not chosen)");
         StageRows parsed = StageRows::F32;
         check(stage_rows_parse("bf16", parsed) && parsed == StageRows::BF16 && stage_rows_parse("fp32", parsed) &&
-                  parsed == StageRows::F32 && !stage_rows_parse("fp8", parsed),
-              "STRATA_REMOTE_ROWS names: fp32, bf16");
+                  parsed == StageRows::F32 && stage_rows_parse("fp8", parsed) && parsed == StageRows::FP8 &&
+                  !stage_rows_parse("fp4", parsed),
+              "STRATA_REMOTE_ROWS names: fp32, bf16, fp8");
+        const uint32_t f8 = 1u << (uint32_t) StageRows::FP8;
+        check(stage_rows_agreed(f32 | f8, kStageRowsAll) == StageRows::FP8 &&
+                  stage_rows_agreed(f32 | f8, f32 | b16) == StageRows::F32 &&
+                  stage_rows_agreed(f32 | b16 | f8, kStageRowsAll) == StageRows::FP8,
+              "fp8 is the narrowest; a worker without it and a main process asking only for it: fp32");
+
+        // ---- fp8 rows (strata-mesh 2026-11-23): bytes, the value-by-value reference against AVX2, the error bound,
+        // re-encoding what was read gives the same codes, NaN / infinity / zero blocks
+        {
+            check(stage_rows_bytes(StageRows::FP8, 3, 10240) == 3 * (10240 + 4 * 80) &&
+                      stage_rows_bytes(StageRows::FP8, 2, 129) == 2 * (129 + 8) &&
+                      stage_rows_bytes(StageRows::FP8, 1, 1) == 5,
+                  "fp8 bytes: per row its values plus one fp32 scale a block of 128");
+            std::mt19937 r8(11);
+            std::uniform_real_distribution<float> u8(-2.0f, 2.0f);
+            bool same = true, bound = true, idem = true, tails = true, have_avx2 = false;
+            for (const size_t w : {(size_t) 1, (size_t) 7, (size_t) 31, (size_t) 127, (size_t) 128, (size_t) 129,
+                                   (size_t) 300, (size_t) 10240}) {
+                const size_t rows = 3, n = rows * w, bytes = stage_rows_bytes(StageRows::FP8, rows, w);
+                std::vector<float> x(n);
+                for (size_t i = 0; i < n; ++i) {
+                    float v = u8(r8);
+                    if (i % 97 == 5) v *= 3000.0f;   // outliers, as a residual stream has
+                    if (i % 31 == 3) v *= 1e-5f;     // and values far below the block's largest (E4M3's subnormals)
+                    if (i % 211 == 7) v = 0.0f;
+                    x[i] = v;
+                }
+                std::vector<unsigned char> e0(bytes + 1, 0xA5), e2(bytes + 1, 0xA5), ee(bytes + 1, 0xA5);
+                std::vector<float> d0(n + 1, -9.0f), d2(n + 1, -9.0f);
+                tails = tails && detail::stage_fp8_encode_isa(0, x.data(), rows, w, e0.data()) && e0[bytes] == 0xA5 &&
+                        detail::stage_fp8_decode_isa(0, e0.data(), rows, w, d0.data()) && d0[n] == -9.0f;
+                if (detail::stage_fp8_encode_isa(2, x.data(), rows, w, e2.data())) {
+                    have_avx2 = true;
+                    same = same && std::memcmp(e0.data(), e2.data(), bytes) == 0 && e2[bytes] == 0xA5 &&
+                           detail::stage_fp8_decode_isa(2, e0.data(), rows, w, d2.data()) &&
+                           std::memcmp(d0.data(), d2.data(), 4 * n) == 0 && d2[n] == -9.0f;
+                }
+                const size_t nb = (w + kStageFp8Block - 1) / kStageFp8Block;
+                for (size_t rr = 0; rr < rows; ++rr)
+                    for (size_t b = 0; b < nb; ++b) {
+                        const size_t lo = b * kStageFp8Block, hi = std::min(w, lo + kStageFp8Block);
+                        float amax = 0.0f;
+                        for (size_t i = lo; i < hi; ++i) amax = std::max(amax, std::fabs(x[rr * w + i]));
+                        const float sc = amax / 448.0f;
+                        for (size_t i = lo; i < hi; ++i) {
+                            const float a = x[rr * w + i], d = d0[rr * w + i];
+                            // 3 significant bits to nearest: half a step (2^-4 of the value), or half a subnormal
+                            // step (2^-10 of the scale); a hair for the scaling's own rounding
+                            const float lim = std::fabs(a) * 0.0626f + sc * (1.0f / 1024.0f) * 1.001f + 1e-30f;
+                            if (!(std::fabs(a - d) <= lim) || (a != 0.0f && d != 0.0f && (a < 0) != (d < 0))) bound = false;
+                        }
+                    }
+                stage_rows_encode(StageRows::FP8, d0.data(), rows, w, ee.data());
+                for (size_t rr = 0; rr < rows; ++rr)   // the codes (a row's bytes after its scales)
+                    idem = idem && std::memcmp(ee.data() + rr * (bytes / rows) + 4 * nb,
+                                               e0.data() + rr * (bytes / rows) + 4 * nb, w) == 0;
+            }
+            check(tails && (same || !have_avx2),
+                  "fp8: AVX2 writes the reference's bits (both ways), widths 1..10240 with partial blocks, nothing past");
+            check(bound, "fp8: each value within half an E4M3 step of itself (relative 2^-4, or 2^-10 of the scale)");
+            check(idem, "fp8: what was read encodes to the same codes (a relay re-encoding a reply changes no value)");
+            // special blocks: a NaN and an infinity spoil their own block only; zeros stay zeros; the largest is exact
+            std::vector<float> sx(4 * kStageFp8Block, 0.0f);
+            for (size_t i = 0; i < sx.size(); ++i) sx[i] = (float) (i % 13) - 6.0f;
+            sx[5] = std::numeric_limits<float>::quiet_NaN();
+            sx[kStageFp8Block + 9] = std::numeric_limits<float>::infinity();
+            for (size_t i = 2 * kStageFp8Block; i < 3 * kStageFp8Block; ++i) sx[i] = 0.0f;
+            sx[3 * kStageFp8Block + 1] = 1234.5f;
+            for (const int isa : {0, 2}) {
+                std::vector<unsigned char> se(stage_rows_bytes(StageRows::FP8, 1, sx.size()));
+                std::vector<float> sd(sx.size(), 7.0f);
+                if (!detail::stage_fp8_encode_isa(isa, sx.data(), 1, sx.size(), se.data())) continue;
+                (void) detail::stage_fp8_decode_isa(isa, se.data(), 1, sx.size(), sd.data());
+                bool ok = true;
+                for (size_t i = 0; i < 2 * kStageFp8Block; ++i) ok = ok && std::isnan(sd[i]);
+                for (size_t i = 2 * kStageFp8Block; i < 3 * kStageFp8Block; ++i) ok = ok && sd[i] == 0.0f;
+                ok = ok && std::fabs(sd[3 * kStageFp8Block + 1] - 1234.5f) <= 1234.5f * 1e-6f;
+                check(ok, isa == 0 ? "fp8 (value by value): a NaN or an infinity makes its block NaNs, zeros stay "
+                                     "zeros, the block's largest comes back (to the scale's rounding)"
+                                   : "fp8 (AVX2): the same");
+            }
+        }
 
         worker_vision = 1;
         Worker wk15;
@@ -1325,6 +1410,38 @@ int main() {
                       wout15 == win15,
                   "a main process listing fp32 only: fp32, the rows exact");
             cl.close();
+            {   // fp8 both ways: the worker reads, copies and sends back, so a value is read twice (the same codes)
+                StageHello mine_8 = hello_of();
+                mine_8.row_formats = f32 | f8;
+                auto rt = [](const std::vector<float>& v, size_t width) {
+                    std::vector<unsigned char> e(stage_rows_bytes(StageRows::FP8, v.size() / width, width));
+                    std::vector<float> o(v.size());
+                    stage_rows_encode(StageRows::FP8, v.data(), v.size() / width, width, e.data());
+                    stage_rows_decode(StageRows::FP8, e.data(), v.size() / width, width, o.data());
+                    return o;
+                };
+                const std::vector<float> want8 = rt(rt(win15, (size_t) kHbf), (size_t) kHbf);
+                const bool c8 = cl.connect(wk15.where, mine_8, peer, err) && cl.rows() == StageRows::FP8 && cl.reset({}, err);
+                const uint64_t o8 = cl.stats().bytes_out, i8 = cl.stats().bytes_in;
+                const bool r8 = c8 && cl.run(2, t2.data(), 0, win15.data(), win15.size(), wout15.data(), wout15.size(), err);
+                check(r8 && wout15 == want8 && want8 != win15,
+                      "a main process listing fp8: the link agrees on it, a window's rows come back read twice");
+                const uint64_t sent8 = cl.stats().bytes_out - o8, got8 = cl.stats().bytes_in - i8;
+                const uint64_t row8 = stage_rows_bytes(StageRows::FP8, 2, (size_t) kHbf);
+                check(r8 && sent8 == sizeof(StageHeader) + 2 * 4 + row8 && got8 == sizeof(StageHeader) + row8,
+                      "... and cross as fp8 both ways (the window's bytes, counted after the reset)");
+                if (!(r8 && sent8 == sizeof(StageHeader) + 2 * 4 + row8 && got8 == sizeof(StageHeader) + row8))
+                    std::printf("    (sent %llu, read %llu, fp8 rows %llu, header %zu)\n", (unsigned long long) sent8,
+                                (unsigned long long) got8, (unsigned long long) row8, sizeof(StageHeader));
+                std::vector<float> pout8(pin15.size(), -1.0f), pwant8(pin15.size(), -1.0f);
+                const std::vector<float> pin_tail(pin15.begin() + skip * kD, pin15.end());
+                const std::vector<float> prt = rt(rt(pin_tail, (size_t) kD), (size_t) kD);
+                std::copy(prt.begin(), prt.end(), pwant8.begin() + skip * kD);
+                check(cl.prefill_send(ptok15.data(), kChunk, 0, 0, pin15.data(), (size_t) kD, skip, err) &&
+                          cl.prefill_recv(pout8.data(), (size_t) kD, kChunk, skip, err) && pout8 == pwant8,
+                      "a prompt chunk's rows as fp8 too, from row `skip`");
+                cl.close();
+            }
             {
                 Raw r;
                 StageHello rh = hello_of();

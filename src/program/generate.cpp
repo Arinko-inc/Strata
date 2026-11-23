@@ -13218,11 +13218,12 @@ int main(int argc, char** argv) {
                                      "the row format its main process asks for (it ignores its own)\n");
             if (remote_main) {
                 // STRATA_REMOTE_ROWS=bf16: the rows cross the link as bf16 (half the bytes, each value rounded to 8
-                // significant bits) when the worker has it; unset or fp32: fp32, as before
+                // significant bits) when the worker has it; fp8: E4M3 with a scale a block of 128 (about a quarter of
+                // the bytes, 3 significant bits); unset or fp32: fp32, as before
                 if (const char* v = std::getenv("STRATA_REMOTE_ROWS"); v != nullptr && *v != '\0') {
                     strata::net::StageRows f = strata::net::StageRows::F32;
                     if (!strata::net::stage_rows_parse(v, f)) {
-                        std::fprintf(stderr, "strata serve: STRATA_REMOTE_ROWS=%s: expected fp32 or bf16\n", v);
+                        std::fprintf(stderr, "strata serve: STRATA_REMOTE_ROWS=%s: expected fp32, bf16 or fp8\n", v);
                         return 1;
                     }
                     me.row_formats |= 1u << (uint32_t) f;

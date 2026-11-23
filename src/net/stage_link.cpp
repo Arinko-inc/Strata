@@ -2,6 +2,9 @@
 #include "strata/net/stage_link.hpp"
 
 #include <algorithm>
+#include <cfloat>
+#include <cmath>
+#include <limits>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -65,21 +68,25 @@ int io_timeout_s() {
 
 StageRows stage_rows_agreed(uint32_t a, uint32_t b) {
     const uint32_t both = a & b & kStageRowsAll;
-    for (const StageRows f : {StageRows::BF16})   // the narrowest first
+    for (const StageRows f : {StageRows::FP8, StageRows::BF16})   // the narrowest first
         if ((both & (1u << (uint32_t) f)) != 0) return f;
     return StageRows::F32;
 }
 
-const char* stage_rows_name(StageRows f) { return f == StageRows::BF16 ? "bf16" : "fp32"; }
+const char* stage_rows_name(StageRows f) {
+    return f == StageRows::FP8 ? "fp8" : f == StageRows::BF16 ? "bf16" : "fp32";
+}
 
 bool stage_rows_parse(const std::string& name, StageRows& f) {
     if (name == "fp32") f = StageRows::F32;
     else if (name == "bf16") f = StageRows::BF16;
+    else if (name == "fp8") f = StageRows::FP8;
     else return false;
     return true;
 }
 
 size_t stage_rows_bytes(StageRows f, size_t rows, size_t width) {
+    if (f == StageRows::FP8) return rows * (width + 4 * ((width + kStageFp8Block - 1) / kStageFp8Block));
     return rows * width * (f == StageRows::BF16 ? 2 : 4);
 }
 
@@ -104,6 +111,98 @@ void bf16_decode_scalar(const unsigned char* s, size_t n, float* dst) {
         std::memcpy(&b, s + 2 * i, 2);
         const uint32_t u = (uint32_t) b << 16;
         std::memcpy(dst + i, &u, 4);
+    }
+}
+
+// ---- fp8 rows (StageRows::FP8): per block of kStageFp8Block values one fp32 scale and one OCP E4M3 byte a value.
+// The value by value code is the reference; the AVX2 code gives the same bits.
+constexpr size_t kFp8B = kStageFp8Block;
+constexpr float kFp8Max = 448.0f;   // E4M3's largest finite magnitude (code 0x7E)
+
+size_t fp8_blocks(size_t width) { return (width + kFp8B - 1) / kFp8B; }
+
+// One scaled value (|y| at most 448 or a hair over it from the scaling's rounding) to its E4M3 code, to nearest even.
+inline uint8_t fp8_code(float y) {
+    uint32_t u;
+    std::memcpy(&u, &y, 4);
+    const uint32_t a = u & 0x7fffffffu;
+    uint32_t c;
+    if (a < 0x3C800000u) {   // below 2^-6: E4M3's subnormals, steps of 2^-9 (8 steps is the smallest normal, code 8)
+        float ay;
+        std::memcpy(&ay, &a, 4);
+        c = (uint32_t) std::nearbyint(ay * 512.0f);
+    } else {   // fp32's exponent and top 3 mantissa bits, rounded; the exponent rebased from 127 to 7
+        const uint32_t r = a + 0x7ffffu + ((a >> 20) & 1u);
+        c = (r >> 20) - (120u << 3);
+    }
+    if (c > 0x7eu) c = 0x7eu;   // (0x7F is E4M3's NaN)
+    return (uint8_t) (((u >> 24) & 0x80u) | c);
+}
+
+// The magnitude of a code (its sign apart).
+inline float fp8_magnitude(uint8_t c) {
+    if ((c & 0x78u) == 0) return (float) (c & 7u) * (1.0f / 512.0f);
+    const uint32_t u = ((uint32_t) (c & 0x7fu) << 20) + (120u << 23);
+    float v;
+    std::memcpy(&v, &u, 4);
+    return v;
+}
+
+// A block's scale and the factor its values are multiplied by: a NaN or an infinity in it gives a NaN scale (the block
+// reads back as NaNs); a block of zeros (or of values below 1e-30, read back as zeros) gives 0 and 0.
+inline void fp8_scale(float amax, bool bad, float& scale, float& inv) {
+    if (bad) {
+        scale = std::numeric_limits<float>::quiet_NaN();
+        inv = 0.0f;
+    } else if (!(amax >= 1e-30f)) {
+        scale = 0.0f;
+        inv = 0.0f;
+    } else {
+        scale = amax / kFp8Max;
+        inv = kFp8Max / amax;
+    }
+}
+
+void fp8_block_amax_scalar(const float* x, size_t n, float& amax, bool& bad) {
+    for (size_t i = 0; i < n; ++i) {
+        const float a = std::fabs(x[i]);
+        if (!(a <= FLT_MAX)) bad = true;
+        else amax = std::max(amax, a);
+    }
+}
+
+void fp8_encode_rows_scalar(const float* src, size_t rows, size_t width, unsigned char* d) {
+    const size_t nb = fp8_blocks(width);
+    for (size_t r = 0; r < rows; ++r, src += width, d += 4 * nb + width) {
+        unsigned char* q = d + 4 * nb;
+        for (size_t b = 0; b < nb; ++b) {
+            const size_t lo = b * kFp8B, n = std::min(kFp8B, width - lo);
+            float amax = 0.0f, scale, inv;
+            bool bad = false;
+            fp8_block_amax_scalar(src + lo, n, amax, bad);
+            fp8_scale(amax, bad, scale, inv);
+            std::memcpy(d + 4 * b, &scale, 4);
+            for (size_t i = 0; i < n; ++i) q[lo + i] = fp8_code(src[lo + i] * inv);
+        }
+    }
+}
+
+void fp8_decode_block_scalar(const unsigned char* q, size_t n, float scale, float* dst) {
+    for (size_t i = 0; i < n; ++i) {
+        const float v = fp8_magnitude(q[i]) * scale;
+        dst[i] = (q[i] & 0x80u) != 0 ? -v : v;
+    }
+}
+
+void fp8_decode_rows_scalar(const unsigned char* s, size_t rows, size_t width, float* dst) {
+    const size_t nb = fp8_blocks(width);
+    for (size_t r = 0; r < rows; ++r, s += 4 * nb + width, dst += width) {
+        for (size_t b = 0; b < nb; ++b) {
+            const size_t lo = b * kFp8B, n = std::min(kFp8B, width - lo);
+            float scale;
+            std::memcpy(&scale, s + 4 * b, 4);
+            fp8_decode_block_scalar(s + 4 * nb + lo, n, scale, dst + lo);
+        }
     }
 }
 
@@ -170,6 +269,88 @@ STRATA_ROWS_AVX2 void bf16_decode_avx2(const unsigned char* s, size_t n, float* 
     bf16_decode_scalar(s + 2 * i, n - i, dst + i);
 }
 
+// fp8_code, eight at a time (the subnormal step's rounding: cvtps_epi32 under the default nearest-even mode, as
+// nearbyint's)
+STRATA_ROWS_AVX2 inline __m256i fp8_code8(__m256 y) {
+    const __m256i u = _mm256_castps_si256(y);
+    const __m256i a = _mm256_and_si256(u, _mm256_set1_epi32(0x7fffffff));
+    const __m256i sub = _mm256_cvtps_epi32(_mm256_mul_ps(_mm256_castsi256_ps(a), _mm256_set1_ps(512.0f)));
+    const __m256i r = _mm256_add_epi32(_mm256_add_epi32(a, _mm256_set1_epi32(0x7ffff)),
+                                       _mm256_and_si256(_mm256_srli_epi32(a, 20), _mm256_set1_epi32(1)));
+    const __m256i nrm = _mm256_sub_epi32(_mm256_srli_epi32(r, 20), _mm256_set1_epi32(120 << 3));
+    const __m256i is_sub = _mm256_cmpgt_epi32(_mm256_set1_epi32(0x3C800000), a);
+    const __m256i c = _mm256_min_epi32(_mm256_blendv_epi8(nrm, sub, is_sub), _mm256_set1_epi32(0x7e));
+    return _mm256_or_si256(c, _mm256_and_si256(_mm256_srli_epi32(u, 24), _mm256_set1_epi32(0x80)));
+}
+
+STRATA_ROWS_AVX2 void fp8_encode_rows_avx2(const float* src, size_t rows, size_t width, unsigned char* d) {
+    const size_t nb = fp8_blocks(width);
+    const __m256 absm = _mm256_castsi256_ps(_mm256_set1_epi32(0x7fffffff));
+    const __m256 fmax = _mm256_set1_ps(FLT_MAX);
+    const __m256i order = _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7);
+    for (size_t r = 0; r < rows; ++r, src += width, d += 4 * nb + width) {
+        unsigned char* q = d + 4 * nb;
+        for (size_t b = 0; b < nb; ++b) {
+            const size_t lo = b * kFp8B, n = std::min(kFp8B, width - lo);
+            const float* x = src + lo;
+            __m256 mx = _mm256_setzero_ps(), badm = _mm256_setzero_ps();
+            size_t i = 0;
+            for (; i + 8 <= n; i += 8) {
+                const __m256 ax = _mm256_and_ps(_mm256_loadu_ps(x + i), absm);
+                badm = _mm256_or_ps(badm, _mm256_cmp_ps(ax, fmax, _CMP_NLE_UQ));   // over FLT_MAX, or a NaN
+                mx = _mm256_max_ps(mx, ax);
+            }
+            alignas(32) float m8[8];
+            _mm256_store_ps(m8, mx);
+            float amax = 0.0f, scale, inv;
+            bool bad = _mm256_movemask_ps(badm) != 0;
+            for (int k = 0; k < 8; ++k) amax = std::max(amax, m8[k]);
+            fp8_block_amax_scalar(x + i, n - i, amax, bad);
+            fp8_scale(amax, bad, scale, inv);
+            std::memcpy(d + 4 * b, &scale, 4);
+            const __m256 vinv = _mm256_set1_ps(inv);
+            i = 0;
+            for (; i + 32 <= n; i += 32) {
+                const __m256i c0 = fp8_code8(_mm256_mul_ps(_mm256_loadu_ps(x + i), vinv));
+                const __m256i c1 = fp8_code8(_mm256_mul_ps(_mm256_loadu_ps(x + i + 8), vinv));
+                const __m256i c2 = fp8_code8(_mm256_mul_ps(_mm256_loadu_ps(x + i + 16), vinv));
+                const __m256i c3 = fp8_code8(_mm256_mul_ps(_mm256_loadu_ps(x + i + 24), vinv));
+                // the packs work within each 128-bit half (c0 0-3, c1 0-3, c2 0-3, c3 0-3 | the 4-7s): the dwords back
+                const __m256i p = _mm256_packus_epi16(_mm256_packus_epi32(c0, c1), _mm256_packus_epi32(c2, c3));
+                _mm256_storeu_si256((__m256i*) (q + lo + i), _mm256_permutevar8x32_epi32(p, order));
+            }
+            for (; i < n; ++i) q[lo + i] = fp8_code(x[i] * inv);
+        }
+    }
+}
+
+STRATA_ROWS_AVX2 void fp8_decode_rows_avx2(const unsigned char* s, size_t rows, size_t width, float* dst) {
+    const size_t nb = fp8_blocks(width);
+    for (size_t r = 0; r < rows; ++r, s += 4 * nb + width, dst += width) {
+        const unsigned char* q = s + 4 * nb;
+        for (size_t b = 0; b < nb; ++b) {
+            const size_t lo = b * kFp8B, n = std::min(kFp8B, width - lo);
+            float scale;
+            std::memcpy(&scale, s + 4 * b, 4);
+            const __m256 vs = _mm256_set1_ps(scale);
+            size_t i = 0;
+            for (; i + 8 <= n; i += 8) {
+                const __m256i c = _mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i*) (q + lo + i)));
+                const __m256 vn = _mm256_castsi256_ps(_mm256_add_epi32(
+                    _mm256_slli_epi32(_mm256_and_si256(c, _mm256_set1_epi32(0x7f)), 20), _mm256_set1_epi32(120 << 23)));
+                const __m256 vsub = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_and_si256(c, _mm256_set1_epi32(7))),
+                                                  _mm256_set1_ps(1.0f / 512.0f));
+                const __m256i is_sub =
+                    _mm256_cmpeq_epi32(_mm256_and_si256(c, _mm256_set1_epi32(0x78)), _mm256_setzero_si256());
+                const __m256 v = _mm256_mul_ps(_mm256_blendv_ps(vn, vsub, _mm256_castsi256_ps(is_sub)), vs);
+                const __m256 sg = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_and_si256(c, _mm256_set1_epi32(0x80)), 24));
+                _mm256_storeu_ps(dst + lo + i, _mm256_xor_ps(v, sg));
+            }
+            fp8_decode_block_scalar(q + lo + i, n - i, scale, dst + lo + i);
+        }
+    }
+}
+
 // AVX2 and the OS saving its registers (as kernels/cpu/expert_layout.cpp's cpu_avx2_ok looks)
 bool rows_avx2() {
     static const bool ok = [] {
@@ -226,6 +407,24 @@ bool stage_bf16_decode_isa(int isa, const void* src, size_t n, float* dst) {
     return false;
 }
 
+bool stage_fp8_encode_isa(int isa, const float* src, size_t rows, size_t width, void* dst) {
+    unsigned char* d = (unsigned char*) dst;
+    if (isa == 0 || isa == 1) { fp8_encode_rows_scalar(src, rows, width, d); return true; }
+#if defined(STRATA_ROWS_X86)
+    if (isa == 2 && rows_avx2()) { fp8_encode_rows_avx2(src, rows, width, d); return true; }
+#endif
+    return false;
+}
+
+bool stage_fp8_decode_isa(int isa, const void* src, size_t rows, size_t width, float* dst) {
+    const unsigned char* s = (const unsigned char*) src;
+    if (isa == 0 || isa == 1) { fp8_decode_rows_scalar(s, rows, width, dst); return true; }
+#if defined(STRATA_ROWS_X86)
+    if (isa == 2 && rows_avx2()) { fp8_decode_rows_avx2(s, rows, width, dst); return true; }
+#endif
+    return false;
+}
+
 int stage_rows_isa() {
 #if defined(STRATA_ROWS_X86)
     return rows_avx2() ? 2 : 1;
@@ -239,12 +438,14 @@ int stage_rows_isa() {
 void stage_rows_encode(StageRows f, const float* src, size_t rows, size_t width, void* dst) {
     const size_t n = rows * width;
     if (f == StageRows::F32) { std::memcpy(dst, src, n * 4); return; }
+    if (f == StageRows::FP8) { (void) detail::stage_fp8_encode_isa(detail::stage_rows_isa(), src, rows, width, dst); return; }
     (void) detail::stage_bf16_encode_isa(detail::stage_rows_isa(), src, n, dst);
 }
 
 void stage_rows_decode(StageRows f, const void* src, size_t rows, size_t width, float* dst) {
     const size_t n = rows * width;
     if (f == StageRows::F32) { std::memcpy(dst, src, n * 4); return; }
+    if (f == StageRows::FP8) { (void) detail::stage_fp8_decode_isa(detail::stage_rows_isa(), src, rows, width, dst); return; }
     (void) detail::stage_bf16_decode_isa(detail::stage_rows_isa(), src, n, dst);
 }
 
