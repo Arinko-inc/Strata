@@ -13633,10 +13633,17 @@ int main(int argc, char** argv) {
                     }
                     sp.set_hand_in(rows_in);
                     sp.set_single_chunk(only_chunk);
+                    sp.set_hand_flags(flags);   // a relay passes the main process's word on what follows on with the chunk
                     if (!sp.run(tokens, T, p0, e)) return false;
                     // (the chunk's rows are on the host: a relay's hand-off to the next worker and the reply are host
                     // buffers, so the loan's device memory is free once run returns)
-                    if (refill_early && only_chunk && !refill_early_issue(e)) {
+                    // the loan goes back early once windows follow this chunk: the main process says so (bit 1) when it
+                    // tells it at all (bit 2); an older main process only marks a read's only chunk (bit 0), which
+                    // windows almost always follow
+                    using strata::prefill::Prefill;
+                    const bool told = (flags & Prefill::kRemoteWindowTold) != 0;
+                    const bool window_next = told ? (flags & Prefill::kRemoteWindowNext) != 0 : only_chunk;
+                    if (refill_early && window_next && !refill_early_issue(e)) {
                         // not this chunk's failure: its rows are read, and a relay's next worker still owes their reply (an error
                         // here would leave that reply on the link).  The next refill() waits for what was queued and
                         // refills the whole loan again the usual way

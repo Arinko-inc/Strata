@@ -5728,7 +5728,15 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             // may already have forwarded its older chunk to later GPUs.
             if (on_stage_chunk && !on_stage_chunk(p0 + T, err)) return false;
             if (remote_send) {   // remote-stage: the worker reads the rest of the layers of this chunk
-                const int64_t flags = single_chunk ? 1 : 0;
+                static const bool window_bit = [] {
+                    const char* v = std::getenv("STRATA_REMOTE_WINDOW_BIT");
+                    return v == nullptr || std::atoi(v) != 0;
+                }();
+                int64_t flags = single_chunk ? 1 : 0;
+                if (hand_in_ != nullptr)   // a relay worker: the main process's word on what follows, as it came
+                    flags |= hand_flags_;
+                else if (window_bit)       // the main process: whether windows start where this chunk ends
+                    flags |= kRemoteWindowTold | (window_at_ >= 0 && p0 + T == window_at_ ? kRemoteWindowNext : 0);
                 const int64_t skip = std::max<int64_t>(0, std::min<int64_t>(remote_rows_from_ - p0, T));   // unread rows
                 send_err_.clear();
                 send_run_ = std::async(std::launch::async, [this, tokens, c0, T, p0, flags, h, skip] {
