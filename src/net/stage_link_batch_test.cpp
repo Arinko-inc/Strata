@@ -561,7 +561,7 @@ int main() {
         c.close();
         StageClient b;
         StageHello mb = mine;
-        mb.row_formats = kStageRowsAll;
+        mb.row_formats = (1u << (uint32_t) StageRows::F32) | (1u << (uint32_t) StageRows::BF16);   // (fp8 is narrower)
         StageHello pb;
         std::string eb;
         bool ball = b.connect(where, mb, pb, eb) && b.rows() == StageRows::BF16;
