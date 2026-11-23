@@ -12932,11 +12932,28 @@ int main(int argc, char** argv) {
         // waited for - the same copies into the same slots, so the same cache; one stage: refill_one exactly.
         // STRATA_REFILL_SERIAL=1: stage after stage, as 0.1.30/0.1.31.
         static const bool refill_serial = std::getenv("STRATA_REFILL_SERIAL") != nullptr;
+        // STRATA_WK_REFILL_EARLY (a stage worker): the copies of a read's only chunk's loan were queued as soon as the
+        // chunk was read (refill_early_issue), and host_res already names the slots; what is left is the wait and the
+        // residency upload.  Every path that reads the cache or lends again comes through refill() first.
+        bool refill_issued = false;
         auto refill = [&](std::string& e) -> bool {
             const auto t_rf = Clock::now();
             int64_t n_lent = 0, n_parts = 0;
             for (PfPart& p : pf_parts)
                 if (!p.lent.empty()) { n_lent += (int64_t) p.lent.size(); ++n_parts; }
+            if (refill_issued) {
+                refill_issued = false;
+                for (PfPart& p : pf_parts)
+                    if (!p.lent.empty() && !refill_wait(p, e)) return false;
+                if (n_parts > 0) res_upload();
+                if (trace && n_parts > 0) {
+                    std::fprintf(stderr, "strata trace: refilled %lld slots on %lld stage(s) (queued early): waited "
+                                         "%.1f ms\n", (long long) n_lent, (long long) n_parts,
+                                 std::chrono::duration<double, std::milli>(Clock::now() - t_rf).count());
+                    std::fflush(stderr);
+                }
+                return true;
+            }
             if (n_parts > 1 && !refill_serial) {
                 for (PfPart& p : pf_parts)
                     if (!p.lent.empty() && !refill_issue(p, e)) return false;
@@ -12955,6 +12972,25 @@ int main(int argc, char** argv) {
             }
             return true;
         };
+        // queue the copies that give every loan back, without waiting for them (refill() waits): a stage worker's
+        // read whose only chunk is done (STRATA_WK_REFILL_EARLY), so the copies run while the later stages read it
+        auto refill_early_issue = [&](std::string& e) -> bool {
+            if (refill_issued) return true;
+            const auto t_rf = Clock::now();
+            int64_t n_lent = 0;
+            for (PfPart& p : pf_parts)
+                if (!p.lent.empty()) {
+                    if (!refill_issue(p, e)) return false;
+                    n_lent += (int64_t) p.lent.size();
+                }
+            refill_issued = n_lent > 0;
+            if (trace && n_lent > 0) {
+                std::fprintf(stderr, "strata trace: queued the refill of %lld slots in %.1f ms\n", (long long) n_lent,
+                             std::chrono::duration<double, std::milli>(Clock::now() - t_rf).count());
+                std::fflush(stderr);
+            }
+            return true;
+        };
         // lend the slots `tokens` batched prompt tokens need: the prompt path's buffers for min(chunk, tokens
         // rounded up to 256), laid out in the last of the slots it may borrow - per participant, out of that
         // participant's own cache, and marking only that participant's own layers
@@ -12962,6 +12998,9 @@ int main(int argc, char** argv) {
         auto lend = [&](int64_t tokens, std::string& e, int64_t exact) -> bool {
             seg_lend = 0;
             if (pf_parts.empty()) return true;                     // its own buffers: nothing to lend
+            // a loan whose copies back were queued early is being overwritten: it cannot be kept, so it goes back
+            // first (the copies are waited for) and this read lends again
+            if (refill_issued && !refill(e)) return false;
             const auto t_ln = Clock::now();
             // what this segment needs, capped by the configured chunk: a request lends only what its own
             // prompt needs, so a large chunk costs a short prompt nothing
@@ -13530,8 +13569,21 @@ int main(int argc, char** argv) {
                     apply_pending(true);
                     // the prompt path's buffers out of this worker's cache, for the main process's chunk size or this
                     // worker's own (lend_chunk, the hello's choice; a loan that covers it stays for the rest of the
-                    // prompt)
-                    if (!lend(std::max<int64_t>(T, lend_chunk), e, 0)) return false;
+                    // prompt).  STRATA_WK_LEND_SINGLE=1 (read once; off by default): a chunk the main process marks as
+                    // its read's only one (flags bit 0) lends for its own rows instead - no later chunk of this read
+                    // needs the bigger loan, and the first window after it refills only what was lent
+                    static const bool lend_single = [] {
+                        const char* v = std::getenv("STRATA_WK_LEND_SINGLE");
+                        return v && v[0] != '0';
+                    }();
+                    // STRATA_WK_REFILL_EARLY=1 (read once; off by default): after such a chunk is read, the copies that
+                    // give its loan back are queued at once (refill_early_issue); the next window only waits for them
+                    static const bool refill_early = [] {
+                        const char* v = std::getenv("STRATA_WK_REFILL_EARLY");
+                        return v && v[0] != '0';
+                    }();
+                    const bool only_chunk = (flags & 1) != 0;
+                    if (!lend(lend_single && only_chunk ? T : std::max<int64_t>(T, lend_chunk), e, 0)) return false;
                     // a chunk lend() halved anyway (#2090) would leave rows out: an error, not a wrong reply
                     if (sp.chunk() < T) {
                         e = "this worker lends the prompt path buffers for " + std::to_string(sp.chunk()) +
@@ -13540,8 +13592,12 @@ int main(int argc, char** argv) {
                         return false;
                     }
                     sp.set_hand_in(rows_in);
-                    sp.set_single_chunk((flags & 1) != 0);
-                    return sp.run(tokens, T, p0, e);
+                    sp.set_single_chunk(only_chunk);
+                    if (!sp.run(tokens, T, p0, e)) return false;
+                    // (the chunk's rows are on the host: a relay's hand-off to the next worker and the reply are host
+                    // buffers, so the loan's device memory is free once run returns)
+                    if (refill_early && only_chunk && !refill_early_issue(e)) return false;
+                    return true;
                 };
                 if (stage_relay)   // the next worker's rows of a chunk, in chunk order, on the replying thread
                     hs.prefill_reply = [&next_link, D](float* rows_out, int64_t T, int64_t skip, std::string& e) {
