@@ -99,7 +99,19 @@ struct WeightRef {
     /// STRATA_HC_Q8 (experiment): non-null when `data` holds int8 codes [ne1][ne0] of a BF16 hyper-connection
     /// projection quantized Q8_0-style (one fp32 scale per 32 contiguous values, `q8_scale[ne1][ne0 / 32]`).
     const float* q8_scale = nullptr;
+    /// SYCL port, STRATA_HC_REQ8: the same codes and scales in the ESIMD read's table (`hc_req8_pack`), in their own
+    /// device allocation; `data` keeps the BF16 matrix (the prompt path and the single-token read use it).
+    const void* req8 = nullptr;
+    const float* req8_scale = nullptr;
 };
+
+/// SYCL port, STRATA_HC_REQ8: a BF16 matrix [rows][cols] (rows a multiple of 16, cols of 32) -> the device table of
+/// the ESIMD hyper-connection read (kernels/fused_gr_req8.hpp).  The codes are load_hc_q8's (Q8_0's rule per 32
+/// contiguous values of a row: d = amax / 127, q = round-to-nearest-even(x / d)); only their place differs:
+///   codes  [rows / 16][cols / 32][8 dwords][16 rows][4 bytes]: byte i of dword j of block b of row 16 g + l is the
+///          code of element (16 g + l, 32 b + 4 j + i)
+///   scales [rows / 16][cols / 32][16 rows]
+void hc_req8_pack(const uint16_t* bf16, size_t rows, size_t cols, std::vector<int8_t>& codes, std::vector<float>& scales);
 
 struct LoadReport {
     size_t tensors = 0;
@@ -143,6 +155,11 @@ public:
     /// are read from the pack, quantized to int8 + one fp32 scale per 32 values, and uploaded to their own device
     /// allocation (`q8_scale` set).  Returns the bytes uploaded in `bytes`.
     bool load_hc_q8(const std::string& pack_dir, uint64_t& bytes, std::string& err);
+    /// SYCL port, STRATA_HC_REQ8: the resident BF16 hyper-connection down / up projections of the layers
+    /// [layer_lo, layer_hi) also as `hc_req8_pack` tables on the device (`req8` / `req8_scale` set; the BF16 copy
+    /// stays).  Returns the bytes uploaded in `bytes`.
+    bool load_hc_req8(const std::string& pack_dir, uint64_t& bytes, std::string& err, int64_t layer_lo = 0,
+                      int64_t layer_hi = INT64_MAX);
     /// The tensor names `load_hc_q8` converts, for the loader's skip set.
     static void hc_q8_names(int64_t n_layers, std::set<std::string>& out);
     const std::map<std::string, WeightRef>& all() const { return table_; }

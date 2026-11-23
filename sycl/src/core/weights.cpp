@@ -9,6 +9,7 @@
 
 #include <chrono>
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -524,6 +525,88 @@ catch (sycl::exception const &exc) {
   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
             << ", line:" << __LINE__ << std::endl;
   std::exit(1);
+}
+
+void hc_req8_pack(const uint16_t* bf16, size_t rows, size_t cols, std::vector<int8_t>& codes, std::vector<float>& scales) {
+    const size_t nb = cols / 32;
+    codes.assign(rows * cols, 0);
+    scales.assign(rows * nb, 0.0f);
+    for (size_t r = 0; r < rows; ++r) {
+        const size_t g = r / 16, l = r % 16;
+        for (size_t b = 0; b < nb; ++b) {   // Q8_0's rule, as WeightTable::load_hc_q8 (CUDA / HIP): d = amax / 127, q = rne(x / d)
+            float x[32];
+            float amax = 0.f;
+            for (int j = 0; j < 32; ++j) {
+                const uint32_t u = (uint32_t) bf16[r * cols + b * 32 + j] << 16;   // bf16 -> f32 is exact
+                std::memcpy(&x[j], &u, 4);
+                amax = std::max(amax, std::fabs(x[j]));
+            }
+            const float d = amax / 127.f, id = d > 0.f ? 1.f / d : 0.f;
+            scales[(g * nb + b) * 16 + l] = d;
+            int8_t* blk = codes.data() + (g * nb + b) * 512;
+            for (int j = 0; j < 32; ++j) blk[(j / 4) * 64 + l * 4 + (j % 4)] = (int8_t) std::nearbyint(x[j] * id);
+        }
+    }
+}
+
+// SYCL port, STRATA_HC_REQ8 (weights.hpp).  Unlike CUDA / HIP's load_hc_q8 the BF16 matrices stay resident: the prompt
+// path's GEMMs and the single-token read take them as they are, and only the verify window reads the int8 tables.
+bool WeightTable::load_hc_req8(const std::string& pack_dir, uint64_t& bytes, std::string& err, int64_t layer_lo,
+                               int64_t layer_hi) {
+    bytes = 0;
+    sycl::queue& q = dpct::get_in_order_queue();
+    std::vector<uint16_t> src;
+    std::vector<int8_t> codes;
+    std::vector<float> scales;
+    for (auto& [name, w] : table_) {
+        const bool hc = name.find(".hc_attn_down.") != std::string::npos || name.find(".hc_attn_up.") != std::string::npos ||
+                        name.find(".hc_ffn_down.") != std::string::npos || name.find(".hc_ffn_up.") != std::string::npos;
+        if (!hc || !w.resident || w.req8 != nullptr || name.rfind("blk.", 0) != 0) continue;
+        const int64_t l = std::atoll(name.c_str() + 4);
+        if (l < layer_lo || l >= layer_hi) continue;
+        // the pack holds BF16 either promoted to f32 (4 B/elem) or as it is in the GGUF (a native pack, 2 B/elem)
+        if (w.kind != WeightKind::Bf16InF32 || w.ne0 % 32 != 0 || w.ne1 % 16 != 0 ||
+            (w.src_bytes != (uint64_t) w.elements * 4 && w.src_bytes != (uint64_t) w.elements * 2)) {
+            err = "STRATA_HC_REQ8: " + name + " is not a BF16 tensor of whole 32-value blocks and 16-row groups";
+            return false;
+        }
+        const char* fn = file_name(w.file_id);
+        const std::string path = pack_dir + "/" + (fn ? fn : "?");
+        std::FILE* f = std::fopen(path.c_str(), "rb");
+        if (!f) { err = "STRATA_HC_REQ8: cannot open " + path; return false; }
+        src.resize((size_t) w.elements);
+        const bool raw16 = w.src_bytes == (uint64_t) w.elements * 2;
+        std::string rerr;
+        bool ok;
+        if (raw16) {
+            ok = read_at(f, w.src_off, src.data(), src.size() * 2, rerr, name.c_str());
+        } else {
+            std::vector<uint32_t> wide(src.size());
+            ok = read_at(f, w.src_off, wide.data(), wide.size() * 4, rerr, name.c_str());
+            for (size_t i = 0; ok && i < wide.size(); ++i) {
+                if (wide[i] & 0xffffu) { ok = false; rerr = name + ": an f32 value is not a BF16 value"; break; }
+                src[i] = (uint16_t) (wide[i] >> 16);
+            }
+        }
+        std::fclose(f);
+        if (!ok) { err = "STRATA_HC_REQ8: " + rerr; return false; }
+        hc_req8_pack(src.data(), (size_t) w.ne1, (size_t) w.ne0, codes, scales);
+        auto* dc = (int8_t*) sycl::malloc_device(codes.size(), q);
+        auto* ds = (float*) sycl::malloc_device(scales.size() * 4, q);
+        if (dc == nullptr || ds == nullptr) { err = "STRATA_HC_REQ8: no device memory for " + name; return false; }
+        try {
+            q.memcpy(dc, codes.data(), codes.size());
+            q.memcpy(ds, scales.data(), scales.size() * 4);
+            q.wait_and_throw();
+        } catch (const sycl::exception& e) {
+            err = std::string("STRATA_HC_REQ8: upload failed: ") + e.what();
+            return false;
+        }
+        w.req8 = dc;
+        w.req8_scale = ds;
+        bytes += codes.size() + scales.size() * 4;
+    }
+    return true;
 }
 
 const WeightRef* WeightTable::find(const std::string& name) const {

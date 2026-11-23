@@ -40,6 +40,7 @@
 #include "strata/core/gguf_expert_source.hpp"
 namespace strata::prefill { void set_nonresident_share(double share); }   // SYCL port: prefill.cpp
 #include "strata/kernels/resident_plan_mirror.hpp"
+#include "strata/kernels/fused_gr_req8.hpp"
 #include "strata/core/pinned.hpp"
 #include "strata/core/remote_experts.hpp"
 #include "strata/core/on_device.hpp"
@@ -3095,6 +3096,23 @@ int main(int argc, char **argv) try {
     if (!wt.load(o.pack, arena, pool_bytes, err, skip.empty() ? nullptr : &skip)) {
         std::fprintf(stderr, "strata generate: %s\n", err.c_str());
         return 1;
+    }
+    // SYCL port, STRATA_HC_REQ8=1 (opt-in, changes the output): the verify window reads the hyper-connection down / up
+    // projections as int8 + an fp32 scale per 32 values (CUDA / HIP's STRATA_HC_REQ8 codes) on ESIMD.  The BF16 copies
+    // stay (the prompt path reads them); a remote stage converts its own layers only.  Before the expert cache is sized.
+    if (const char* e = std::getenv("STRATA_HC_REQ8"); e != nullptr && std::atoi(e) != 0) {
+        if (!strata::kernels::hc_req8_built()) {
+            std::fprintf(stderr, "strata generate: STRATA_HC_REQ8 needs the ESIMD kernels (a Battlemage build): not in this build\n");
+            return 1;
+        }
+        uint64_t qb = 0;
+        // [own_lo, own_hi) is every layer unless this is a remote stage (own_hi -1: to the last layer)
+        if (!wt.load_hc_req8(o.pack, qb, err, own_lo, own_hi >= 0 ? own_hi : INT64_MAX)) {
+            std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+            return 1;
+        }
+        std::fprintf(stderr, "strata generate: STRATA_HC_REQ8: hyper-connection projections also as int8 + fp32/32 scales "
+                             "for the verify window, %llu MiB\n", (unsigned long long) (qb >> 20));
     }
     std::fprintf(stderr, "strata generate: %llu MiB of weights loaded from %s in %.1f s (%zu canonical tensors "
                          "skipped: served natively)\n",
