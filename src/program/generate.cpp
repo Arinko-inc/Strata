@@ -18323,7 +18323,17 @@ int main(int argc, char** argv) {
                 const int64_t read_to = merge_at >= 0 ? merge_at : to;   // (merge_at > at: the part's windows before it)
                 const auto tsp = Clock::now();
                 pp_exact = false;   // a batched or pipelined part is in flight: a cancel may leave the state past pp_reached
+                // remote-stage: a batched part that windows follow (the next part goes through them, or it is the
+                // last part and the reply's first window reads the last prompt token) says so with its last chunk,
+                // so a worker can give its loan back while the later stages still read that chunk
+                if (remote_main && !win) {
+                    int64_t next_to = -1;
+                    for (const int64_t c : cuts)
+                        if (c > to) { next_to = c; break; }
+                    sp.set_window_at((next_to < 0 ? max_new > 0 : windows_ok(to, next_to)) ? to : -1);   // (a prefill-only request has no window)
+                }
                 const bool sp_ok = read_to <= at || (win ? read_windows(at, read_to, err) : read_part(at, to, err));
+                if (remote_main) sp.set_window_at(-1);
                 if (sp_ok) pp_exact = true;
                 if (trace) {
                     const double ms = std::chrono::duration<double, std::milli>(Clock::now() - tsp).count();
