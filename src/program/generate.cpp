@@ -13552,6 +13552,7 @@ int main(int argc, char** argv) {
                     }
                     sp.set_hand_in(rows_in);
                     sp.set_single_chunk((flags & 1) != 0);
+                    sp.set_hand_flags(flags);   // a relay passes the main process's word on what follows on with the chunk
                     return sp.run(tokens, T, p0, e);
                 };
                 if (stage_relay)   // the next worker's rows of a chunk, in chunk order, on the replying thread
@@ -18226,7 +18227,7 @@ int main(int argc, char** argv) {
                     int64_t next_to = -1;
                     for (const int64_t c : cuts)
                         if (c > to) { next_to = c; break; }
-                    sp.set_window_at(next_to < 0 || windows_ok(to, next_to) ? to : -1);
+                    sp.set_window_at((next_to < 0 ? max_new > 0 : windows_ok(to, next_to)) ? to : -1);   // (a prefill-only request has no window)
                 }
                 const bool sp_ok = read_to <= at || (win ? read_windows(at, read_to, err) : read_part(at, to, err));
                 if (remote_main) sp.set_window_at(-1);
