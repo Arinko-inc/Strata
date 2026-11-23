@@ -3739,9 +3739,10 @@ void native_iq4_xs_f32(const void* weights, const float* x, void* scratch_q8_1,
 //       kernel (its launch is cheaper: 4-7 us against 4.5-15 us on the B70, 2026-11-24).  STRATA_MMVQ_ESIMD_RPT:
 //       1, 2, 4 or 8 for every matrix; unset or 0: 2, and 1 for 1 or 4 columns of a matrix of at most 2560 inputs
 //       and 8192 rows (the B70's measurements of orca's layers 30-47: bench/2026-11-24-b70gemv).
-//       STRATA_MMVQ_ESIMD_LOOP: 0 = four 256-blocks per loop iteration (the kernels of 2026-11-24), 1 = one block per
-//       iteration (a quarter of the code: the 2-row 4-column kernel of 0 is 38.7 KB and ran 1.5-2 times slower per
-//       block than the kernels below 29 KB); unset: by the shape (mmvq_esimd_loop).  Same bits either way.
+//       STRATA_MMVQ_ESIMD_LOOP: 0 = four 256-blocks per loop iteration for every matrix (the kernels and the
+//       choice of rows of 2026-11-24 morning), 2 = one block per iteration with the lane sums at a run-time offset
+//       for every matrix; unset: 2 with 2 rows for 4 columns of a matrix of more than 2560 inputs or 8192 rows
+//       (there 0's 2-row kernel is not allocated round-robin and runs 4-5 us slower per call), else 0.  Same bits.
 // 1 keeps every output's integer and float operations and their order: mmvq_esimd_bench compares it with the wide
 // kernel bit for bit on a model's own matrices (rerun it after a compiler update: it relies on how the compiler
 // contracts WideQ4K::apply's float expression).  Any other value, or 1 in a build without ESIMD, is refused at start.
@@ -3773,8 +3774,8 @@ int mmvq_esimd_rpt_parse() {
 int mmvq_esimd_loop_parse() {   // -1: unset (by the shape)
     const char* e = std::getenv("STRATA_MMVQ_ESIMD_LOOP");
     if (!e || !*e) return -1;
-    if ((e[0] != '0' && e[0] != '1') || e[1] != '\0') {
-        std::fprintf(stderr, "STRATA_MMVQ_ESIMD_LOOP=%s: 0 (four 256-blocks per loop iteration) or 1 (one)\n", e);
+    if ((e[0] != '0' && e[0] != '2') || e[1] != '\0') {
+        std::fprintf(stderr, "STRATA_MMVQ_ESIMD_LOOP=%s: 0 (four 256-blocks per loop iteration) or 2 (one)\n", e);
         std::exit(1);
     }
     return e[0] - '0';
@@ -3787,16 +3788,14 @@ int g_mmvq_esimd = -1;   // native_mmvq_set_esimd (the bench); < 0: the environm
 void native_mmvq_set_esimd(int v) { g_mmvq_esimd = v; }
 namespace {
 constexpr int kEsimdMinRows = 2048;
-// q4k_mmvq_esimd's rpt argument: rows per hardware thread + 400 * the loop's shape
-int mmvq_esimd_loop(int /*n_in*/, int /*n_out*/, int /*ncols*/) {
-    if (g_mmvq_esimd_loop >= 0) return g_mmvq_esimd_loop;
-    return 0;   // WIP: the rule is set from the B70's measurements
-}
+// q4k_mmvq_esimd's rpt argument: rows per hardware thread + 400 * the loop's shape (B70, orca's layers 30-47:
+// bench/2026-11-24-b70gemv for LOOP 0's rows, bench/2026-11-24-b70t4 for 4 columns)
 int mmvq_esimd_rpt(int n_in, int n_out, int ncols) {
-    const int loop = mmvq_esimd_loop(n_in, n_out, ncols);
+    const bool small = n_in <= 2560 && n_out <= 8192;
+    const int loop = g_mmvq_esimd_loop >= 0 ? g_mmvq_esimd_loop : (ncols == 4 && !small ? 2 : 0);
     if (g_mmvq_esimd_rpt) return g_mmvq_esimd_rpt + 400 * loop;
-    if (loop == 0) return ((ncols == 1 || ncols == 4) && n_in <= 2560 && n_out <= 8192) ? 1 : 2;
-    return 2 + 400;   // WIP
+    if (loop == 0) return ((ncols == 1 || ncols == 4) && small) ? 1 : 2;
+    return 2 + 400 * loop;
 }
 }  // namespace
 int native_mmvq_esimd() { return g_mmvq_esimd >= 0 ? g_mmvq_esimd : g_mmvq_esimd_env; }

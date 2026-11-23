@@ -17,15 +17,19 @@
 // The loads take dword-aligned addresses: the weights and the Q8_1 buffer must sit at multiples of 4 (the launch checks).
 //
 // LOOP: how the thread walks a row's 256-blocks (the four lane sums of a (row, column) are the blocks kb % 4 = 0..3).
-//   0  four blocks per iteration, each adding into its own lane sum (the first shape, 2026-11-24).  The kernel's code
-//      is four copies of a block's work: with 2 rows and 4 columns 38.7 KB, and every kernel above about 32 KB
-//      (2 rows x 4 columns, 4 x 2, 8 x 1) ran 1.5-2 times slower per block than the ones below 29 KB
+//   0  four blocks per iteration, each adding into its own lane sum (the first shape, 2026-11-24)
 //   1  one block per iteration: the block adds into lane sum 0 and the four sums rotate (sum i holds lane (kb + i) % 4;
 //      the final tree pairs sums (0, 2) and (1, 3), which are lanes {0, 2} and {1, 3} whatever the rotation, and float
 //      adds commute, so the bits are those of 0)
 //   2  one block per iteration, the four sums in one 32-float register read and written at the run-time offset
 //      8 * (kb % 4)
-// The experiment's variants (VAR 1..9, the 128-register file, the chained dp4a, the LOOP that the engine does not use)
+// All three give the wide kernel's bits.  On the B70 (2026-11-24, bench/2026-11-24-b70t4) a thread's time per block
+// went with the device compiler's register allocation, not with spills (none up to 2 rows x 4 columns; every ESIMD
+// kernel of an AOT build has 128 registers, grf_size<256> does not reach it) and not with the code's size (LOOP 1 is
+// a third of LOOP 0's and as slow): kernels allocated round-robin ran in proportion to rows x columns, the others
+// (first fit, graph colouring: 2 x 4 and 4 x 2 of LOOP 0 and 1, anything of 4 rows x 3 columns or more) 1.3 to 10
+// times slower.  LOOP 2 keeps 2 rows x 4 columns round-robin; the engine uses it there (native_mmvq.dp.cpp).
+// The experiment's variants (VAR 1..9, the 128-register file, the chained dp4a, LOOP 1)
 // are built only with STRATA_Q4KE_EXP, and then under the names q4k_mmvq_esimd_exp / Q4kMmvqExpTag: mmvq_esimd_bench
 // compiles this file a second time that way, so the engine's binary carries the engine's kernels only.
 #include <sycl/sycl.hpp>
@@ -375,9 +379,9 @@ bool STRATA_Q4KE_FN(const void* weights, const void* x_q8_1, float* y, int n_in,
     if (var < 0) var = kVar;
 #define STRATA_Q4KE(RP, VA, GR, DO, LO) if (rpt == RP + (GR == 128 ? 100 : 0) + 200 * DO + 400 * LO && var == VA) return launch_nc<RP, VA, GR, DO, LO>(q, w, x, y, n_in, n_out, ncols);
     STRATA_Q4KE(1, kVar, 256, 0, 0) STRATA_Q4KE(2, kVar, 256, 0, 0) STRATA_Q4KE(4, kVar, 256, 0, 0) STRATA_Q4KE(8, kVar, 256, 0, 0)
-    STRATA_Q4KE(1, kVar, 256, 0, 1) STRATA_Q4KE(2, kVar, 256, 0, 1) STRATA_Q4KE(4, kVar, 256, 0, 1) STRATA_Q4KE(8, kVar, 256, 0, 1)
-#ifdef STRATA_Q4KE_EXP
     STRATA_Q4KE(1, kVar, 256, 0, 2) STRATA_Q4KE(2, kVar, 256, 0, 2) STRATA_Q4KE(4, kVar, 256, 0, 2) STRATA_Q4KE(8, kVar, 256, 0, 2)
+#ifdef STRATA_Q4KE_EXP
+    STRATA_Q4KE(1, kVar, 256, 0, 1) STRATA_Q4KE(2, kVar, 256, 0, 1) STRATA_Q4KE(4, kVar, 256, 0, 1) STRATA_Q4KE(8, kVar, 256, 0, 1)
     STRATA_Q4KE(2, 1, 256, 0, 0) STRATA_Q4KE(2, 2, 256, 0, 0) STRATA_Q4KE(2, 3, 256, 0, 0) STRATA_Q4KE(2, 4, 256, 0, 0) STRATA_Q4KE(2, 5, 256, 0, 0)
     STRATA_Q4KE(2, 6, 256, 0, 0) STRATA_Q4KE(2, 7, 256, 0, 0) STRATA_Q4KE(2, 8, 256, 0, 0) STRATA_Q4KE(2, 9, 256, 0, 0)
     STRATA_Q4KE(1, kVar, 128, 0, 0) STRATA_Q4KE(2, kVar, 128, 0, 0) STRATA_Q4KE(4, kVar, 128, 0, 0)
