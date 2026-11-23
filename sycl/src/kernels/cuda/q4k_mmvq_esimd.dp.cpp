@@ -15,22 +15,44 @@
 // go through an xor with a run-time zero.  mmvq_esimd_bench checks the bits against the wide kernel on a model's own
 // matrices, and has to be rerun after a compiler update.
 // The loads take dword-aligned addresses: the weights and the Q8_1 buffer must sit at multiples of 4 (the launch checks).
+//
+// LOOP: how the thread walks a row's 256-blocks (the four lane sums of a (row, column) are the blocks kb % 4 = 0..3).
+//   0  four blocks per iteration, each adding into its own lane sum (the first shape, 2026-11-24).  The kernel's code
+//      is four copies of a block's work: with 2 rows and 4 columns 38.7 KB, and every kernel above about 32 KB
+//      (2 rows x 4 columns, 4 x 2, 8 x 1) ran 1.5-2 times slower per block than the ones below 29 KB
+//   1  one block per iteration: the block adds into lane sum 0 and the four sums rotate (sum i holds lane (kb + i) % 4;
+//      the final tree pairs sums (0, 2) and (1, 3), which are lanes {0, 2} and {1, 3} whatever the rotation, and float
+//      adds commute, so the bits are those of 0)
+//   2  one block per iteration, the four sums in one 32-float register read and written at the run-time offset
+//      8 * (kb % 4)
+// The experiment's variants (VAR 1..9, the 128-register file, the chained dp4a, the LOOP that the engine does not use)
+// are built only with STRATA_Q4KE_EXP, and then under the names q4k_mmvq_esimd_exp / Q4kMmvqExpTag: mmvq_esimd_bench
+// compiles this file a second time that way, so the engine's binary carries the engine's kernels only.
 #include <sycl/sycl.hpp>
 #include <sycl/ext/intel/esimd.hpp>
 #include <sycl/ext/intel/experimental/grf_size_properties.hpp>
 #include <cstdint>
 #include "strata/sycl_queue.hpp"
 
+#ifdef STRATA_Q4KE_EXP
+#define STRATA_Q4KE_FN q4k_mmvq_esimd_exp
+#define STRATA_Q4KE_TAG Q4kMmvqExpTag
+#else
+#define STRATA_Q4KE_FN q4k_mmvq_esimd
+#define STRATA_Q4KE_TAG Q4kMmvqTag
+#endif
 namespace strata::kernels {
 bool q4k_mmvq_esimd_built();
-bool q4k_mmvq_esimd(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ncols, void* stream,
+bool STRATA_Q4KE_FN(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ncols, void* stream,
                     int rpt, int var);
 }
 
 #ifdef STRATA_I8_NO_ESIMD
 namespace strata::kernels {
+#ifndef STRATA_Q4KE_EXP
 bool q4k_mmvq_esimd_built() { return false; }
-bool q4k_mmvq_esimd(const void*, const void*, float*, int, int, int, void*, int, int) { return false; }
+#endif
+bool STRATA_Q4KE_FN(const void*, const void*, float*, int, int, int, void*, int, int) { return false; }
 }  // namespace strata::kernels
 #else
 namespace strata::kernels {
@@ -38,7 +60,7 @@ namespace {
 using namespace sycl::ext::intel::esimd;
 using sycl::half;
 
-template <int NC, int RPT, int VAR, int GRF, int DOT> struct Q4kMmvqTag;
+template <int NC, int RPT, int VAR, int GRF, int DOT, int LOOP> struct STRATA_Q4KE_TAG;
 
 SYCL_ESIMD_FUNCTION inline simd<float, 8> fma8(simd<float, 8> a, simd<float, 8> b, simd<float, 8> c) {
     return simd<float, 8>(__builtin_elementwise_fma(a.data(), b.data(), c.data()));
@@ -122,7 +144,88 @@ SYCL_ESIMD_FUNCTION inline simd<float, 8> term(const Wt& w, const Act& x, simd<u
     }
 }
 
-template <int NC, int RPT, int VAR, int GRF, int DOT>
+// a column's 8 Q8_1 blocks of 256-block kb.  Q8_1 blocks of 9 dwords (ds, 8 of qs), 72 dwords: L0 = dwords 0..31,
+// L1 = 28..59, L2 = 40..71
+template <int DOT>
+SYCL_ESIMD_FUNCTION inline void load_act(Act& A, const uint32_t* xp) {
+    simd<uint32_t, 32> L0 = block_load<uint32_t, 32>(xp);
+    simd<uint32_t, 32> L1 = block_load<uint32_t, 32>(xp + 28);
+    simd<uint32_t, 32> L2 = block_load<uint32_t, 32>(xp + 40);
+    simd<uint32_t, 32> a, c;
+    a.select<8, 1>(0) = L0.template select<8, 1>(1);      // block 0
+    c.select<8, 1>(0) = L0.template select<8, 1>(10);     // 1
+    a.select<8, 1>(8) = L0.template select<8, 1>(19);     // 2
+    c.select<8, 1>(8) = L1.template select<8, 1>(0);      // 3
+    a.select<8, 1>(16) = L1.template select<8, 1>(9);     // 4
+    c.select<8, 1>(16) = L1.template select<8, 1>(18);    // 5
+    a.select<8, 1>(24) = L2.template select<8, 1>(15);    // 6
+    c.select<8, 1>(24) = L2.template select<8, 1>(24);    // 7
+    simd<uint32_t, 8> ds;   // d of blocks 0, 2, 4, 6, then 1, 3, 5, 7
+    ds.select<2, 1>(0) = L0.template select<2, 18>(0);
+    ds.select<1, 1>(2) = L1.template select<1, 1>(8);
+    ds.select<1, 1>(3) = L2.template select<1, 1>(14);
+    ds.select<2, 1>(4) = L0.template select<2, 18>(9);
+    ds.select<1, 1>(6) = L1.template select<1, 1>(17);
+    ds.select<1, 1>(7) = L2.template select<1, 1>(23);
+    auto dsh = ds.template bit_cast_view<half>();
+    simd<half, 8> dh8 = dsh.template select<8, 2>(0);
+    simd<float, 8> df = dh8;
+    simd<float, 4> da4 = df.template select<4, 1>(0), dc4 = df.template select<4, 1>(4);
+    A.a = a.template bit_cast_view<int>();
+    A.c = c.template bit_cast_view<int>();
+    A.da = twice(da4);
+    A.dc = twice(dc4);
+    const simd<int, 32> ones(0x01010101);
+    A.sa = dot8<DOT>(ones, A.a);
+    A.sc = dot8<DOT>(ones, A.c);
+}
+// a row's 256-block (144 bytes: d, dmin (fp16), scales[12], qs[128])
+SYCL_ESIMD_FUNCTION inline void load_wt(Wt& W, const uint32_t* wp) {
+    simd<uint32_t, 4> H = block_load<uint32_t, 4>(wp);
+    simd<uint32_t, 32> Q = block_load<uint32_t, 32>(wp + 4);
+    simd<uint32_t, 32> lq = Q & 0x0F0F0F0Fu;
+    simd<uint32_t, 32> hq = (Q >> 4) & 0x0F0F0F0Fu;
+    W.l = lq.template bit_cast_view<int>();
+    W.h = hq.template bit_cast_view<int>();
+    // ggml's get_scale_min_k4 for the 8 sub-blocks: scales j < 4 in bytes j (6 bits), mins in bytes j + 4;
+    // j >= 4: the low / high nibble of byte j + 4 with the top 2 bits of byte j - 4 / byte j
+    auto H8 = H.template bit_cast_view<uint8_t>();
+    simd<uint8_t, 4> b0 = H8.template select<4, 1>(4), b1 = H8.template select<4, 1>(8), b2 = H8.template select<4, 1>(12);
+    simd<uint32_t, 4> s0 = b0, s1 = b1, s2 = b2;
+    simd<uint32_t, 4> sl = s0 & 63u, mlo = s1 & 63u;
+    simd<uint32_t, 4> sh = (s2 & 15u) | ((s0 >> 6) << 4), mhi = (s2 >> 4) | ((s1 >> 6) << 4);
+    simd<uint32_t, 4> se, so, me, mo;   // sub-blocks 0, 2, 4, 6 and 1, 3, 5, 7
+    se.select<2, 1>(0) = sl.template select<2, 2>(0);
+    se.select<2, 1>(2) = sh.template select<2, 2>(0);
+    so.select<2, 1>(0) = sl.template select<2, 2>(1);
+    so.select<2, 1>(2) = sh.template select<2, 2>(1);
+    me.select<2, 1>(0) = mlo.template select<2, 2>(0);
+    me.select<2, 1>(2) = mhi.template select<2, 2>(0);
+    mo.select<2, 1>(0) = mlo.template select<2, 2>(1);
+    mo.select<2, 1>(2) = mhi.template select<2, 2>(1);
+    auto Hh = H.template bit_cast_view<half>();
+    simd<half, 2> dmh = Hh.template select<2, 1>(0);
+    simd<float, 2> dmf = dmh;
+    const float dx = dmf[0], dy = dmf[1];
+    simd<float, 4> fse = se, fso = so, fme = me, fmo = mo;
+    simd<float, 4> dl4 = fse * dx, dh4 = fso * dx, ml4 = fme * dy, mh4 = fmo * dy;
+    W.dl = twice(dl4);
+    W.dh = twice(dh4);
+    W.ml = twice(ml4);
+    W.mh = twice(mh4);
+}
+// the butterfly's tree over a (row, column)'s four lane sums
+SYCL_ESIMD_FUNCTION inline float tree(simd<float, 8> a0, simd<float, 8> a1, simd<float, 8> a2, simd<float, 8> a3) {
+    simd<float, 8> u0 = a0 + a2;
+    simd<float, 8> u1 = a1 + a3;
+    simd<float, 8> u = u0 + u1;
+    simd<float, 4> t4 = u.template select<4, 1>(0) + u.template select<4, 1>(4);
+    simd<float, 2> t2 = t4.template select<2, 1>(0) + t4.template select<2, 1>(2);
+    const float v0 = t2[0], v1 = t2[1];
+    return v0 + v1;
+}
+
+template <int NC, int RPT, int VAR, int GRF, int DOT, int LOOP>
 void launch(sycl::queue& q, const uint8_t* w, const uint32_t* x, float* y, int n_in, int n_out) {
     const size_t threads = ((size_t) n_out + RPT - 1) / RPT;
     auto kernel = [=](sycl::id<1> id) SYCL_ESIMD_KERNEL {
@@ -130,141 +233,139 @@ void launch(sycl::queue& q, const uint8_t* w, const uint32_t* x, float* y, int n
         const size_t xcol = (size_t) (n_in / 32) * 9;   // dwords of a column's Q8_1 blocks
         const int row0 = (int) id[0] * RPT;
         const simd<uint32_t, 8> zz((uint32_t) (n_out >> 31));   // 0, unknown to the compiler
-        simd<float, 8> acc[RPT][4][NC];
-#pragma unroll
-        for (int r = 0; r < RPT; ++r)
-#pragma unroll
-            for (int s = 0; s < 4; ++s)
-#pragma unroll
-                for (int j = 0; j < NC; ++j) acc[r][s][j] = simd<float, 8>(0.0f);
         const uint8_t* wr[RPT];
 #pragma unroll
         for (int r = 0; r < RPT; ++r) wr[r] = w + (size_t) (row0 + r < n_out ? row0 + r : row0) * bpr * 144;
-        for (int kb4 = 0; kb4 < bpr; kb4 += 4) {
+        if constexpr (LOOP == 0) {
+            simd<float, 8> acc[RPT][4][NC];
 #pragma unroll
-            for (int s = 0; s < 4; ++s) {
-                const int kb = kb4 + s;
-                if (kb >= bpr) break;
-                Act X[NC];
+            for (int r = 0; r < RPT; ++r)
 #pragma unroll
-                for (int j = 0; j < NC; ++j) {
-                    // Q8_1 blocks of 9 dwords (ds, 8 of qs), 72 dwords: L0 = dwords 0..31, L1 = 28..59, L2 = 40..71
-                    const uint32_t* xp = x + (size_t) j * xcol + (size_t) kb * 72;
-                    simd<uint32_t, 32> L0 = block_load<uint32_t, 32>(xp);
-                    simd<uint32_t, 32> L1 = block_load<uint32_t, 32>(xp + 28);
-                    simd<uint32_t, 32> L2 = block_load<uint32_t, 32>(xp + 40);
-                    simd<uint32_t, 32> a, c;
-                    a.select<8, 1>(0) = L0.template select<8, 1>(1);      // block 0
-                    c.select<8, 1>(0) = L0.template select<8, 1>(10);     // 1
-                    a.select<8, 1>(8) = L0.template select<8, 1>(19);     // 2
-                    c.select<8, 1>(8) = L1.template select<8, 1>(0);      // 3
-                    a.select<8, 1>(16) = L1.template select<8, 1>(9);     // 4
-                    c.select<8, 1>(16) = L1.template select<8, 1>(18);    // 5
-                    a.select<8, 1>(24) = L2.template select<8, 1>(15);    // 6
-                    c.select<8, 1>(24) = L2.template select<8, 1>(24);    // 7
-                    simd<uint32_t, 8> ds;   // d of blocks 0, 2, 4, 6, then 1, 3, 5, 7
-                    ds.select<2, 1>(0) = L0.template select<2, 18>(0);
-                    ds.select<1, 1>(2) = L1.template select<1, 1>(8);
-                    ds.select<1, 1>(3) = L2.template select<1, 1>(14);
-                    ds.select<2, 1>(4) = L0.template select<2, 18>(9);
-                    ds.select<1, 1>(6) = L1.template select<1, 1>(17);
-                    ds.select<1, 1>(7) = L2.template select<1, 1>(23);
-                    auto dsh = ds.template bit_cast_view<half>();
-                    simd<half, 8> dh8 = dsh.template select<8, 2>(0);
-                    simd<float, 8> df = dh8;
-                    simd<float, 4> da4 = df.template select<4, 1>(0), dc4 = df.template select<4, 1>(4);
-                    Act& A = X[j];
-                    A.a = a.template bit_cast_view<int>();
-                    A.c = c.template bit_cast_view<int>();
-                    A.da = twice(da4);
-                    A.dc = twice(dc4);
-                    const simd<int, 32> ones(0x01010101);
-                    A.sa = dot8<DOT>(ones, A.a);
-                    A.sc = dot8<DOT>(ones, A.c);
-                }
+                for (int s = 0; s < 4; ++s)
 #pragma unroll
-                for (int r = 0; r < RPT; ++r) {
-                    const uint32_t* wp = (const uint32_t*) (wr[r] + (size_t) kb * 144);
-                    simd<uint32_t, 4> H = block_load<uint32_t, 4>(wp);          // d, dmin (fp16), scales[12]
-                    simd<uint32_t, 32> Q = block_load<uint32_t, 32>(wp + 4);    // qs[128]
-                    simd<uint32_t, 32> lq = Q & 0x0F0F0F0Fu;
-                    simd<uint32_t, 32> hq = (Q >> 4) & 0x0F0F0F0Fu;
-                    Wt W;
-                    W.l = lq.template bit_cast_view<int>();
-                    W.h = hq.template bit_cast_view<int>();
-                    // ggml's get_scale_min_k4 for the 8 sub-blocks: scales j < 4 in bytes j (6 bits), mins in bytes j + 4;
-                    // j >= 4: the low / high nibble of byte j + 4 with the top 2 bits of byte j - 4 / byte j
-                    auto H8 = H.template bit_cast_view<uint8_t>();
-                    simd<uint8_t, 4> b0 = H8.template select<4, 1>(4), b1 = H8.template select<4, 1>(8), b2 = H8.template select<4, 1>(12);
-                    simd<uint32_t, 4> s0 = b0, s1 = b1, s2 = b2;
-                    simd<uint32_t, 4> sl = s0 & 63u, mlo = s1 & 63u;
-                    simd<uint32_t, 4> sh = (s2 & 15u) | ((s0 >> 6) << 4), mhi = (s2 >> 4) | ((s1 >> 6) << 4);
-                    simd<uint32_t, 4> se, so, me, mo;   // sub-blocks 0, 2, 4, 6 and 1, 3, 5, 7
-                    se.select<2, 1>(0) = sl.template select<2, 2>(0);
-                    se.select<2, 1>(2) = sh.template select<2, 2>(0);
-                    so.select<2, 1>(0) = sl.template select<2, 2>(1);
-                    so.select<2, 1>(2) = sh.template select<2, 2>(1);
-                    me.select<2, 1>(0) = mlo.template select<2, 2>(0);
-                    me.select<2, 1>(2) = mhi.template select<2, 2>(0);
-                    mo.select<2, 1>(0) = mlo.template select<2, 2>(1);
-                    mo.select<2, 1>(2) = mhi.template select<2, 2>(1);
-                    auto Hh = H.template bit_cast_view<half>();
-                    simd<half, 2> dmh = Hh.template select<2, 1>(0);
-                    simd<float, 2> dmf = dmh;
-                    const float dx = dmf[0], dy = dmf[1];
-                    simd<float, 4> fse = se, fso = so, fme = me, fmo = mo;
-                    simd<float, 4> dl4 = fse * dx, dh4 = fso * dx, ml4 = fme * dy, mh4 = fmo * dy;
-                    W.dl = twice(dl4);
-                    W.dh = twice(dh4);
-                    W.ml = twice(ml4);
-                    W.mh = twice(mh4);
+                    for (int j = 0; j < NC; ++j) acc[r][s][j] = simd<float, 8>(0.0f);
+            for (int kb4 = 0; kb4 < bpr; kb4 += 4) {
 #pragma unroll
-                    for (int j = 0; j < NC; ++j) acc[r][s][j] = acc[r][s][j] + term<VAR, DOT>(W, X[j], zz);
+                for (int s = 0; s < 4; ++s) {
+                    const int kb = kb4 + s;
+                    if (kb >= bpr) break;
+                    Act X[NC];
+#pragma unroll
+                    for (int j = 0; j < NC; ++j) load_act<DOT>(X[j], x + (size_t) j * xcol + (size_t) kb * 72);
+#pragma unroll
+                    for (int r = 0; r < RPT; ++r) {
+                        Wt W;
+                        load_wt(W, (const uint32_t*) (wr[r] + (size_t) kb * 144));
+#pragma unroll
+                        for (int j = 0; j < NC; ++j) acc[r][s][j] = acc[r][s][j] + term<VAR, DOT>(W, X[j], zz);
+                    }
                 }
             }
-        }
 #pragma unroll
-        for (int r = 0; r < RPT; ++r) {
-            if (row0 + r >= n_out) break;
+            for (int r = 0; r < RPT; ++r) {
+                if (row0 + r >= n_out) break;
 #pragma unroll
-            for (int j = 0; j < NC; ++j) {
-                simd<float, 8> u0 = acc[r][0][j] + acc[r][2][j];
-                simd<float, 8> u1 = acc[r][1][j] + acc[r][3][j];
-                simd<float, 8> u = u0 + u1;
-                simd<float, 4> t4 = u.template select<4, 1>(0) + u.template select<4, 1>(4);
-                simd<float, 2> t2 = t4.template select<2, 1>(0) + t4.template select<2, 1>(2);
-                const float v0 = t2[0], v1 = t2[1];
-                y[(size_t) j * n_out + row0 + r] = v0 + v1;
+                for (int j = 0; j < NC; ++j)
+                    y[(size_t) j * n_out + row0 + r] = tree(acc[r][0][j], acc[r][1][j], acc[r][2][j], acc[r][3][j]);
+            }
+        } else if constexpr (LOOP == 1) {
+            simd<float, 8> acc[RPT][4][NC];
+#pragma unroll
+            for (int r = 0; r < RPT; ++r)
+#pragma unroll
+                for (int s = 0; s < 4; ++s)
+#pragma unroll
+                    for (int j = 0; j < NC; ++j) acc[r][s][j] = simd<float, 8>(0.0f);
+            for (int kb = 0; kb < bpr; ++kb) {
+                Act X[NC];
+#pragma unroll
+                for (int j = 0; j < NC; ++j) load_act<DOT>(X[j], x + (size_t) j * xcol + (size_t) kb * 72);
+#pragma unroll
+                for (int r = 0; r < RPT; ++r) {
+                    Wt W;
+                    load_wt(W, (const uint32_t*) (wr[r] + (size_t) kb * 144));
+#pragma unroll
+                    for (int j = 0; j < NC; ++j) {
+                        const simd<float, 8> t = acc[r][0][j] + term<VAR, DOT>(W, X[j], zz);
+                        acc[r][0][j] = acc[r][1][j];
+                        acc[r][1][j] = acc[r][2][j];
+                        acc[r][2][j] = acc[r][3][j];
+                        acc[r][3][j] = t;
+                    }
+                }
+            }
+#pragma unroll
+            for (int r = 0; r < RPT; ++r) {
+                if (row0 + r >= n_out) break;
+#pragma unroll
+                for (int j = 0; j < NC; ++j)
+                    y[(size_t) j * n_out + row0 + r] = tree(acc[r][0][j], acc[r][1][j], acc[r][2][j], acc[r][3][j]);
+            }
+        } else {
+            simd<float, 32> acc[RPT][NC];
+#pragma unroll
+            for (int r = 0; r < RPT; ++r)
+#pragma unroll
+                for (int j = 0; j < NC; ++j) acc[r][j] = simd<float, 32>(0.0f);
+            for (int kb = 0; kb < bpr; ++kb) {
+                const uint16_t off = (uint16_t) ((kb & 3) * 8);
+                Act X[NC];
+#pragma unroll
+                for (int j = 0; j < NC; ++j) load_act<DOT>(X[j], x + (size_t) j * xcol + (size_t) kb * 72);
+#pragma unroll
+                for (int r = 0; r < RPT; ++r) {
+                    Wt W;
+                    load_wt(W, (const uint32_t*) (wr[r] + (size_t) kb * 144));
+#pragma unroll
+                    for (int j = 0; j < NC; ++j) {
+                        simd<float, 8> lane = acc[r][j].template select<8, 1>(off);
+                        lane = lane + term<VAR, DOT>(W, X[j], zz);
+                        acc[r][j].template select<8, 1>(off) = lane;
+                    }
+                }
+            }
+#pragma unroll
+            for (int r = 0; r < RPT; ++r) {
+                if (row0 + r >= n_out) break;
+#pragma unroll
+                for (int j = 0; j < NC; ++j) {
+                    simd<float, 8> a0 = acc[r][j].template select<8, 1>(0), a1 = acc[r][j].template select<8, 1>(8);
+                    simd<float, 8> a2 = acc[r][j].template select<8, 1>(16), a3 = acc[r][j].template select<8, 1>(24);
+                    y[(size_t) j * n_out + row0 + r] = tree(a0, a1, a2, a3);
+                }
             }
         }
     };
     if constexpr (GRF == 256) {
         auto props = sycl::ext::oneapi::experimental::properties{sycl::ext::intel::experimental::grf_size<256>};
-        q.parallel_for<Q4kMmvqTag<NC, RPT, VAR, GRF, DOT>>(sycl::range<1>(threads), props, kernel);
+        q.parallel_for<STRATA_Q4KE_TAG<NC, RPT, VAR, GRF, DOT, LOOP>>(sycl::range<1>(threads), props, kernel);
     } else {
-        q.parallel_for<Q4kMmvqTag<NC, RPT, VAR, GRF, DOT>>(sycl::range<1>(threads), kernel);
+        q.parallel_for<STRATA_Q4KE_TAG<NC, RPT, VAR, GRF, DOT, LOOP>>(sycl::range<1>(threads), kernel);
     }
 }
 
-#define STRATA_Q4KE_EXP 1   // the experiment's variants (the float expression's shapes, the register file)
 constexpr int kVar = 0;
 
-template <int RPT, int VAR, int GRF, int DOT>
+template <int RPT, int VAR, int GRF, int DOT, int LOOP>
 bool launch_nc(sycl::queue& q, const uint8_t* w, const uint32_t* x, float* y, int n_in, int n_out, int ncols) {
     switch (ncols) {
-        case 1: launch<1, RPT, VAR, GRF, DOT>(q, w, x, y, n_in, n_out); return true;
-        case 2: launch<2, RPT, VAR, GRF, DOT>(q, w, x, y, n_in, n_out); return true;
-        case 3: launch<3, RPT, VAR, GRF, DOT>(q, w, x, y, n_in, n_out); return true;
-        case 4: launch<4, RPT, VAR, GRF, DOT>(q, w, x, y, n_in, n_out); return true;
+        case 1: launch<1, RPT, VAR, GRF, DOT, LOOP>(q, w, x, y, n_in, n_out); return true;
+        case 2: launch<2, RPT, VAR, GRF, DOT, LOOP>(q, w, x, y, n_in, n_out); return true;
+        case 3: launch<3, RPT, VAR, GRF, DOT, LOOP>(q, w, x, y, n_in, n_out); return true;
+        case 4: launch<4, RPT, VAR, GRF, DOT, LOOP>(q, w, x, y, n_in, n_out); return true;
         default: return false;
     }
 }
 }  // namespace
 
+#ifndef STRATA_Q4KE_EXP
 bool q4k_mmvq_esimd_built() { return true; }
+#endif
 
-// rpt: rows per hardware thread (1, 2, 4, 8); + 100: the 128-register file; + 200: the chained dp4a.  var < 0: the engine's expression.
-bool q4k_mmvq_esimd(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ncols, void* stream,
+// rpt: rows per hardware thread (1, 2, 4, 8) + 400 * LOOP (see the top).  var < 0: the engine's expression.
+// With STRATA_Q4KE_EXP (q4k_mmvq_esimd_exp, the bench): also + 100: the 128-register file; + 200: the chained dp4a;
+// var 1..9.  (The register file's size does not reach an AOT build's ESIMD kernels: both are compiled with 128.)
+bool STRATA_Q4KE_FN(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ncols, void* stream,
                     int rpt, int var) {
     if (ncols < 1 || ncols > 4 || n_in <= 0 || n_in % 256 != 0 || n_out <= 0) return false;
     if (((uintptr_t) weights | (uintptr_t) x_q8_1) & 3) return false;
@@ -272,14 +373,16 @@ bool q4k_mmvq_esimd(const void* weights, const void* x_q8_1, float* y, int n_in,
     const auto* w = (const uint8_t*) weights;
     const auto* x = (const uint32_t*) x_q8_1;
     if (var < 0) var = kVar;
-#define STRATA_Q4KE(RP, VA, GR, DO) if (rpt == RP + (GR == 128 ? 100 : 0) + 200 * DO && var == VA) return launch_nc<RP, VA, GR, DO>(q, w, x, y, n_in, n_out, ncols);
-    STRATA_Q4KE(1, kVar, 256, 0) STRATA_Q4KE(2, kVar, 256, 0) STRATA_Q4KE(4, kVar, 256, 0) STRATA_Q4KE(8, kVar, 256, 0)
+#define STRATA_Q4KE(RP, VA, GR, DO, LO) if (rpt == RP + (GR == 128 ? 100 : 0) + 200 * DO + 400 * LO && var == VA) return launch_nc<RP, VA, GR, DO, LO>(q, w, x, y, n_in, n_out, ncols);
+    STRATA_Q4KE(1, kVar, 256, 0, 0) STRATA_Q4KE(2, kVar, 256, 0, 0) STRATA_Q4KE(4, kVar, 256, 0, 0) STRATA_Q4KE(8, kVar, 256, 0, 0)
+    STRATA_Q4KE(1, kVar, 256, 0, 1) STRATA_Q4KE(2, kVar, 256, 0, 1) STRATA_Q4KE(4, kVar, 256, 0, 1) STRATA_Q4KE(8, kVar, 256, 0, 1)
 #ifdef STRATA_Q4KE_EXP
-    STRATA_Q4KE(2, 1, 256, 0) STRATA_Q4KE(2, 2, 256, 0) STRATA_Q4KE(2, 3, 256, 0) STRATA_Q4KE(2, 4, 256, 0) STRATA_Q4KE(2, 5, 256, 0)
-    STRATA_Q4KE(2, 6, 256, 0) STRATA_Q4KE(2, 7, 256, 0) STRATA_Q4KE(2, 8, 256, 0) STRATA_Q4KE(2, 9, 256, 0)
-    STRATA_Q4KE(1, kVar, 128, 0) STRATA_Q4KE(2, kVar, 128, 0) STRATA_Q4KE(4, kVar, 128, 0)
-    STRATA_Q4KE(1, kVar, 256, 1) STRATA_Q4KE(2, kVar, 256, 1) STRATA_Q4KE(4, kVar, 256, 1) STRATA_Q4KE(8, kVar, 256, 1)
-    STRATA_Q4KE(2, kVar, 128, 1) STRATA_Q4KE(4, kVar, 128, 1)
+    STRATA_Q4KE(1, kVar, 256, 0, 2) STRATA_Q4KE(2, kVar, 256, 0, 2) STRATA_Q4KE(4, kVar, 256, 0, 2) STRATA_Q4KE(8, kVar, 256, 0, 2)
+    STRATA_Q4KE(2, 1, 256, 0, 0) STRATA_Q4KE(2, 2, 256, 0, 0) STRATA_Q4KE(2, 3, 256, 0, 0) STRATA_Q4KE(2, 4, 256, 0, 0) STRATA_Q4KE(2, 5, 256, 0, 0)
+    STRATA_Q4KE(2, 6, 256, 0, 0) STRATA_Q4KE(2, 7, 256, 0, 0) STRATA_Q4KE(2, 8, 256, 0, 0) STRATA_Q4KE(2, 9, 256, 0, 0)
+    STRATA_Q4KE(1, kVar, 128, 0, 0) STRATA_Q4KE(2, kVar, 128, 0, 0) STRATA_Q4KE(4, kVar, 128, 0, 0)
+    STRATA_Q4KE(1, kVar, 256, 1, 0) STRATA_Q4KE(2, kVar, 256, 1, 0) STRATA_Q4KE(4, kVar, 256, 1, 0) STRATA_Q4KE(8, kVar, 256, 1, 0)
+    STRATA_Q4KE(2, kVar, 128, 1, 0) STRATA_Q4KE(4, kVar, 128, 1, 0)
 #endif
 #undef STRATA_Q4KE
     return false;

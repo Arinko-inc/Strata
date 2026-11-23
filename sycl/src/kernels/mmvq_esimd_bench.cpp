@@ -5,10 +5,13 @@
 //     mmvq_esimd_bench <any shard.gguf> <layer[,layer...]> [--t 1,2,3,4] [--rpt 4] [--var -1] [--trials 9]
 //                      [--names attn_qkv,...] [--cmp 1|0] [--time 1|0]
 //
-// --rpt: rows per hardware thread of the ESIMD kernel (1, 2, 4, 8; + 100 in an experiment build: the 128-register file).
-// --var: the float expression's shape (-1 the engine's; 0..9 in an experiment build).  Every (rpt, var) pair is a
-// configuration; the first one is also run through native_mmvq with native_mmvq_set_esimd(1) (the engine's way in; the
-// engine's rpt is STRATA_MMVQ_ESIMD_RPT's).
+// --rpt: rows per hardware thread of the ESIMD kernel (1, 2, 4, 8) + 400 * the loop's shape (0: four blocks per
+// iteration, 1: one block and rotating sums, 2: one block and a run-time offset) + 100: the 128-register file + 200: the
+// chained dp4a.  0: the engine's choice by the shape (through native_mmvq; STRATA_MMVQ_ESIMD_RPT / _LOOP apply).
+// --var: the float expression's shape (-1 the engine's; 0..9).  Every (rpt, var) pair is a configuration; they run on
+// this program's own copy of the kernel file, built with STRATA_Q4KE_EXP (q4k_mmvq_esimd_exp: the engine's kernels and
+// the experiment's variants; the library's copy has the engine's only).  The engine's way in (native_mmvq with
+// native_mmvq_set_esimd(1), the library's copy) is compared as well.
 // The matrices: the layers' Q4_K dense tensors by role (attn_qkv, attn_gate, ssm_out, ssm_alpha, ssm_beta of a GDN layer;
 // attn_q, attn_k, attn_v, attn_output of a QSA layer; ffn_gate_shexp, ffn_up_shexp of both).  Activations are normal
 // random vectors through native_quantize_q8_1, T columns.
@@ -34,6 +37,10 @@
 #include <string>
 #include <vector>
 
+namespace strata::kernels {
+bool q4k_mmvq_esimd_exp(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ncols, void* stream,
+                        int rpt, int var);   // q4k_mmvq_esimd.dp.cpp with STRATA_Q4KE_EXP (this target's own copy)
+}
 namespace K = strata::kernels;
 
 namespace {
@@ -145,8 +152,8 @@ int main(int argc, char** argv) {
                         K::native_mmvq_set_esimd(1);
                         K::native_mmvq(12, mats[m].w, xq, ym, n_in, n_out, T, s);
                         K::native_mmvq_set_esimd(0);
-                    } else if (!K::q4k_mmvq_esimd(mats[m].w, xq, ym, n_in, n_out, T, s, cfgs[c].rpt, cfgs[c].var)) {
-                        std::fprintf(stderr, "q4k_mmvq_esimd declined rpt %d var %d\n", cfgs[c].rpt, cfgs[c].var);
+                    } else if (!K::q4k_mmvq_esimd_exp(mats[m].w, xq, ym, n_in, n_out, T, s, cfgs[c].rpt, cfgs[c].var)) {
+                        std::fprintf(stderr, "q4k_mmvq_esimd_exp declined rpt %d var %d\n", cfgs[c].rpt, cfgs[c].var);
                         std::exit(2);
                     }
                 }

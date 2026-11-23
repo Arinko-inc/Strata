@@ -452,7 +452,11 @@ if(STRATA_SYCL_PARITY)
   target_link_libraries(dense_bench PRIVATE strata_kernels)
   # STRATA_MMVQ_ESIMD's kernel against the wide kernel on a model's own dense Q4_K matrices, bit for bit, and timed:
   #   mmvq_esimd_bench <any shard.gguf> <layer[,layer]> [--t 1,2,3,4] [--rpt 1,2,4,8] [--var 0,..] [--trials 9]
-  add_executable(mmvq_esimd_bench ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/mmvq_esimd_bench.cpp)
+  # It compiles the kernel file a second time with STRATA_Q4KE_EXP: the experiment's variants, under other names, are in
+  # this program only (strata_kernels carries the engine's kernels).
+  add_executable(mmvq_esimd_bench ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/mmvq_esimd_bench.cpp
+                 ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/cuda/q4k_mmvq_esimd.dp.cpp)
+  target_compile_definitions(mmvq_esimd_bench PRIVATE STRATA_Q4KE_EXP=1)
   target_link_libraries(mmvq_esimd_bench PRIVATE strata_kernels)
   add_executable(mmvq_sg_bench ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/mmvq_sg_bench.cpp)   # SIMD16 vs 32 decode mmvq
   target_link_libraries(mmvq_sg_bench PRIVATE strata_kernels)
