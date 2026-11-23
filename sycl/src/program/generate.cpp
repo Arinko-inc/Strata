@@ -9312,6 +9312,17 @@ int main(int argc, char **argv) try {
                 }
                 return want >= tokens;
             };
+            // the slots lend() takes for a prompt of `tokens` on every participant (lend_whole's sizes): what
+            // STRATA_WK_LEND_SINGLE compares, as a smaller chunk can lay out a bigger ring (#2090)
+            auto loan_slots = [&](int64_t tokens) -> int64_t {
+                const int64_t want_full = equal_chunk(tokens, o.prefill_chunk);
+                const int64_t want = split_small > 0 && tokens <= split_small_max ? std::min(want_full, split_small)
+                                                                                  : want_full;
+                int64_t n = 0;
+                for (const PfPart& p : pf_parts)
+                    if (p.first >= 0) n += std::max<int64_t>(0, part_slots(p, want));
+                return n;
+            };
             if (std::getenv("STRATA_REMOTE_ROWS") != nullptr)
                 std::fprintf(stderr, "strata serve: STRATA_REMOTE_ROWS is the main process's choice; a worker takes "
                                      "the row format its main process asks for (it ignores its own)\n");
@@ -9462,9 +9473,10 @@ int main(int argc, char **argv) try {
                     return v && v[0] != '0';
                 }();
                 const bool only_chunk = (flags & 1) != 0;
-                // (only where lend() takes T's loan whole: the loan is not monotonic in the chunk (#2090), and a smaller chunk
+                // (only where lend() takes T's loan whole and it is fewer slots: the loan is not monotonic in the chunk (#2090): a smaller chunk
                 // that needs more slots than may be lent would be halved below T - then the hello's loan, as before)
-                const bool lend_own = lend_single && only_chunk && T < lend_chunk && lend_whole(T);
+                const bool lend_own = lend_single && only_chunk && T < lend_chunk && lend_whole(T) &&
+                      loan_slots(T) < loan_slots(lend_chunk);
                 if (!lend(lend_own ? T : std::max<int64_t>(T, lend_chunk), e)) return false;
                 // a chunk the buffers do not cover would leave rows out: an error, not a wrong reply
                 if (sp.chunk() < T) {
@@ -9478,7 +9490,15 @@ int main(int argc, char **argv) try {
                 // (STRATA_REMOTE_TIMING=1: the link reports each chunk's time)
                 if (!sp.run(tokens, T, p0, e)) return false;
                 // (the chunk's rows are in the reply's host buffer once run returns, so the loan's device memory is free)
-                if (refill_early && only_chunk && !refill_early_issue(e)) return false;
+                if (refill_early && only_chunk && !refill_early_issue(e)) {
+                    // not this chunk's failure: its rows are read, and a relay's next worker still owes their reply (an error
+                    // here would leave that reply on the link).  What was queued is waited for at the next refill(), which
+                    // reports a failed copy queue there, as a refill at the window would
+                    std::fprintf(stderr, "strata stage worker: the early refill was not queued whole (%s): the next window "
+                                         "waits for what was\n", e.c_str());
+                    e.clear();
+                    refill_issued = true;
+                }
                 return true;
             };
             // conversation checkpoints (docs/remote-stage/CHECKPOINTS.md): this worker's layers' part of each, under
