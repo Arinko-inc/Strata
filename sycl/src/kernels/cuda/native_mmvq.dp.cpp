@@ -3786,9 +3786,20 @@ const int g_mmvq_esimd_env = mmvq_esimd_parse();
 // STRATA_MMVQ_ESIMD_RPT / _LOOP are read, and a bad value refused, only where the ESIMD kernel is chosen: at start with
 // STRATA_MMVQ_ESIMD=1, else at the first call that takes it (native_mmvq_set_esimd(1), the bench).  With the wide kernel
 // a stale value in the environment does not stop the start.
+int mmvq_esimd_lean_parse() {   // -1: unset
+    const char* e = std::getenv("STRATA_MMVQ_ESIMD_LEAN");
+    if (!e || !*e) return -1;
+    if ((e[0] != '0' && e[0] != '1') || e[1] != '\0') {
+        std::fprintf(stderr, "STRATA_MMVQ_ESIMD_LEAN=%s: 0 (the kernels of 2026-11-24 noon) or 1 (the lean ones)\n", e);
+        std::exit(1);
+    }
+    return e[0] - '0';
+}
+int mmvq_esimd_lean_env() { static const int v = mmvq_esimd_lean_parse(); return v; }
 int mmvq_esimd_rpt_env() { static const int v = mmvq_esimd_rpt_parse(); return v; }
 int mmvq_esimd_loop_env() { static const int v = mmvq_esimd_loop_parse(); return v; }
-[[maybe_unused]] const bool g_mmvq_esimd_knobs = g_mmvq_esimd_env == 1 && mmvq_esimd_rpt_env() >= 0 && mmvq_esimd_loop_env() >= -1;
+[[maybe_unused]] const bool g_mmvq_esimd_knobs = g_mmvq_esimd_env == 1 && mmvq_esimd_rpt_env() >= 0 && mmvq_esimd_loop_env() >= -1 &&
+                                                 mmvq_esimd_lean_env() >= -1;
 int g_mmvq_esimd = -1;   // native_mmvq_set_esimd (the bench); < 0: the environment's
 }  // namespace
 void native_mmvq_set_esimd(int v) { g_mmvq_esimd = v; }
@@ -3797,9 +3808,17 @@ constexpr int kEsimdMinRows = 2048;
 // q4k_mmvq_esimd's rpt argument: rows per hardware thread + 400 * the loop's shape (B70, orca's layers 30-47:
 // bench/2026-11-24-b70gemv for LOOP 0's rows, bench/2026-11-24-b70t4 for 4 columns)
 // LOOP 2 by the shape only where the thread's rows are 2 (STRATA_MMVQ_ESIMD_RPT unset or 2); other fixed rows keep LOOP 0
+// The lean kernel (+ 1600, LOOP 2, rows 1-4; bench/2026-11-24-b70t34): STRATA_MMVQ_ESIMD_LEAN=1, or unset with neither
+// STRATA_MMVQ_ESIMD_RPT nor _LOOP set (those two keep choosing among the kernels of 2026-11-24 noon, as does LEAN=0).
+// With LEAN=1, STRATA_MMVQ_ESIMD_RPT 1, 2 or 4 fixes the lean kernel's rows (8: the older kernels).
 int mmvq_esimd_rpt(int n_in, int n_out, int ncols) {
     const bool small = n_in <= 2560 && n_out <= 8192;
-    const int rpt_env = mmvq_esimd_rpt_env(), loop_env = mmvq_esimd_loop_env();
+    const int rpt_env = mmvq_esimd_rpt_env(), loop_env = mmvq_esimd_loop_env(), lean_env = mmvq_esimd_lean_env();
+    const bool lean = lean_env >= 0 ? lean_env == 1 && rpt_env != 8 : (rpt_env == 0 && loop_env < 0);
+    if (lean) {
+        if (rpt_env) return 2400 + rpt_env;
+        return 2400 + (ncols >= 2 ? 4 : 2);   // WIP: set from the B70's measurements
+    }
     const int loop = loop_env >= 0 ? loop_env : (ncols == 4 && !small && (rpt_env == 0 || rpt_env == 2) ? 2 : 0);
     if (rpt_env) return rpt_env + 400 * loop;
     if (loop == 0) return ((ncols == 1 || ncols == 4) && small) ? 1 : 2;

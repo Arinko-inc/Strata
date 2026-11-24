@@ -9,7 +9,8 @@
 // iteration, 1: one block and rotating sums, 2: one block and a run-time offset) + 100: the 128-register file + 200: the
 // chained dp4a.  0: the engine's choice by the shape (through native_mmvq; STRATA_MMVQ_ESIMD_RPT / _LOOP apply).
 // --var: the float expression's shape (-1 the engine's; 0..9).  Every (rpt, var) pair is a configuration.  The engine's
-// kernels (rows 1, 2, 4, 8 x LOOP 0, 2 with var -1: rpt 1 2 4 8 801 802 804 808) run the library's own q4k_mmvq_esimd, the
+// kernels (rows 1, 2, 4, 8 x LOOP 0, 2 and the lean LOOP 2 of rows 1-4 with var -1: rpt 1 2 4 8 801 802 804 808 2401-2404;
+// + 1600 is the lean kernel, 1601-1604 its LOOP 0) run the library's own q4k_mmvq_esimd, the
 // one the engine calls; the experiment's (any other rpt or var) run this program's own copy of the kernel file, built
 // with STRATA_Q4KE_EXP (q4k_mmvq_esimd_exp).  The cmp line names which ("engine" / "exp").  The engine's way in
 // (native_mmvq with native_mmvq_set_esimd(1)) is compared as well.
@@ -62,8 +63,10 @@ std::vector<std::string> strs(const char* s) {
 using GraphExec = sycl::ext::oneapi::experimental::command_graph<sycl::ext::oneapi::experimental::graph_state::executable>;
 struct Cfg { int rpt, var; };
 bool engine_cfg(const Cfg& c) {   // in the library's q4k_mmvq_esimd (q4k_mmvq_esimd.dp.cpp without STRATA_Q4KE_EXP)
-    const int rows = c.rpt % 400, loop = c.rpt / 400;
-    return c.var < 0 && (rows == 1 || rows == 2 || rows == 4 || rows == 8) && (loop == 0 || loop == 2);
+    const int lean = c.rpt / 1600, rows = c.rpt % 400, loop = c.rpt % 1600 / 400;
+    if (c.var >= 0 || lean > 1) return false;
+    if (lean) return loop == 2 && rows >= 1 && rows <= 4;
+    return (rows == 1 || rows == 2 || rows == 4 || rows == 8) && (loop == 0 || loop == 2);
 }
 struct Mat { int layer; uint8_t* w; };
 }  // namespace
