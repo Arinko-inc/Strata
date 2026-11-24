@@ -421,7 +421,7 @@ bool q4k_mmvq_esimd_built() { return true; }
 
 // rpt: rows per hardware thread (1, 2, 4, 8; 1, 2, 3, 4 lean) + 400 * LOOP (see the top) + 1600: the lean kernel
 // (DOT 2: the dot as one 32-wide dp4a and two strided adds, the scales' duplication as region reads, no early exit at
-// the end; 2400 + rows is what the engine uses).  var < 0: the engine's expression.
+// the end; the engine uses 2400 + rows 1-4 and 1600 + rows 1-3).  var < 0: the engine's expression.
 // With STRATA_Q4KE_EXP (q4k_mmvq_esimd_exp, the bench): also + 100: the 128-register file; + 200: the chained dp4a;
 // var 1..9.  (The register file's size does not reach an AOT build's ESIMD kernels: both are compiled with 128.)
 bool STRATA_Q4KE_FN(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ncols, void* stream,
@@ -436,8 +436,9 @@ bool STRATA_Q4KE_FN(const void* weights, const void* x_q8_1, float* y, int n_in,
     STRATA_Q4KE(1, kVar, 256, 0, 0) STRATA_Q4KE(2, kVar, 256, 0, 0) STRATA_Q4KE(4, kVar, 256, 0, 0) STRATA_Q4KE(8, kVar, 256, 0, 0)
     STRATA_Q4KE(1, kVar, 256, 0, 2) STRATA_Q4KE(2, kVar, 256, 0, 2) STRATA_Q4KE(4, kVar, 256, 0, 2) STRATA_Q4KE(8, kVar, 256, 0, 2)
     STRATA_Q4KE(1, kVar, 256, 2, 2) STRATA_Q4KE(2, kVar, 256, 2, 2) STRATA_Q4KE(3, kVar, 256, 2, 2) STRATA_Q4KE(4, kVar, 256, 2, 2)
+    STRATA_Q4KE(1, kVar, 256, 2, 0) STRATA_Q4KE(2, kVar, 256, 2, 0) STRATA_Q4KE(3, kVar, 256, 2, 0)
 #ifdef STRATA_Q4KE_EXP
-    STRATA_Q4KE(1, kVar, 256, 2, 0) STRATA_Q4KE(2, kVar, 256, 2, 0) STRATA_Q4KE(3, kVar, 256, 2, 0) STRATA_Q4KE(4, kVar, 256, 2, 0)
+    STRATA_Q4KE(4, kVar, 256, 2, 0)
     STRATA_Q4KE(1, kVar, 256, 0, 1) STRATA_Q4KE(2, kVar, 256, 0, 1) STRATA_Q4KE(4, kVar, 256, 0, 1) STRATA_Q4KE(8, kVar, 256, 0, 1)
     STRATA_Q4KE(2, 1, 256, 0, 0) STRATA_Q4KE(2, 2, 256, 0, 0) STRATA_Q4KE(2, 3, 256, 0, 0) STRATA_Q4KE(2, 4, 256, 0, 0) STRATA_Q4KE(2, 5, 256, 0, 0)
     STRATA_Q4KE(2, 6, 256, 0, 0) STRATA_Q4KE(2, 7, 256, 0, 0) STRATA_Q4KE(2, 8, 256, 0, 0) STRATA_Q4KE(2, 9, 256, 0, 0)

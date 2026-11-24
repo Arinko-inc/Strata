@@ -3808,16 +3808,21 @@ constexpr int kEsimdMinRows = 2048;
 // q4k_mmvq_esimd's rpt argument: rows per hardware thread + 400 * the loop's shape (B70, orca's layers 30-47:
 // bench/2026-11-24-b70gemv for LOOP 0's rows, bench/2026-11-24-b70t4 for 4 columns)
 // LOOP 2 by the shape only where the thread's rows are 2 (STRATA_MMVQ_ESIMD_RPT unset or 2); other fixed rows keep LOOP 0
-// The lean kernel (+ 1600, LOOP 2, rows 1-4; bench/2026-11-24-b70t34): STRATA_MMVQ_ESIMD_LEAN=1, or unset with neither
-// STRATA_MMVQ_ESIMD_RPT nor _LOOP set (those two keep choosing among the kernels of 2026-11-24 noon, as does LEAN=0).
-// With LEAN=1, STRATA_MMVQ_ESIMD_RPT 1, 2 or 4 fixes the lean kernel's rows (8: the older kernels).
+// The lean kernels (+ 1600: a third fewer instructions per block, every one of them allocated without spills;
+// bench/2026-11-24-b70t34): STRATA_MMVQ_ESIMD_LEAN=1, or unset with neither STRATA_MMVQ_ESIMD_RPT nor _LOOP set (those
+// two keep choosing among the kernels of 2026-11-24 noon, as does LEAN=0).  Rows and loop by the shape, the fastest of
+// rows 1-4 x LOOP 0, 2 on the B70 for orca's layers 30-47 (qkv 2560 x 10240, q x 12288, gate x 6144, ssm_out and
+// attn_output 6144 x 2560).  With LEAN=1, STRATA_MMVQ_ESIMD_RPT 1, 2 or 4 fixes the rows (LOOP 2; 8: the older kernels).
 int mmvq_esimd_rpt(int n_in, int n_out, int ncols) {
     const bool small = n_in <= 2560 && n_out <= 8192;
     const int rpt_env = mmvq_esimd_rpt_env(), loop_env = mmvq_esimd_loop_env(), lean_env = mmvq_esimd_lean_env();
     const bool lean = lean_env >= 0 ? lean_env == 1 && rpt_env != 8 : (rpt_env == 0 && loop_env < 0);
     if (lean) {
         if (rpt_env) return 2400 + rpt_env;
-        return 2400 + (ncols >= 2 ? 4 : 2);   // WIP: set from the B70's measurements
+        if (n_in > 2560) return ncols == 2 ? 1602 : 2403;
+        if (ncols == 4) return 1603;
+        if (n_out > 8192) return 1602;
+        return ncols == 3 ? 2404 : 1601;
     }
     const int loop = loop_env >= 0 ? loop_env : (ncols == 4 && !small && (rpt_env == 0 || rpt_env == 2) ? 2 : 0);
     if (rpt_env) return rpt_env + 400 * loop;
