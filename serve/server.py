@@ -4408,6 +4408,8 @@ class Service:
         self.stop_ids = set(tokenizer.encode(IM_END, parse_special=True) +
                             tokenizer.encode("<|endoftext|>", parse_special=True))
         self.family = None                              # the model family ("deepseek41"): set_family() below
+        from serve.auto_prefix import AutoPrefix        # Arinko-inc: a pin inside one message (serve/auto_prefix.py)
+        self.auto_prefix = AutoPrefix(StrataEngine.TURN_ID)
         self.parser_cls = OutputParser                  # reads the model's output (reasoning, content, tool calls)
         # #567: a prompt re-encodes only what follows the last special token it shares with a recent prompt (the
         # same ids as a full encode: tools/strata_tokenizer.py PromptEncoder).  Tokenizers without resume points
@@ -5481,9 +5483,29 @@ class Service:
             lead = self.deepseek_shared_start(messages)
             if lead:
                 req["strata_prefix"] = {"messages": lead}
-        if req is not None and req.get("strata_prefix") is not None:
+        ap = getattr(self, "auto_prefix", None)
+        if (ap is not None and ap.enabled and req is not None and req.get("strata_prefix") is None
+                and self.family != "deepseek41" and not images and not ds_pics and not self.conversation_cache_on()):
+            pin = ap.pick(ids)
+            if pin:
+                print(f"[strata] auto prefix: pin={pin} of the {len(ids)}-token prompt (its start, shared with a recent "
+                      "prompt, runs inside one message)", flush=True)
+                req["strata_prefix"] = {"tokens": pin}
+        elif req is not None and req.get("strata_prefix") is not None:
             req["strata_prefix"] = self.resolve_prefix(req["strata_prefix"], messages, tools, kwargs, ids, bool(images) or ds_pics)
+            if ap is not None:
+                ap.note_explicit(ids, (req["strata_prefix"] or {}).get("tokens", 0))
         return ids, kwargs.get("enable_thinking", True) is not False, max_new
+
+    def conversation_cache_on(self) -> bool:
+        """Whether an engine this request may run on parks conversations (--conversation-cache-mib): every replica is
+        asked, since the replica is picked after prepare() (Arinko-inc: serve/auto_prefix.py stays off there)."""
+        for e in getattr(self.engine, "engines", None) or [self.engine]:
+            info = getattr(e, "info", None) or {}
+            mib, slots = info.get("conversation_cache_mib"), info.get("conversation_cache_slots")
+            if isinstance(mib, int) and mib > 0 and slots != 0:
+                return True
+        return False
 
     @staticmethod
     def deepseek_shared_start(messages) -> int:
@@ -6305,6 +6327,7 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
     total, rounds, done = 0, 0, None
     finalizing = False
     messages = list(messages)
+    first_ids = ids
     while True:
         text, reasoning, calls, own_calls = [], [], [], 0
         for kind, x in svc.run(ids, thinking, tools, max_new, sampling, cancel, declared_only=True):
@@ -6389,6 +6412,12 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
         except ClientGone:                                      # #1999: the client left while a picture was prepared
             done = {**done, "finish": "cancel"}
             break
+        # a pin ("strata_prefix" resolved to {"tokens": N}) names a start of the FIRST prompt; the final round's
+        # rebuilt prompt (its added system message, no tools) may not share it - then it is no pin of this prompt
+        sp = sampling.get("strata_prefix") if isinstance(sampling, dict) else None
+        n_pin = sp.get("tokens") if isinstance(sp, dict) else None
+        if isinstance(n_pin, int) and n_pin > 0 and (len(ids) <= n_pin + 1 or ids[:n_pin] != first_ids[:n_pin]):
+            sampling.pop("strata_prefix", None)
     yield "done", {**done, "completion_tokens": total, "prompt_tokens": len(ids)}
 
 
