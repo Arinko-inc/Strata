@@ -14,8 +14,9 @@ ask for the same position.  The request that finds it reads the document once mo
 the requests after it resume there.
 
 Opt-in: STRATA_AUTO_PREFIX=1 in the server's environment (anything else: off, the default path unchanged).  A request's
-own "strata_prefix" always wins, and a later request that a recent explicit pin serves gets no automatic one (the engine
-holds one pin at a time, and a new pin would unpin the client's).  An automatic pin is sent with EVERY request that finds
+own "strata_prefix" always wins.  The engine holds one pin at a time, and a pin at a position it has no checkpoint for
+unpins the one it holds, so a prompt that a recently sent pin (the client's or an automatic one) still serves gets THAT
+position again, not a nearby one the rounding would give.  An automatic pin is sent with EVERY request that finds
 it, not once: the engine drops even a pinned checkpoint when an unrelated prompt takes the session (its K/V holds one
 branch), and the next request of the document must be able to lay it again - measured 2026-11-25: A, A, A, unrelated B,
 A, A read the document in full at both of the last two when only the first finder sent the pin.  Requests with images are skipped, and so is an engine
@@ -68,15 +69,22 @@ class AutoPrefix:
         self.turn_id = int(turn_id)
         self._recent: collections.deque = collections.deque(maxlen=_int_env(env, "STRATA_AUTO_PREFIX_KEEP", DEFAULT_KEEP))
         self._lock = threading.Lock()
-        # the starts recent requests pinned themselves ("strata_prefix"): several, so one request that never reaches the
-        # engine (cancelled in the queue) does not make the server forget the pin a client keeps
-        self._explicit: collections.deque = collections.deque(maxlen=4)
+        # the starts recently pinned (a request's own "strata_prefix" and the automatic ones): several, so one request
+        # that never reaches the engine (cancelled in the queue) does not make the server forget a pin still in use
+        self._pins: collections.deque = collections.deque(maxlen=4)
 
     def note_explicit(self, ids, n: int) -> None:
         """A request's own "strata_prefix", resolved to its first `n` tokens."""
         if self.enabled and isinstance(n, int) and n > 0:
-            with self._lock:
-                self._explicit.append(array("q", ids[:n]))
+            self._remember(array("q", ids[:n]))
+
+    def _remember(self, p) -> None:
+        with self._lock:
+            for i, q in enumerate(self._pins):
+                if q == p:
+                    del self._pins[i]
+                    break
+            self._pins.append(p)
 
     def pick(self, ids) -> int:
         """The pin position for this prompt (0: none), and remember the prompt for the next ones."""
@@ -86,7 +94,7 @@ class AutoPrefix:
         with self._lock:
             best = max((lcp(cur, r) for r in self._recent), default=0)
             self._recent.append(cur)
-            explicit = list(self._explicit)
+            pins = list(self._pins)
         # the pin must leave the prompt's tail to read (the engine ignores pin >= n - 1) and sit clear of the divergence
         pin = min(best - MARGIN, len(ids) - 2)
         pin -= pin % QUANTUM
@@ -101,7 +109,10 @@ class AutoPrefix:
                 break
         if pin - last_turn < self.min_tokens:
             return 0
-        # a client's own pin serves this prompt: an automatic one would unpin it
-        if any(len(p) < len(cur) and cur[:len(p)] == p for p in explicit):
-            return 0
+        # a recent pin that serves this prompt nearly as deep: send its position again (the engine marks the checkpoint it
+        # has there, or lays it again if an unrelated prompt made it drop it) instead of moving the pin
+        held = [len(p) for p in pins if len(p) < len(cur) - 1 and len(p) + self.min_tokens > pin and cur[:len(p)] == p]
+        if held:
+            pin = max(held)
+        self._remember(cur[:pin])
         return pin

@@ -5501,8 +5501,9 @@ class Service:
         """Whether an engine this request may run on parks conversations (--conversation-cache-mib): every replica is
         asked, since the replica is picked after prepare() (Arinko-inc: serve/auto_prefix.py stays off there)."""
         for e in getattr(self.engine, "engines", None) or [self.engine]:
-            mib = (getattr(e, "info", None) or {}).get("conversation_cache_mib")
-            if isinstance(mib, int) and mib > 0:
+            info = getattr(e, "info", None) or {}
+            mib, slots = info.get("conversation_cache_mib"), info.get("conversation_cache_slots")
+            if isinstance(mib, int) and mib > 0 and slots != 0:
                 return True
         return False
 

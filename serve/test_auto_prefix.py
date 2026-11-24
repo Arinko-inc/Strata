@@ -84,12 +84,35 @@ class Pick(unittest.TestCase):
             ap.pick(user_prompt(self.head, doc(400, 1)))
             self.assertEqual(ap.pick(user_prompt(self.head, doc(400, 2))), 0)
 
-    def test_an_explicit_pin_is_not_replaced(self):
+    def test_an_explicit_pin_is_sent_again_not_moved(self):
         first = user_prompt(self.head, doc(400, 1))
         self.ap.pick(first)
         self.ap.note_explicit(first, 40002)                                       # the client marked its document
-        self.assertEqual(self.ap.pick(user_prompt(self.head, doc(400, 2))), 0)
-        self.assertEqual(self.ap.pick(user_prompt(self.head + doc(9000, 4), doc(400, 3))), 0)
+        self.assertEqual(self.ap.pick(user_prompt(self.head, doc(400, 2))), 40002)
+
+    def test_an_explicit_pin_lost_to_another_document_comes_back(self):
+        first = user_prompt(self.head, doc(400, 1))
+        self.ap.pick(first)
+        self.ap.note_explicit(first, 40002)
+        other = doc(40000, 14)
+        self.ap.pick(user_prompt(other, doc(400, 2)))
+        self.assertGreater(self.ap.pick(user_prompt(other, doc(400, 3))), 0)     # the engine now holds B's pin
+        self.assertEqual(self.ap.pick(user_prompt(self.head, doc(400, 4))), 40002)
+
+    def test_a_held_pin_is_not_moved_by_the_rounding(self):
+        self.ap.pick(user_prompt(self.head, doc(400, 1)))
+        p = self.ap.pick(user_prompt(self.head, doc(400, 2)))
+        # questions that diverge right at p (user_prompt's 2 header tokens + head[:p - 2]): the rounding alone gives
+        # p - QUANTUM, which would unpin the checkpoint at p
+        self.ap.pick(user_prompt(self.head[:p - 2], doc(5000, 5)))
+        self.assertEqual(self.ap.pick(user_prompt(self.head[:p - 2], doc(5000, 6))), p)
+
+    def test_a_much_deeper_start_moves_the_pin(self):
+        self.ap.pick(user_prompt(self.head, doc(400, 1)))
+        p = self.ap.pick(user_prompt(self.head, doc(400, 2)))
+        longer = self.head + doc(9000, 4)
+        self.assertEqual(self.ap.pick(user_prompt(longer, doc(400, 3))), p)
+        self.assertGreater(self.ap.pick(user_prompt(longer, doc(400, 5))), p + 4096)
 
     def test_an_explicit_pin_survives_a_later_one_that_never_ran(self):
         first = user_prompt(self.head, doc(400, 1))
@@ -97,7 +120,7 @@ class Pick(unittest.TestCase):
         self.ap.note_explicit(first, 40002)
         other = user_prompt(doc(40000, 12), doc(400, 2))
         self.ap.note_explicit(other, 40002)                                       # (cancelled in the queue)
-        self.assertEqual(self.ap.pick(user_prompt(self.head, doc(400, 3))), 0)
+        self.assertEqual(self.ap.pick(user_prompt(self.head, doc(400, 3))), 40002)
 
     def test_the_pin_comes_back_after_an_unrelated_prompt(self):
         self.ap.pick(user_prompt(self.head, doc(400, 1)))
