@@ -13,9 +13,12 @@ root or turn checkpoint can serve it), gets `pin` at that start, rounded down to
 ask for the same position.  The request that finds it reads the document once more and leaves a pinned checkpoint;
 the requests after it resume there.
 
-Opt-in: STRATA_AUTO_PREFIX=1 in the server's environment (unset or 0: off, the default path unchanged).  A request's
-own "strata_prefix" always wins, and a later request that the last explicit pin serves gets no automatic one (the engine
-holds one pin at a time, and a new pin would unpin the client's).  Requests with images are skipped, and so is an engine
+Opt-in: STRATA_AUTO_PREFIX=1 in the server's environment (anything else: off, the default path unchanged).  A request's
+own "strata_prefix" always wins, and a later request that a recent explicit pin serves gets no automatic one (the engine
+holds one pin at a time, and a new pin would unpin the client's).  An automatic pin is sent with EVERY request that finds
+it, not once: the engine drops even a pinned checkpoint when an unrelated prompt takes the session (its K/V holds one
+branch), and the next request of the document must be able to lay it again - measured 2026-11-25: A, A, A, unrelated B,
+A, A read the document in full at both of the last two when only the first finder sent the pin.  Requests with images are skipped, and so is an engine
 with the conversation cache on (a pinned resume skips parking the branch it leaves, right only for a known sibling).
 """
 from __future__ import annotations
@@ -60,18 +63,20 @@ def lcp(a, b) -> int:
 class AutoPrefix:
     def __init__(self, turn_id: int, env=None):
         env = os.environ if env is None else env
-        self.enabled = str(env.get("STRATA_AUTO_PREFIX", "0")).strip() not in ("", "0")
+        self.enabled = str(env.get("STRATA_AUTO_PREFIX", "0")).strip() == "1"
         self.min_tokens = _int_env(env, "STRATA_AUTO_PREFIX_MIN", DEFAULT_MIN)
         self.turn_id = int(turn_id)
         self._recent: collections.deque = collections.deque(maxlen=_int_env(env, "STRATA_AUTO_PREFIX_KEEP", DEFAULT_KEEP))
         self._lock = threading.Lock()
-        self._pinned = None    # (ids of the last pin sent to the engine, explicit?): the engine holds one at a time
+        # the starts recent requests pinned themselves ("strata_prefix"): several, so one request that never reaches the
+        # engine (cancelled in the queue) does not make the server forget the pin a client keeps
+        self._explicit: collections.deque = collections.deque(maxlen=4)
 
-    def note_pin(self, ids, n: int, explicit: bool) -> None:
-        """A pin the engine is about to take (a request's own "strata_prefix", or one pick() chose)."""
-        if self.enabled and n > 0:
+    def note_explicit(self, ids, n: int) -> None:
+        """A request's own "strata_prefix", resolved to its first `n` tokens."""
+        if self.enabled and isinstance(n, int) and n > 0:
             with self._lock:
-                self._pinned = (array("q", ids[:n]), explicit)
+                self._explicit.append(array("q", ids[:n]))
 
     def pick(self, ids) -> int:
         """The pin position for this prompt (0: none), and remember the prompt for the next ones."""
@@ -81,7 +86,7 @@ class AutoPrefix:
         with self._lock:
             best = max((lcp(cur, r) for r in self._recent), default=0)
             self._recent.append(cur)
-            pinned = self._pinned
+            explicit = list(self._explicit)
         # the pin must leave the prompt's tail to read (the engine ignores pin >= n - 1) and sit clear of the divergence
         pin = min(best - MARGIN, len(ids) - 2)
         pin -= pin % QUANTUM
@@ -96,11 +101,7 @@ class AutoPrefix:
                 break
         if pin - last_turn < self.min_tokens:
             return 0
-        if pinned is not None:
-            p, explicit = pinned
-            # the pin the engine holds serves this prompt: keep it (an explicit one always; an automatic one unless
-            # this prompt shares a good deal more)
-            if len(p) < len(cur) and cur[:len(p)] == p and (explicit or pin < len(p) + self.min_tokens):
-                return 0
-        self.note_pin(cur, pin, explicit=False)
+        # a client's own pin serves this prompt: an automatic one would unpin it
+        if any(len(p) < len(cur) and cur[:len(p)] == p for p in explicit):
+            return 0
         return pin

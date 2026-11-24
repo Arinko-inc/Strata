@@ -46,7 +46,7 @@ class Pick(unittest.TestCase):
         self.assertGreater(p2, 40000 - auto_prefix.QUANTUM - auto_prefix.MARGIN)
         self.assertLessEqual(p2, 2 + 40000 - auto_prefix.MARGIN)
         self.assertEqual(p2 % auto_prefix.QUANTUM, 0)
-        self.assertEqual(p3, 0)                                                   # the pin p2 left serves the followers
+        self.assertEqual(p3, p2)          # sent again: the engine drops it when an unrelated prompt comes between
 
     def test_head_in_a_system_message_is_left_to_the_root(self):
         sysmsg = doc(40000, 8)
@@ -78,7 +78,8 @@ class Pick(unittest.TestCase):
         self.assertLess(pin, len(h) + 3 - 1)
 
     def test_off_by_default_and_with_0(self):
-        for env in ({}, {"STRATA_AUTO_PREFIX": "0"}, {"STRATA_AUTO_PREFIX": ""}):
+        for env in ({}, {"STRATA_AUTO_PREFIX": "0"}, {"STRATA_AUTO_PREFIX": ""}, {"STRATA_AUTO_PREFIX": "false"},
+                    {"STRATA_AUTO_PREFIX": "no"}, {"STRATA_AUTO_PREFIX": "true"}):
             ap = AutoPrefix(T, env=env)
             ap.pick(user_prompt(self.head, doc(400, 1)))
             self.assertEqual(ap.pick(user_prompt(self.head, doc(400, 2))), 0)
@@ -86,18 +87,23 @@ class Pick(unittest.TestCase):
     def test_an_explicit_pin_is_not_replaced(self):
         first = user_prompt(self.head, doc(400, 1))
         self.ap.pick(first)
-        self.ap.note_pin(first, 40002, explicit=True)                             # the client marked its document
+        self.ap.note_explicit(first, 40002)                                       # the client marked its document
         self.assertEqual(self.ap.pick(user_prompt(self.head, doc(400, 2))), 0)
         self.assertEqual(self.ap.pick(user_prompt(self.head + doc(9000, 4), doc(400, 3))), 0)
 
-    def test_the_held_automatic_pin_is_kept_unless_much_more_is_shared(self):
+    def test_an_explicit_pin_survives_a_later_one_that_never_ran(self):
+        first = user_prompt(self.head, doc(400, 1))
+        self.ap.pick(first)
+        self.ap.note_explicit(first, 40002)
+        other = user_prompt(doc(40000, 12), doc(400, 2))
+        self.ap.note_explicit(other, 40002)                                       # (cancelled in the queue)
+        self.assertEqual(self.ap.pick(user_prompt(self.head, doc(400, 3))), 0)
+
+    def test_the_pin_comes_back_after_an_unrelated_prompt(self):
         self.ap.pick(user_prompt(self.head, doc(400, 1)))
         p = self.ap.pick(user_prompt(self.head, doc(400, 2)))
-        self.assertGreater(p, 0)
-        longer = self.head + doc(9000, 4)
-        self.assertEqual(self.ap.pick(user_prompt(longer, doc(400, 3))), 0)       # shares ~p with the earlier ones
-        p2 = self.ap.pick(user_prompt(longer, doc(400, 5)))                       # shares 9000 more with the last
-        self.assertGreater(p2, p + 4096)
+        self.ap.pick(user_prompt(doc(150, 13), doc(10, 3)))                       # short and unrelated
+        self.assertEqual(self.ap.pick(user_prompt(self.head, doc(400, 4))), p)
 
     def test_a_new_document_moves_the_pin(self):
         other = doc(40000, 11)

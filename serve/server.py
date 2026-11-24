@@ -5484,9 +5484,8 @@ class Service:
             if lead:
                 req["strata_prefix"] = {"messages": lead}
         ap = getattr(self, "auto_prefix", None)
-        conv_cache = (getattr(self.engine, "info", None) or {}).get("conversation_cache_mib")
-        if (ap is not None and req is not None and req.get("strata_prefix") is None and self.family != "deepseek41"
-                and not images and not ds_pics and not (isinstance(conv_cache, int) and conv_cache > 0)):
+        if (ap is not None and ap.enabled and req is not None and req.get("strata_prefix") is None
+                and self.family != "deepseek41" and not images and not ds_pics and not self.conversation_cache_on()):
             pin = ap.pick(ids)
             if pin:
                 print(f"[strata] auto prefix: pin={pin} of the {len(ids)}-token prompt (its start, shared with a recent "
@@ -5495,8 +5494,17 @@ class Service:
         elif req is not None and req.get("strata_prefix") is not None:
             req["strata_prefix"] = self.resolve_prefix(req["strata_prefix"], messages, tools, kwargs, ids, bool(images) or ds_pics)
             if ap is not None:
-                ap.note_pin(ids, (req["strata_prefix"] or {}).get("tokens", 0), explicit=True)
+                ap.note_explicit(ids, (req["strata_prefix"] or {}).get("tokens", 0))
         return ids, kwargs.get("enable_thinking", True) is not False, max_new
+
+    def conversation_cache_on(self) -> bool:
+        """Whether an engine this request may run on parks conversations (--conversation-cache-mib): every replica is
+        asked, since the replica is picked after prepare() (Arinko-inc: serve/auto_prefix.py stays off there)."""
+        for e in getattr(self.engine, "engines", None) or [self.engine]:
+            mib = (getattr(e, "info", None) or {}).get("conversation_cache_mib")
+            if isinstance(mib, int) and mib > 0:
+                return True
+        return False
 
     @staticmethod
     def deepseek_shared_start(messages) -> int:
