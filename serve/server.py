@@ -4408,6 +4408,8 @@ class Service:
         self.stop_ids = set(tokenizer.encode(IM_END, parse_special=True) +
                             tokenizer.encode("<|endoftext|>", parse_special=True))
         self.family = None                              # the model family ("deepseek41"): set_family() below
+        from serve.auto_prefix import AutoPrefix        # Arinko-inc: a pin inside one message (serve/auto_prefix.py)
+        self.auto_prefix = AutoPrefix(StrataEngine.TURN_ID)
         self.parser_cls = OutputParser                  # reads the model's output (reasoning, content, tool calls)
         # #567: a prompt re-encodes only what follows the last special token it shares with a recent prompt (the
         # same ids as a full encode: tools/strata_tokenizer.py PromptEncoder).  Tokenizers without resume points
@@ -5481,6 +5483,13 @@ class Service:
             lead = self.deepseek_shared_start(messages)
             if lead:
                 req["strata_prefix"] = {"messages": lead}
+        if (req is not None and req.get("strata_prefix") is None and self.family != "deepseek41" and not images
+                and not ds_pics and getattr(self, "auto_prefix", None) is not None):
+            pin = self.auto_prefix.pick(ids)
+            if pin:
+                print(f"[strata] auto prefix: pin={pin} of the {len(ids)}-token prompt (its start, shared with a recent "
+                      "prompt, runs inside one message)", flush=True)
+                req["strata_prefix"] = {"tokens": pin}
         if req is not None and req.get("strata_prefix") is not None:
             req["strata_prefix"] = self.resolve_prefix(req["strata_prefix"], messages, tools, kwargs, ids, bool(images) or ds_pics)
         return ids, kwargs.get("enable_thinking", True) is not False, max_new
