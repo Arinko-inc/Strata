@@ -36,7 +36,7 @@ class Lcp(unittest.TestCase):
 
 class Pick(unittest.TestCase):
     def setUp(self):
-        self.ap = AutoPrefix(T, env={})
+        self.ap = AutoPrefix(T, env={"STRATA_AUTO_PREFIX": "1"})
         self.head = doc(40000, 7)
 
     def test_one_message_head_is_pinned_from_the_second_request(self):
@@ -46,7 +46,7 @@ class Pick(unittest.TestCase):
         self.assertGreater(p2, 40000 - auto_prefix.QUANTUM - auto_prefix.MARGIN)
         self.assertLessEqual(p2, 2 + 40000 - auto_prefix.MARGIN)
         self.assertEqual(p2 % auto_prefix.QUANTUM, 0)
-        self.assertEqual(p2, p3)                                                  # the followers ask for the same place
+        self.assertEqual(p3, 0)                                                   # the pin p2 left serves the followers
 
     def test_head_in_a_system_message_is_left_to_the_root(self):
         sysmsg = doc(40000, 8)
@@ -77,13 +77,37 @@ class Pick(unittest.TestCase):
         self.assertGreater(pin, 0)
         self.assertLess(pin, len(h) + 3 - 1)
 
-    def test_off(self):
-        ap = AutoPrefix(T, env={"STRATA_AUTO_PREFIX": "0"})
-        ap.pick(user_prompt(self.head, doc(400, 1)))
-        self.assertEqual(ap.pick(user_prompt(self.head, doc(400, 2))), 0)
+    def test_off_by_default_and_with_0(self):
+        for env in ({}, {"STRATA_AUTO_PREFIX": "0"}, {"STRATA_AUTO_PREFIX": ""}):
+            ap = AutoPrefix(T, env=env)
+            ap.pick(user_prompt(self.head, doc(400, 1)))
+            self.assertEqual(ap.pick(user_prompt(self.head, doc(400, 2))), 0)
+
+    def test_an_explicit_pin_is_not_replaced(self):
+        first = user_prompt(self.head, doc(400, 1))
+        self.ap.pick(first)
+        self.ap.note_pin(first, 40002, explicit=True)                             # the client marked its document
+        self.assertEqual(self.ap.pick(user_prompt(self.head, doc(400, 2))), 0)
+        self.assertEqual(self.ap.pick(user_prompt(self.head + doc(9000, 4), doc(400, 3))), 0)
+
+    def test_the_held_automatic_pin_is_kept_unless_much_more_is_shared(self):
+        self.ap.pick(user_prompt(self.head, doc(400, 1)))
+        p = self.ap.pick(user_prompt(self.head, doc(400, 2)))
+        self.assertGreater(p, 0)
+        longer = self.head + doc(9000, 4)
+        self.assertEqual(self.ap.pick(user_prompt(longer, doc(400, 3))), 0)       # shares ~p with the earlier ones
+        p2 = self.ap.pick(user_prompt(longer, doc(400, 5)))                       # shares 9000 more with the last
+        self.assertGreater(p2, p + 4096)
+
+    def test_a_new_document_moves_the_pin(self):
+        other = doc(40000, 11)
+        self.ap.pick(user_prompt(self.head, doc(400, 1)))
+        self.assertGreater(self.ap.pick(user_prompt(self.head, doc(400, 2))), 0)
+        self.ap.pick(user_prompt(other, doc(400, 3)))
+        self.assertGreater(self.ap.pick(user_prompt(other, doc(400, 4))), 0)
 
     def test_keep_and_min_from_env(self):
-        ap = AutoPrefix(T, env={"STRATA_AUTO_PREFIX_KEEP": "1", "STRATA_AUTO_PREFIX_MIN": "bad"})
+        ap = AutoPrefix(T, env={"STRATA_AUTO_PREFIX": "1", "STRATA_AUTO_PREFIX_KEEP": "1", "STRATA_AUTO_PREFIX_MIN": "bad"})
         self.assertEqual(ap.min_tokens, auto_prefix.DEFAULT_MIN)
         ap.pick(user_prompt(self.head, doc(400, 1)))
         ap.pick(user_prompt(doc(40000, 99), doc(400, 2)))                        # pushes the first one out

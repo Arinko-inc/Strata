@@ -5483,15 +5483,19 @@ class Service:
             lead = self.deepseek_shared_start(messages)
             if lead:
                 req["strata_prefix"] = {"messages": lead}
-        if (req is not None and req.get("strata_prefix") is None and self.family != "deepseek41" and not images
-                and not ds_pics and getattr(self, "auto_prefix", None) is not None):
-            pin = self.auto_prefix.pick(ids)
+        ap = getattr(self, "auto_prefix", None)
+        conv_cache = (getattr(self.engine, "info", None) or {}).get("conversation_cache_mib")
+        if (ap is not None and req is not None and req.get("strata_prefix") is None and self.family != "deepseek41"
+                and not images and not ds_pics and not (isinstance(conv_cache, int) and conv_cache > 0)):
+            pin = ap.pick(ids)
             if pin:
                 print(f"[strata] auto prefix: pin={pin} of the {len(ids)}-token prompt (its start, shared with a recent "
                       "prompt, runs inside one message)", flush=True)
                 req["strata_prefix"] = {"tokens": pin}
-        if req is not None and req.get("strata_prefix") is not None:
+        elif req is not None and req.get("strata_prefix") is not None:
             req["strata_prefix"] = self.resolve_prefix(req["strata_prefix"], messages, tools, kwargs, ids, bool(images) or ds_pics)
+            if ap is not None:
+                ap.note_pin(ids, (req["strata_prefix"] or {}).get("tokens", 0), explicit=True)
         return ids, kwargs.get("enable_thinking", True) is not False, max_new
 
     @staticmethod
@@ -6314,6 +6318,7 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
     total, rounds, done = 0, 0, None
     finalizing = False
     messages = list(messages)
+    first_ids = ids
     while True:
         text, reasoning, calls, own_calls = [], [], [], 0
         for kind, x in svc.run(ids, thinking, tools, max_new, sampling, cancel, declared_only=True):
@@ -6398,6 +6403,12 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
         except ClientGone:                                      # #1999: the client left while a picture was prepared
             done = {**done, "finish": "cancel"}
             break
+        # a pin ("strata_prefix" resolved to {"tokens": N}) names a start of the FIRST prompt; the final round's
+        # rebuilt prompt (its added system message, no tools) may not share it - then it is no pin of this prompt
+        sp = sampling.get("strata_prefix") if isinstance(sampling, dict) else None
+        n_pin = sp.get("tokens") if isinstance(sp, dict) else None
+        if isinstance(n_pin, int) and n_pin > 0 and (len(ids) <= n_pin + 1 or ids[:n_pin] != first_ids[:n_pin]):
+            sampling.pop("strata_prefix", None)
     yield "done", {**done, "completion_tokens": total, "prompt_tokens": len(ids)}
 
 
