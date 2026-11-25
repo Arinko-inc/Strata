@@ -272,7 +272,8 @@ add_library(strata_prefill STATIC ${_prefill}
             ${CMAKE_CURRENT_SOURCE_DIR}/src/prefill/moe_fused_stub.cpp   # upstream's fused int8 kernels: not built here
             ${CMAKE_CURRENT_SOURCE_DIR}/src/prefill/xmx_moe.dp.cpp         # A770 port: grouped XMX expert GEMM
             ${CMAKE_CURRENT_SOURCE_DIR}/src/prefill/esimd_moe.dp.cpp        # 151-b70: fused int8 DPAS expert products (ESIMD, Battlemage)
-            ${CMAKE_CURRENT_SOURCE_DIR}/src/prefill/esimd_scores.dp.cpp)    # the prompt's QSA block scores (ESIMD, Battlemage)
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/prefill/esimd_scores.dp.cpp     # the prompt's QSA block scores (ESIMD, Battlemage)
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/prefill/esimd_scores_mq.dp.cpp) # the same, several queries a thread (STRATA_SCORES_MQ)
 target_compile_options(strata_prefill PUBLIC -qmkl=sequential)
 target_link_options(strata_prefill PUBLIC -qmkl=sequential)
 target_link_libraries(strata_prefill PUBLIC strata_engine)

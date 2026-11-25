@@ -7,6 +7,7 @@
 #include "strata/prefill/xmx_moe.hpp"
 #include "strata/prefill/esimd_moe.hpp"
 #include "strata/prefill/esimd_scores.hpp"
+#include "strata/prefill/esimd_scores_mq.hpp"
 #include "strata/prefill/prefill.hpp"
 #include "strata/core/gguf_expert_source.hpp"
 #include "../../../src/prefill/mmq_resident_sort.hpp"
@@ -3357,6 +3358,16 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                         }
                     } catch (const std::exception& e) { err = std::string("prefill indexer: ") + e.what(); return false; }
                     pt.mark(kPfQsaSel, cs);
+                    // STRATA_SCORES_MQ (opt-in, Battlemage): several queries a thread (prefill/esimd_scores_mq.hpp), the same bits
+                    bool scores_mq = false;
+                    if (strata::prefill::i8::scores_mq_env() > 0) {
+                        const strata::prefill::i8::ScoreSteps sst0{strata::kernels::kStepCount, strata::kernels::kStepNKv,
+                                                                   strata::kernels::kStepNBid, (int) s.idx_dim, (int) s.idx_n_head,
+                                                                   (int) s.idx_block};
+                        const int64_t last_bid = (int64_t) m.steps_host[(size_t) ((T - 1) * strata::kernels::kStepCount + strata::kernels::kStepNBid)];
+                        scores_mq = strata::prefill::i8::scores_mq_prepare(st.idx_pooled, m.q_idx, T, std::min<int64_t>(last_bid, st.idx_pooled_rows),
+                                                                           sst0, m.cs);
+                    }
                     for (int64_t t0 = 0; t0 < T; t0 += m.sel_batch) {
                         const int64_t nb = std::min(m.sel_batch, T - t0);
                         const int32_t* steps0 = m.steps_dev + t0 * strata::kernels::kStepCount;
@@ -3411,6 +3422,10 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                                              (long long) (p0 + T), (int) qsa_index, n_scores, n_diff[1], max_rel[1], n_diff[2], max_rel[2],
                                              n_diff[3], max_rel[3]);
                         }
+                        if (scores_mq && !old_sel &&
+                            strata::prefill::i8::block_scores_mq(st.idx_pooled, st.idx_dead, m.q_idx + t0 * 512, steps0, sst, t0, nb,
+                                                                 m.max_blocks, m.sel_scores, m.cs, active)) {
+                        } else
                         if (!old_sel && esc > 0 &&
                             strata::prefill::i8::block_scores(st.idx_pooled, st.idx_dead, m.q_idx + t0 * 512, steps0, sst, nb,
                                                               m.max_blocks, m.sel_scores, m.cs, active, esc)) {

@@ -1,0 +1,17 @@
+# the 05:42 window: the new exe without flags (hashes), the multi-query scores, the existing flags
+E=/home/arinko/wt/b70-read/strata.mq1; NEED=120 $R new-n $E
+E=/home/arinko/wt/b70-read/strata.mq1; NEED=100 SEQ="3072:3072:2 58368:3072:1" $R mq4-t $E STRATA_SCORES_MQ=4 STRATA_PREFILL_TIMING=1
+E=/home/arinko/wt/b70-read/strata.mq1; NEED=100 SEQ="3072:3072:3 58368:3072:1" $R mq4-n $E STRATA_SCORES_MQ=4
+E=/home/arinko/wt/b70-read/strata.mq1; NEED=100 SEQ="58368:3072:1" $R mq2-t $E STRATA_SCORES_MQ=2 STRATA_PREFILL_TIMING=1
+E=/home/arinko/wt/b70-read/strata.mq1; NEED=100 SEQ="58368:3072:1" $R mq804-t $E STRATA_SCORES_MQ=804 STRATA_PREFILL_TIMING=1
+E=/home/arinko/wt/b70-read/strata.mq1; NEED=100 SEQ="58368:3072:1" $R mq406-t $E STRATA_SCORES_MQ=406 STRATA_PREFILL_TIMING=1
+E=/home/arinko/wt/b70-read/strata.mq1; NEED=100 SEQ="58368:3072:1" $R sc26-t $E STRATA_SCORES_ESIMD=26 STRATA_PREFILL_TIMING=1
+E=/home/arinko/wt/b70-read/strata.mq1; NEED=100 SEQ="3072:3072:3 58368:3072:1" $R base-h $E STRATA_PREFILL_HOST_TIMING=1
+E=/home/arinko/wt/b70-read/strata.mq1; NEED=100 SEQ="3072:3072:3 58368:3072:1" $R grf128-n $E STRATA_I8_GRF=128
+E=/home/arinko/wt/b70-read/strata.mq1; NEED=100 SEQ="3072:3072:3 58368:3072:1" $R mt8-n $E STRATA_I8_MT=8
+E=/home/arinko/wt/b70-read/strata.mq1; NEED=100 SEQ="3072:3072:3 58368:3072:1" $R qonce-n $E STRATA_I8_QONCE=1
+E=/home/arinko/wt/b70-read/strata.mq1; NEED=100 SEQ="3072:3072:3 58368:3072:1" $R sc26-n $E STRATA_SCORES_ESIMD=26
+E=/home/arinko/wt/b70-read/strata.mq1; NEED=100 SEQ="3072:3072:3 58368:3072:1" $R base3-n $E
+E=/home/arinko/wt/b70-read/strata.mq1; NEED=100 SEQ="58368:3072:1" $R mq104-t $E STRATA_SCORES_MQ=104 STRATA_PREFILL_TIMING=1
+E=/home/arinko/wt/b70-read/strata.mq1; NEED=100 SEQ="58368:3072:1" $R mq802-t $E STRATA_SCORES_MQ=802 STRATA_PREFILL_TIMING=1
+E=/home/arinko/wt/b70-read/strata.mq1; NEED=100 SEQ="3072:3072:3 58368:3072:1" $R gdnxe-n $E STRATA_GDN_XE=1
