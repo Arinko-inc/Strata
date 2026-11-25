@@ -311,6 +311,13 @@ public:
     /// 1..the slot's rows.  `rows`, `S`, `hbase`, `tokens` and `pos` are the window's, as batch_launch_rows got them.
     bool batch_commit_rows(const int* rows, int S, int hbase, const int* keep, const int32_t* tokens,
                            const int64_t* pos, std::string& err);
+    /// L1 (Arinko-inc, strata-mesh IMPL-PLAN-2026-11-26-batch-drafts.md 3.4; src/core/verify_deferred.cpp): a remote
+    /// stage worker's deferred window - run_slot_rows over `rows` (hand-off rows [0, S)) without its commit graph, then
+    /// the save graph of capture_deferred(rows, S, save_base) queued behind it, not waited for (this stage's stream
+    /// orders it before its next window or commit).  The rows are in the hand-off when this returns; the commit is
+    /// batch_commit_rows(rows, S, save_base, ...) once the main process has judged them.  After init_deferred_commit.
+    bool run_slot_rows_deferred(const int* rows, int S, int save_base, const int32_t* tokens, const int64_t* pos,
+                                PoolMultiFn pool, void* user, int32_t* out, std::string& err);
     /// Serves the layers of this stage's window that have rung (the CPU pool and the flags), with no CUDA call: 1 once
     /// every layer is served (or the window raises no host doorbells), 0 while one is still to ring.  batch_poll
     /// calls it, unless set_external_serve(true) moved it to a thread of its own (STRATA_PIPED_CONCURRENT: a CUDA

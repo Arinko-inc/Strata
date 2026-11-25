@@ -176,6 +176,23 @@ public:
     /// the regions do not fit `table_cells`, or this device has no position table.
     bool set_slot_positions(int64_t stride, int64_t table_cells, std::string& err);
     int32_t slot_pos_base(int slot) const { return slot_pos_stride_ > 0 ? (int32_t) ((slot + 1) * slot_pos_stride_) : 0; }
+    // ---- L1 (Arinko-inc, strata-mesh IMPL-PLAN-2026-11-26-batch-drafts.md 3.5): a remote stage worker's deferred
+    // windows - the CUDA tree's STRATA_PIPED_MTP pieces (init_deferred_commit, capture_deferred, batch_commit_rows) with
+    // the same meaning, and run_slot_rows_deferred as the CUDA tree's.  In sycl/src/core/verify_deferred.cpp (担当 S);
+    // nothing calls them unless the worker runs with STRATA_WK_PIPED_MTP=1.
+    /// The saved rows for `rows` rows (n_slots * max_t on a worker: one region of max_t rows per slot), after
+    /// init_slots.  Only this stage's layers' rows.
+    bool init_deferred_commit(int rows, std::string& err);
+    bool deferred_commit_on() const { return dc_rows_ > 0; }
+    /// run_slot_rows over `rows` (hand-off rows [0, S)) without its commit graph, then the save graph (the window's rows
+    /// the commit replays -> saved rows [save_base, save_base + S)) queued behind it, not waited for.  The rows are in
+    /// the hand-off when this returns.
+    bool run_slot_rows_deferred(const int* rows, int S, int save_base, const int32_t* tokens, const int64_t* pos,
+                                PoolMultiFn pool, void* user, int32_t* out, std::string& err);
+    /// Queue the commit of that window's accepted prefixes (no host wait): `keep` per slot ID, 1..the slot's rows;
+    /// `rows`, `S`, `hbase` (= its save_base), `tokens` and `pos` as the window's.
+    bool batch_commit_rows(const int* rows, int S, int hbase, const int* keep, const int32_t* tokens,
+                           const int64_t* pos, std::string& err);
 
     // ---- The stages of a layer split as a PIPELINE.  A batch window over the slot GROUP
     // [base, base + S) is launched on ONE stage with its commit right behind it on the stage's stream (a batch window
@@ -335,6 +352,18 @@ private:
     std::vector<uint32_t> pl_ple_rows_;   ///< the window's PLE rows (T x PLE_N_HEADS), gathered when layer 0 is served
     bool capture_commit_batch(const int* rows, int S, int hbase, std::string& err);
     bool stage_batch(const int* rows, int S, int hbase, const int32_t* tokens, const int64_t* pos, std::string& err);
+    // L1 (verify_deferred.cpp, 担当 S): the saved rows, laid out as the CUDA tree's (dc_rows_ rows per layer), the
+    // slots' accepted prefixes (mapped and device, 2 + max_t_ per slot), the save and commit graphs per row layout.
+    // S may add what the port needs here.
+    int dc_rows_ = 0;
+    bool staging_deferred_ = false;   ///< stage_batch for run_slot_rows_deferred: no capture_commit_batch
+    float *dc_qkv_ = nullptr, *dc_h_ = nullptr, *dc_gate_ = nullptr, *dc_beta_ = nullptr, *dc_idx_ = nullptr;
+    float* dc_hist_ = nullptr;
+    void* dc_arena_ = nullptr;
+    int32_t *h_commitd_ = nullptr, *m_commitd_ = nullptr, *commitd_ = nullptr;
+    std::map<std::vector<int>, dpct::experimental::command_graph_exec_ptr> save_bm_, dcommit_bm_;
+    bool capture_deferred(const int* rows, int S, int hbase, std::string& err);
+    void free_deferred();   ///< ~Verifier: the above (best-effort, as the rest there)
     strata::kernels::SamplerParams sampling_ = [] {
         strata::kernels::SamplerParams s;
         s.greedy = true;

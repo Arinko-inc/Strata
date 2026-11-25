@@ -436,6 +436,7 @@ Verifier::~Verifier() try {
         if (kv.second) delete (kv.second);
     for (auto& kv : commit_bm_)
         if (kv.second) delete (kv.second);
+    free_deferred();   // L1 (verify_deferred.cpp): the deferred windows' saved rows and graphs
     if (arena_b_) sycl::free(arena_b_, dpct::get_in_order_queue());
     if (h_commitb_) sycl::free(h_commitb_, dpct::get_in_order_queue());
     if (qcnt_) sycl::free(qcnt_, dpct::get_in_order_queue());
@@ -3118,7 +3119,9 @@ bool Verifier::stage_batch(const int *rows, int S, int hbase,
         }
         bm_used_[key] = ++bm_tick_;
     }
-    if (!capture_batch(rows, S, hbase, err) || !capture_commit_batch(rows, S, hbase, err)) return false;
+    // (L1: a deferred window has its own commit graph, capture_deferred in verify_deferred.cpp)
+    if (!capture_batch(rows, S, hbase, err) || (!staging_deferred_ && !capture_commit_batch(rows, S, hbase, err)))
+        return false;
     const Clock::time_point t0 = Clock::now();
     const QsaShapes s = shapes_of(g);
     for (int t = 0; t < S; ++t) {
