@@ -88,7 +88,6 @@
                          ea.c_str(), eb.c_str());
             return false;
         }
-        strata::core::conversation_checkpoint_join();
         auto same = [](const char* part, const std::vector<uint8_t>& x, const std::vector<uint8_t>& y) {
             const bool eq = x == y;
             size_t first = 0, nz = 0, diff = 0;
