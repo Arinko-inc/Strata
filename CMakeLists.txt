@@ -366,6 +366,11 @@ if(STRATA_BUILD_TESTS)
   target_link_libraries(adapt_early_test PRIVATE Threads::Threads)
   add_test(NAME adapt_early_test COMMAND adapt_early_test)
 
+  # STRATA_WAITB_SPLIT: the per-layer sums and the overlap bound of the waitB measurement: header-only, no GPU
+  add_executable(waitb_split_test tests/core/waitb_split_test.cpp)
+  target_include_directories(waitb_split_test PRIVATE include)
+  add_test(NAME waitb_split_test COMMAND waitb_split_test)
+
   # the default CPU prefill share is not armed when every expert is resident (#1595): header-only rule, no GPU
   add_executable(share_rules_test tests/prefill/share_rules_test.cpp)
   target_include_directories(share_rules_test PRIVATE include)

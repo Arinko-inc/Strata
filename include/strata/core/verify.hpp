@@ -27,6 +27,7 @@
 #include "strata/core/flag_order.hpp"
 #include "strata/core/layer.hpp"
 #include "strata/core/session.hpp"
+#include "strata/core/waitb_split.hpp"
 #include "strata/kernels/sampler.hpp"
 
 #include <cuda_runtime.h>
@@ -540,6 +541,7 @@ private:
     void note_prio_tail(cudaStream_t on, int prio);
     void apply_node_priorities(cudaGraph_t graph, int T);
     void collect_profile();   ///< STRATA_VERIFY_PROFILE: add the last window's stamps to prof_sum_
+    void collect_waitb_split();   ///< STRATA_WAITB_SPLIT: add the last window's layers to wbs_ (after collect_profile)
     void accumulate_profile(const unsigned long long* stamps);
     void accumulate_profile_inner(const unsigned long long* stamps);   ///< one window's stamps (host copy) into prof_sum_
     // pipelined windows (pl_launch ...)
@@ -649,6 +651,12 @@ private:
     bool prof_on_ = false;
     unsigned long long* prof_ = nullptr;              // device: n_layers * kProfPer + 4 stamps
     std::vector<unsigned long long> prof_h_;
+    // STRATA_WAITB_SPLIT (with STRATA_VERIFY_PROFILE): a stamp after the flag-B wait, per layer (group 0); the host's
+    // count of PCIe experts per layer; the sums (see waitb_split.hpp).  null / empty when the flag is off
+    unsigned long long* wbs_dev_ = nullptr;
+    std::vector<unsigned long long> wbs_h_;
+    std::vector<int32_t> wbs_n_;
+    strata::core::waitb_split::Sums wbs_;
     double prof_sum_[2][kProfPer] = {};   // [GDN / QSA layers][stage]
     int64_t prof_windows_ = 0;
     double prof_t_sum_[9][2][kProfPer] = {};   // the same per window size T (1..8), for profile_by_t_report

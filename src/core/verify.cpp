@@ -753,6 +753,7 @@ Verifier::~Verifier() {
     rjob_ = nullptr;
     if (cs_) cudaStreamSynchronize(cs_);
     if (sh_cs_) cudaStreamSynchronize(sh_cs_);
+    if (wbs_dev_ != nullptr) cudaFree(wbs_dev_);
     for (auto& row : exec_)
         for (auto& e : row)
             if (e) cudaGraphExecDestroy(e);
@@ -1103,6 +1104,22 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         const size_t np = (size_t) g.n_layers * kProfPer + 4;
         if (cudaMalloc((void**) &prof_, np * 8) != cudaSuccess) { prof_on_ = false; prof_ = nullptr; cudaGetLastError(); }
         else { cudaMemset(prof_, 0, np * 8); prof_h_.assign(np, 0); }
+    }
+    if (strata::core::waitb_split::on(std::getenv("STRATA_WAITB_SPLIT"))) {   // measurement only
+        if (!prof_on_) {
+            std::fprintf(stderr, "strata verify: STRATA_WAITB_SPLIT needs STRATA_VERIFY_PROFILE=1: off\n");
+        } else if (wbs_dev_ == nullptr) {
+            const size_t nl = (size_t) g.n_layers;
+            if (cudaMalloc((void**) &wbs_dev_, nl * 8) == cudaSuccess) {
+                cudaMemset(wbs_dev_, 0, nl * 8);
+                wbs_h_.assign(nl, 0);
+                wbs_n_.assign(nl, 0);
+                std::fprintf(stderr, "strata verify: STRATA_WAITB_SPLIT: a stamp after the flag-B wait (the GPU profile's line ends with the split)\n");
+            } else {
+                wbs_dev_ = nullptr;
+                cudaGetLastError();
+            }
+        }
     }
     Bump real;
     real.base = (uint8_t*) arena_;
@@ -2336,6 +2353,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             else if (m_bal_ != nullptr)   // set_pcie_balance: the PCIe part starts
                 wait_flag_ge_stamped(m_flagB_, ring, m_bal_ + ((l - lb_) * 2 + grp) * 4 + 1, nullptr, cs);
             else wait_flag_ge(m_flagB_, ring, cs);                 // the PCIe share is in staging (DMA) or mapped
+            if (wbs_dev_ != nullptr && grp == 0) gpu_stamp(wbs_dev_, (int) l, cs);   // STRATA_WAITB_SPLIT
             if (sink_.pcie_mode == 2) {                            // stage it with a copy kernel, then point at staging
                 const int64_t per = G == 2 ? kStagingBlobs / 2 : kStagingBlobs;
                 uint8_t* stage = staging_ + (size_t) (grp * per) * lay.max_blob;
@@ -2634,6 +2652,8 @@ std::string Verifier::profile_report() {
     }
     std::snprintf(b, sizeof b, " | total %.2f ms/window over %lld windows", total / 1e6 / (double) prof_windows_, (long long) prof_windows_);
     out += b;
+    out += wbs_.report();   // STRATA_WAITB_SPLIT: empty unless the flag is on
+    wbs_.reset();
     for (auto& r : prof_sum_) for (double& d : r) d = 0;
     prof_windows_ = 0;
     return out;
@@ -2975,6 +2995,28 @@ void Verifier::stage_inputs(int T, const int32_t* tokens, int64_t pos0) {
 void Verifier::collect_profile() {
     cudaMemcpy(prof_h_.data(), prof_, prof_h_.size() * 8, cudaMemcpyDeviceToHost);
     accumulate_profile(prof_h_.data());
+}
+
+// STRATA_WAITB_SPLIT: one window's layers of this stage, from the profile's stamps 19..23 and the new stamp.  Called
+// right after collect_profile() (prof_h_ is the same window's).
+void Verifier::collect_waitb_split() {
+    if (wbs_dev_ == nullptr) return;
+    cudaMemcpy(wbs_h_.data(), wbs_dev_, wbs_h_.size() * 8, cudaMemcpyDeviceToHost);
+    const auto& lay = strata::kernels::cpu::expert_layout();
+    for (int64_t l = lb_; l < le_; ++l) {
+        const unsigned long long* p = prof_h_.data() + (size_t) l * kProfPer;
+        strata::core::waitb_split::Layer x;
+        x.hits0 = p[19];
+        x.hits1 = p[20];
+        x.flagb = wbs_h_[(size_t) l];
+        x.copy1 = p[21];
+        x.pcie1 = p[22];
+        x.cpu1 = p[23];
+        x.n_fetch = wbs_n_[(size_t) l];
+        x.blob_bytes = (uint64_t) lay.blob_bytes(l);
+        wbs_.add(x);
+    }
+    wbs_.end_window();
 }
 
 void Verifier::accumulate_profile(const unsigned long long* stamps) {
@@ -3339,6 +3381,8 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
             bal_np_[bi] = bal_ok_[bi] ? sink_.counts[2] : 0;
             sink_.cpu_jobs = 0;
         }
+        if (wbs_dev_ != nullptr && grp == 0)   // STRATA_WAITB_SPLIT: the PCIe experts of this layer's plan (an empty plan: 0)
+            wbs_n_[(size_t) l] = *(volatile uint32_t*) h_flagA_ == want ? sink_.counts[2] : 0;
         if (*(volatile uint32_t*) h_flagA_ != want) {        // the pool did not publish a plan: an empty one
             sink_.counts[0] = 0;
             sink_.counts[1] = 0;
@@ -3388,7 +3432,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
             return false;
         }
         commit_pending_ = false;
-        if (prof_on_ && G == 1) collect_profile();
+        if (prof_on_ && G == 1) { collect_profile(); collect_waitb_split(); }
         return true;
     }
     progress_at("verify window: waiting for the GPU to finish the window (flags A/B/M raised)", (int64_t) T);
@@ -3421,7 +3465,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         copy_used_ = false;
     }
     if (h_bal_ != nullptr && !all_resident_ && !bal_paused_) pcie_balance_window(steps, G);
-    if (prof_on_ && G == 1) collect_profile();   // the window's GPU stage stamps
+    if (prof_on_ && G == 1) { collect_profile(); collect_waitb_split(); }   // the window's GPU stage stamps
     // ---- a sampled or penalized request: the head's sampling again, host-side so its parameters are this call's
     // own (a captured kernel would replay the same draws forever).  Row t's draw is Philox(seed, pos0 + t): tied to
     // the POSITION it samples, not to how the text was cut into windows, so a seed replays the same text whatever
