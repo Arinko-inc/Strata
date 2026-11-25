@@ -1314,6 +1314,17 @@ bool gate_up(int gu_type, const uint8_t* const* blob, size_t up_off, int n_ff, c
     a.ldy = 2 * n_ff;
     a.dbg = dbg_flags();
     const int mt = gu_type == T_Q4K ? mt_q4k(lo) : mt_for(lo);
+    // STRATA_I8_Q4K_MT6 (opt-in): six row tiles a thread for Q4_K groups above 4 (=1) or 2.5 (=2) tiles per expert, so an expert
+    // of 33-48 rows is decoded once, not twice (MT 4), without MT 8's spill.  The same sums per row: the same bits.
+    if (gu_type == T_Q4K && !mt_env()) {
+        static const int mt6 = [] { const char* e = std::getenv("STRATA_I8_Q4K_MT6"); return e ? std::atoi(e) : 0; }();
+        const double mean = (double) lo.tile0[lo.n] / lo.n;
+        if ((mt6 == 1 && mean > 4.0) || (mt6 == 2 && mean > 2.5)) {
+            const int rb6 = fill_args_mt(a, lo, 6);
+            launch_gu_q4k_wg<6, 256, 2>(q, a, rb6);
+            return true;
+        }
+    }
     const int rb = fill_args_mt(a, lo, mt);
     return dispatch_mt(mt, [&](auto mtc) {
         constexpr int MT = decltype(mtc)::value;
