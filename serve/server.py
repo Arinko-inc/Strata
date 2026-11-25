@@ -4376,6 +4376,8 @@ class Service:
         self.config_effort = None                     # #1641: the config's "reasoning_effort": the level for requests with none
         self.keep_awake = None                        # #1727 (opt-in): serve.keepawake.KeepAwake, the config's "prevent_sleep"
         self.fifo = threading.Lock()
+        if isinstance(engine, StrataEngine):            # Arinko-inc: serve/warm_heads.py は温めの開始をこの番で守る
+            engine.service_turn = self.fifo
         self.slot_save_path = None                    # --slot-save-path: /slots/0?action=save|restore (off when None)
         self.embeddings = threading.local()           # the current request's image embeddings file (GENI)
         self.api_key = ""                              # when set, /v1/* needs it (Bearer or x-api-key)
@@ -4959,6 +4961,9 @@ class Service:
         """POST /load and every generation request: start the engine now if it is unloaded (raises GpuBusy)."""
         # a request is on its way: the idle thread must not unload between this and the request's own start
         self.last_request_at = time.time()
+        wh = getattr(self.engine, "warm_heads", None)   # Arinko-inc: serve/warm_heads.py (STRATA_WARM_HEADS=1)
+        if wh is not None:
+            wh.expect()                                 # 要求が来る: 温めをしばらく始めない
         if self.loaded() and not self._vision_down():
             return
         trace = getattr(self.request_trace, "record", None)
@@ -4978,6 +4983,9 @@ class Service:
                         trace["state"] = "loading"
                 try:
                     self.ensure_loaded()
+                    wh = getattr(self.engine, "warm_heads", None)
+                    if wh is not None:
+                        wh.expect()                     # (起こし直したあと、番を放す前に: 温めより要求が先)
                 finally:
                     if trace is not None:
                         with self.status_lock:
@@ -6226,6 +6234,8 @@ class Service:
             finish = "error"
             raise
         finally:
+            if wh is not None:
+                wh.leaving()                            # arriving() の対
             with self.status_lock:
                 if queued_counted:
                     self.status["queued"] -= 1
@@ -8959,6 +8969,8 @@ def start_replicas(cfg: dict, groups: list[list[int]], exe: str, effort_end: lis
     """Opt-in data-parallel replicas (serve/replicas.py): one StrataEngine per card group, each with its own cards, log
     and CPU cores, started together; the ReplicaEngine in front spreads the requests."""
     from serve import replicas as rp
+    from serve import warm_heads
+    warm_heads.not_here("replicas")                     # Arinko-inc: 温めはエンジン 1 つの構成だけ(serve/warm_heads.py)
     n = len(groups)
     cpus = rp.cpu_sets(n, cfg.get("replica_cpus") is not False)
     print(f"[strata] {n} replicas on the cards {' | '.join(','.join(map(str, g)) for g in groups)}"
@@ -9003,6 +9015,8 @@ def start_split(cfg: dict, spec: dict, exe: str, effort_end: list[str], lazy: bo
     same session settings.  Started one after the other, so a shared expert arena is filled once; the SplitEngine in
     front hands a long prompt from the first to the second."""
     from serve import split as sp
+    from serve import warm_heads
+    warm_heads.not_here("split serving")                # Arinko-inc: 温めはエンジン 1 つの構成だけ(serve/warm_heads.py)
     sp.check_cfg(cfg, spec)
     arena, arena_note = sp.arena_path(cfg, spec)
     work = sp.session_dir(spec)

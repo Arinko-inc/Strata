@@ -6,6 +6,7 @@ StrataEngine と Service を動かし、エンジンへ届く命令(BGEN と max
 import base64
 import json
 import os
+import sys
 import tempfile
 import threading
 import time
@@ -71,6 +72,9 @@ class Env(unittest.TestCase):
             wh.note(ids, 199, images=False, finish="stop")
             wh.note(ids, 199, images=False, finish="stop")
             wh.arriving(ids)
+            wh.leaving()
+            wh.expect()
+            self.assertEqual((wh._inflight, wh._expect_at), (0, float("-inf")))
             wh.on_ready(object())
             self.assertEqual(wh.saved(), [])
             self.assertIsNone(wh._thread)
@@ -272,8 +276,223 @@ class Select(unittest.TestCase):
         self.assertEqual(os.listdir(self.tmp.name), [])
 
 
+class Stub:
+    """WarmHeads._warm が触るだけの偽のエンジン(制御の行は持たない)。generate は送った (長さ, max_new) を記録する。"""
+
+    def __init__(self, ctx=4096, info=None, batch=4, busy=False):
+        self.gen, self.starting, self.batch, self.max_context = 1, False, batch, ctx
+        self.info = {"engine": "0.1.39"} if info is None else info
+        self.slot_cv, self.waiting, self.admitting = threading.Condition(), 0, 0
+        self.slot_busy = [busy] * batch
+        self.ctl = threading.Lock()
+        self.keep_heads, self.slot_gs = None, 0
+        self.sent = []
+
+    def alive(self):
+        return True
+
+    def generate(self, ids, max_new, sampling, cancel):
+        self.sent.append((len(ids), max_new))
+        started = getattr(cancel, "_strata_queue_started", None)
+        if started is not None:
+            started()
+        yield from ()
+
+
+class Review(unittest.TestCase):
+    """別系統レビュー(2026-11-26 warm-sol1)の指摘の再現。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = Path(self.tmp.name) / "w.json"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def wh(self, **extra):
+        w = WarmHeads(None, TURN, make_env(self.path, **extra))
+        w._say = lambda line, w=w: w.log_lines.append(line)          # 試験の出力を汚さない
+        return w
+
+    def heads_in_file(self):
+        return [h["n"] for h in json.loads(self.path.read_text())["heads"]]
+
+    def test_p2_saves_while_the_warm_up_waits_for_an_idle_engine(self):
+        """[P2] 温めが空きを待つあいだも、新しく条件を満たした頭を保存する。"""
+        a, b = ids_of(1, 200), ids_of(2, 300)
+        first = self.wh()
+        two_notes(first, a)
+        first.save_now()
+        wh = self.wh()
+        eng = Stub(busy=True)                            # ずっと空かない
+        wh.on_ready(eng)
+        for _ in range(3):
+            wh.note(b, 299, images=False, finish="stop")
+        t0 = time.time()
+        while time.time() - t0 < 4 and self.heads_in_file() != [299]:
+            time.sleep(0.05)
+        eng.gen = 2                                      # 待ちを終わらせる
+        self.assertEqual(self.heads_in_file(), [299])
+        self.assertEqual(eng.sent, [])
+
+    def test_p2_an_expired_last_head_leaves_the_file(self):
+        """[P2] 最後の頭が期限切れになったら、ファイルからも消える(実行中)。"""
+        wh = self.wh()
+        two_notes(wh, ids_of(1, 200))
+        wh._loaded = True
+        wh._maybe_save()
+        self.assertEqual(self.heads_in_file(), [199])
+        for h in wh._mem.values():
+            h.last_used = time.time() - 8 * 86400
+        wh._maybe_save()
+        self.assertEqual(self.heads_in_file(), [])
+
+    def test_p2_an_expired_head_in_the_file_is_removed_at_the_start(self):
+        """[P2] 起動のとき、ファイルの頭がすでに期限切れなら、ファイルから消える。"""
+        wh = self.wh()
+        two_notes(wh, ids_of(1, 200))
+        wh.save_now()
+        data = json.loads(self.path.read_text())
+        data["heads"][0]["last_used"] = time.time() - 8 * 86400
+        self.path.write_text(json.dumps(data))
+        again = self.wh()
+        again._ensure_loaded(Stub())
+        again._maybe_save()
+        self.assertEqual(self.heads_in_file(), [])
+
+    def test_p2_a_save_cut_to_4_mib_is_not_written_again_and_again(self):
+        """[P2] 4 MiB に収めるために頭を外した保存のあと、要求が無いのに同じファイルを書き直さない。"""
+        wh = self.wh(STRATA_WARM_HEADS_MAX=2)
+        two_notes(wh, ids_of(1, 200))
+        two_notes(wh, ids_of(2, 200))
+        wh._loaded = True
+        writes = []
+        real = os.replace
+
+        def spy(src, dst):
+            writes.append(dst)
+            return real(src, dst)
+        with mock.patch("serve.warm_heads.FILE_MAX_BYTES", 2000), mock.patch("serve.warm_heads.os.replace", spy):
+            wh._maybe_save()
+            self.assertEqual(len(self.heads_in_file()), 1)
+            for _ in range(3):
+                wh._maybe_save()
+        self.assertEqual(len(writes), 1)
+
+    def test_p3_a_failed_save_of_counts_is_tried_again(self):
+        """[P3] 回数だけが変わった保存が OSError で失敗しても、あとでやり直す。"""
+        wh = self.wh()
+        ids = ids_of(1, 200)
+        two_notes(wh, ids)
+        wh._loaded = True
+        wh._maybe_save()
+        wh.note(ids, 199, images=False, finish="stop")                     # 回数だけ 3 に
+        wh._last_save = time.monotonic() - 700
+        with mock.patch("serve.warm_heads.os.replace", side_effect=OSError("disk full")):
+            wh._maybe_save()
+        self.assertEqual(json.loads(self.path.read_text())["heads"][0]["reuses"], 2)
+        wh._retry_after = 0.0
+        wh._maybe_save()
+        self.assertEqual(json.loads(self.path.read_text())["heads"][0]["reuses"], 3)
+
+    def test_p3_a_head_too_long_for_the_context_is_skipped_and_the_next_is_read(self):
+        """[P3] 文脈に収まらない頭だけを飛ばし、次の頭は読む。"""
+        wh = self.wh(STRATA_WARM_HEADS_MAX=2)
+        for _ in range(3):
+            wh.note(ids_of(1, 301), 300, images=False, finish="stop")
+        two_notes(wh, ids_of(2, 101), reused=100)
+        eng = Stub(ctx=250)
+        wh._warm(eng)
+        self.assertEqual(eng.sent, [(101, 1)])
+
+    def test_p3_the_engine_margin_of_8_tokens_is_counted(self):
+        """[P3] エンジンは prompt + max_new + 8 > 文脈 の命令を断る(server.CTX_SLACK)。それを送らない。"""
+        wh = self.wh()
+        two_notes(wh, ids_of(1, 101), reused=100)
+        eng = Stub(ctx=105)                              # 101 + 1 + 8 > 105
+        wh._warm(eng)
+        self.assertEqual(eng.sent, [])
+        eng = Stub(ctx=110)                              # ちょうど収まる
+        wh._warm(eng)
+        self.assertEqual(eng.sent, [(101, 1)])
+
+    def test_reads_that_finished_do_not_count_toward_tries(self):
+        """STRATA_WARM_HEADS_TRIES は止められた読み込みの数。読み終えた頭は数えない(MAX が TRIES より多くても全部読む)。"""
+        wh = self.wh(STRATA_WARM_HEADS_MAX=2, STRATA_WARM_HEADS_TRIES=1)
+        two_notes(wh, ids_of(1, 101), reused=100)
+        two_notes(wh, ids_of(2, 151), reused=150)
+        eng = Stub()
+        wh._warm(eng)
+        self.assertEqual(sorted(eng.sent), [(101, 1), (151, 1)])
+
+    def test_p2_the_qwen36_engine_path_is_not_warmed(self):
+        """[P2] Qwen3.6 の経路(INFO に engine= が無い)では温めない(確かめていない経路。ログに 1 行)。"""
+        wh = self.wh()
+        two_notes(wh, ids_of(1, 200))
+        eng = Stub(info={"batch_slots": 4, "slot_cache": 1})
+        wh._warm(eng)
+        self.assertEqual(eng.sent, [])
+        self.assertIn("not used", wh.log_lines[-1])
+
+    def test_p2_requests_and_a_coming_request_keep_it_from_starting(self):
+        """[P2] arriving() から leaving() までと、expect() から EXPECT_S 秒は、エンジンが空いていても始めない。
+        登録したがまだ送っていない温めは、頭が同じ要求でも止める。"""
+        wh = self.wh()
+        eng = Stub()
+        self.assertTrue(wh._idle(eng))
+        wh.arriving(ids_of(1, 10))
+        self.assertFalse(wh._idle(eng))
+        wh.leaving()
+        self.assertTrue(wh._idle(eng))
+        wh.expect()
+        self.assertFalse(wh._idle(eng))
+        with mock.patch.object(WarmHeads, "EXPECT_S", 0.0):
+            self.assertTrue(wh._idle(eng))
+        from serve.warm_heads import _Active
+        head = ids_of(1, 100)
+        a = _Active(threading.Event(), head, 100)
+        wh._active = a
+        wh.arriving(head + [TURN, 5])                    # 同じ頭。まだ送っていない -> 止める
+        self.assertTrue(a.cancel.is_set())
+        b = _Active(threading.Event(), head, 100, started=True)
+        wh._active = b
+        wh.arriving(head + [TURN, 5])                    # 送ったあと、同じ頭 -> 止めない
+        self.assertFalse(b.cancel.is_set())
+        wh.arriving(ids_of(2, 120))                      # 送ったあと、違う頭 -> 止める
+        self.assertTrue(b.cancel.is_set())
+
+    def test_p2_replicas_and_split_are_not_warmed(self):
+        """[P2] 複数レプリカ・split の構成では温めない(start_replicas が旗を切る。ログに 1 行)。"""
+        import serve.server as server
+        import serve.warm_heads as whm
+        seen = []
+
+        class Fake:
+            def __init__(self, *a, **kw):
+                self.warm_heads = WarmHeads(None, TURN, make_env(self.path_))
+                seen.append(self.warm_heads.enabled)
+            path_ = self.path
+        try:
+            with mock.patch.object(server, "StrataEngine", Fake), \
+                    mock.patch.object(server, "engine_args", lambda c: []), \
+                    mock.patch.object(server, "child_env", lambda c, offline=False: {}), \
+                    mock.patch("builtins.print"):
+                server.start_replicas({"args": []}, [[0], [1]], "strata", [], False)
+        finally:
+            whm.not_here(None)
+        self.assertEqual(seen, [False, False])
+        self.assertTrue(WarmHeads(None, TURN, make_env(self.path)).enabled)
+
+
 FAKE_FAST = tp.FAKE_BATCH
 FAKE_SLOW = tp.FAKE_BATCH.replace("STEP = 0.02", "STEP = 0.04")      # 塊 1 つの読みが 20 ms: 3900 トークンで約 2.4 秒
+# VRAM の命令に答える偽エンジン(読込の途中に来た VRAM は、その読込のあとで答える。本物と同じく制御の行は 1 本)
+FAKE_VRAM = FAKE_SLOW.replace('    if line.startswith(("GEN ", "BGEN ")):\n',
+                              '    if line.startswith("VRAM"):\n'
+                              '        print("VRAM expert_slots=8 vram_free_mib=100", flush=True)\n'
+                              '        continue\n'
+                              '    if line.startswith(("GEN ", "BGEN ")):\n', 1)
+assert FAKE_VRAM != FAKE_SLOW
 
 
 class ServerPath(FakeEngineCase):
@@ -517,6 +736,108 @@ class ServerPath(FakeEngineCase):
         self.ask(self.SYSTEM)
         self.ask(self.SYSTEM)
         self.assertEqual(self.engine.warm_heads._mem, {})
+
+    def warm_again(self, ids, n):
+        """今のエンジンのまま、頭を覚えさせて READY をもう一度知らせる(温めをもう 1 回回す)。"""
+        wh = self.engine.warm_heads
+        two_notes(wh, ids[:n + 1], reused=n)
+        wh.on_ready(self.engine)
+
+    def test_12_p1_it_does_not_start_while_the_service_holds_its_turn(self):
+        """[P1] Service の番(fifo。ensure_loaded の再起動と VRAM、/v1/vram、/load が持つ)を誰かが持つあいだは、
+        温めを始めない(制御の行の応答を取り合わない)。"""
+        ids = self.prompt_ids(self.SYSTEM)
+        n = len(ids) - 30
+        self.start_wh()
+        self.wait_for("nothing to warm up")
+        with self.svc.fifo:
+            self.warm_again(ids, n)
+            time.sleep(1.5)
+            self.assertEqual(self.commands(), [])
+        self.wait_for("read in")
+        self.assertEqual(self.calls, [(n + 1, 2)])
+
+    def test_13_p1_a_restart_with_a_vram_reserve_and_a_warm_up_do_not_mix_their_lines(self):
+        """[P1] 要求がエンジンを起こし直し、続けて VRAM の予約を戻す(ensure_loaded)。その間に温めが始まると、
+        VRAM と BGEN の応答を取り違えて、VRAM は時間切れ、温めは BADM を待ち続けた。"""
+        import serve.server as server
+        ids = self.prompt_ids(self.SYSTEM)
+        n = len(ids) - 30
+        self.put_head(ids, n)
+        with mock.patch.object(tp, "FAKE_BATCH", FAKE_VRAM):
+            self.start_wh()
+        self.wait_for("read in")
+        self.svc.vram_reserve = 100
+        old = self.engine.proc
+        old.kill()
+        old.wait(timeout=10)
+        t0 = time.time()
+        while self.engine.alive() and time.time() - t0 < 5:
+            time.sleep(0.05)
+        self.assertFalse(self.engine.alive())
+        got = {}
+        real_vram = StrataEngine.vram
+
+        def slow_vram(engine, reserve, timeout=120.0):
+            time.sleep(0.8)                              # 再起動のあとの片付け(画像の会話の復元など)の分
+            try:
+                got["out"] = real_vram(engine, reserve, timeout=5.0)
+            except Exception as e:                      # noqa: BLE001
+                got["err"] = e
+                raise
+            return got["out"]
+        script = Path(self.tmp.name) / "fake_strata.py"
+        real_popen = server.subprocess.Popen
+        with mock.patch.object(server.subprocess, "Popen",
+                               lambda cmd, **kw: real_popen([sys.executable, str(script), *cmd[1:]], **kw)), \
+                mock.patch.object(StrataEngine, "vram", slow_vram):
+            self.svc.load()
+        self.assertNotIn("err", got)
+        self.assertEqual(got["out"].get("expert_slots"), 8)
+        t0 = time.time()
+        while self.count("read in") < 2 and time.time() - t0 < 20:
+            time.sleep(0.05)
+        self.assertEqual(self.count("read in"), 2, self.engine.warm_heads.log_lines)
+        self.assertEqual(self.ask(self.OTHER), "ok, done.")
+
+    def test_14_p2_a_request_that_came_while_it_decided_goes_first(self):
+        """[P2] 空きを確かめてから温めを登録するまでに来た(別の頭の)要求は、温めのあとに回されない。"""
+        ids = self.prompt_ids(self.SYSTEM)
+        n = len(ids) - 30
+        self.start_wh()
+        self.wait_for("nothing to warm up")
+        fired, arrived = threading.Event(), threading.Event()
+        out = {}
+        real_wait, real_arriving = WarmHeads._wait_idle, WarmHeads.arriving
+
+        def go():
+            t0 = time.time()
+            out["reply"] = self.ask(self.OTHER)
+            out["took"] = time.time() - t0
+
+        def wait(wh, engine, gen, idle_s):
+            ok = real_wait(wh, engine, gen, idle_s)
+            if ok and not fired.is_set():                # 空きを確かめた直後に、要求が来る
+                fired.set()
+                threading.Thread(target=go, daemon=True).start()
+                arrived.wait(10)
+            return ok
+
+        def arriving(wh, ids_):
+            real_arriving(wh, ids_)
+            arrived.set()
+            t0 = time.time()                             # 温めが先に制御を取れるだけの間を置く(最悪の順)
+            while time.time() - t0 < 1.0 and not self.commands():
+                time.sleep(0.01)
+        with mock.patch.object(WarmHeads, "_wait_idle", wait), mock.patch.object(WarmHeads, "arriving", arriving):
+            self.warm_again(ids, n)
+            t0 = time.time()
+            while "took" not in out and time.time() - t0 < 20:
+                time.sleep(0.05)
+        self.assertEqual(out.get("reply"), "ok, done.")
+        first = self.commands()[0].split()
+        self.assertNotEqual(int(first[2]), n + 1, self.commands())     # 最初にエンジンに入ったのは要求
+        self.assertLess(out["took"], 2.0)
 
 
 if __name__ == "__main__":

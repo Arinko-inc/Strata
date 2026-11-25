@@ -8,10 +8,16 @@
 - `WarmHeads.note`: 要求が終わったとき(`Service._run` の finally)に呼ばれる。再利用された頭を数えるだけで、I/O をしない
 - `WarmHeads.save_now`: 回数の多い頭を MAX 本、JSON 1 つに原子的に書く(WarmHeads のスレッドだけが呼ぶ)
 - `WarmHeads.on_ready`: エンジンの READY ごとに呼ばれる(`StrataEngine.__init__` の最後)。スレッドは最初の 1 回で始める
-- `WarmHeads.arriving`: 要求がエンジンに入る前に呼ばれる。温めている頭と違う頭の要求が来たら、温めを止める
+- `WarmHeads.arriving` / `leaving`: 要求の始まりと終わり(`Service._run`)。要求が 1 本でもあるあいだは温めを始めない。
+  温めている頭と違う頭の要求が来たら(読み始める前なら頭が同じでも)、温めを止める
+- `WarmHeads.expect`: `Service.load` から(要求の本文を ids にする前)。そのあと EXPECT_S 秒は温めを始めない
+- 温めは、Service の番(fifo。再起動と VRAM の予約・/v1/vram・/load が持つ)が空いているときだけ始め、エンジンに
+  命令を送るまでそれを持つ(エンジンの制御の行の応答を、VRAM などの命令と取り合わない)
+- 複数レプリカ・split の構成(`not_here`)と、INFO に engine= が無いエンジン(Qwen3.6 の経路)では温めない
 
 送る列は 頭 + [TURN_ID]。最後の `<|im_start|>` に turn のチェックポイントが置かれるので、頭の長さちょうどで再利用できる。
 keep-heads が使える構成では max_new を 2 にする(1 では枠に写らない。keep_heads.py の held_after_admission)。
+送る列 + max_new + CTX_SLACK が文脈を超える頭は飛ばす(エンジンが断るため)。
 
 旗が無い(STRATA_WARM_HEADS が ちょうど 1 でない)ときは、スレッドもファイルも作らず、note・arriving・on_ready は
 何もしない。設定(環境変数。どれも範囲外・数でないときは既定値):
@@ -23,7 +29,7 @@ keep-heads が使える構成では max_new を 2 にする(1 では枠に写ら
   STRATA_WARM_HEADS_MAX_TOKENS  1 つの頭の上限(131072)
   STRATA_WARM_HEADS_TTL_DAYS    最後の再利用からこの日数を過ぎた頭は捨てる(7)
   STRATA_WARM_HEADS_IDLE_S      止めた温めをやり直す前に、エンジンが空いている秒数(60)
-  STRATA_WARM_HEADS_TRIES       エンジンの起動 1 回あたりの読み込みの上限(3)
+  STRATA_WARM_HEADS_TRIES       エンジンの起動 1 回あたり、止められた読み込みの上限(3。読み終えた分は数えない)
 """
 from __future__ import annotations
 
@@ -53,6 +59,18 @@ FILE_VERSION = 1
 FILE_MAX_BYTES = 4 << 20
 SAVE_EVERY_S = 600.0
 MEM_HEADS = 16                  # メモリに持つ頭の数の上限
+CTX_SLACK = 8                   # `strata --serve` は prompt + max_new + 8 > 文脈 の命令を断る(server.CTX_SLACK と同じ)
+
+_NOT_HERE: str | None = None    # not_here(): この構成では温めない理由(None: 温めてよい)
+_said_not_here = False
+
+
+def not_here(reason: str | None) -> None:
+    """このプロセスでは温めない(複数レプリカ・split。server.start_replicas / start_split がエンジンを作る前に呼ぶ)。
+    確かめたのはエンジン 1 つの構成だけで、レプリカでは要求の振り分け先と温めの対象が結びつかず、保存先も共有になる。
+    None で戻す(試験用)。"""
+    global _NOT_HERE, _said_not_here
+    _NOT_HERE, _said_not_here = reason, False
 
 
 def env_on(env=None) -> bool:
@@ -121,6 +139,7 @@ class _Active:
     cancel: threading.Event
     head: list
     n: int
+    started: bool = False       # 命令をエンジンに送った(それまでは、どの要求が来ても止める)
 
 
 class WarmHeads:
@@ -128,10 +147,17 @@ class WarmHeads:
 
     POLL = 0.2              # エンジンが空くのを見る間隔(秒)
     TICK = 1.0              # 保存の要否を見る間隔(秒)
+    EXPECT_S = 5.0          # expect() のあと、温めを始めない秒数(要求の本文を ids にするあいだ)
 
     def __init__(self, log_path: str | None, turn_id: int, env=None):
         env = os.environ if env is None else env
         self.enabled = env_on(env)
+        if self.enabled and _NOT_HERE:
+            self.enabled = False
+            global _said_not_here
+            if not _said_not_here:
+                _said_not_here = True
+                print(f"[strata] warm heads: not used with {_NOT_HERE} (checked with one engine only)", flush=True)
         self.turn_id = int(turn_id)
         self.path = str(env.get("STRATA_WARM_HEADS_FILE", "")).strip() or default_path(log_path)
         self.min_tokens = env_int(env, "STRATA_WARM_HEADS_MIN", DEFAULT_MIN, 1, 1 << 30)
@@ -143,10 +169,13 @@ class WarmHeads:
         self.tries = env_int(env, "STRATA_WARM_HEADS_TRIES", DEFAULT_TRIES, 1, 100)
         self.log_lines: list[str] = []          # 試験用: 出したログの行(最後の 200 行)
         self.last_problem: str | None = None    # 試験用: load が使えないと見た理由
-        self._lock = threading.Lock()           # _mem・_active・_dirty
+        self._lock = threading.Lock()           # _mem・_active・_seq・_inflight・_expect_at
         self._mem: dict[tuple[int, str], Head] = {}
         self._active: _Active | None = None
-        self._dirty = False
+        self._seq = 0                           # note() が覚えた回数(保存に成功した時点の値が _saved_seq)
+        self._saved_seq = 0
+        self._inflight = 0                      # arriving() から leaving() までの要求の数
+        self._expect_at = float("-inf")         # 最後の expect()(monotonic)
         self._cv = threading.Condition()
         self._thread: threading.Thread | None = None
         self._engine = None
@@ -196,7 +225,7 @@ class WarmHeads:
             else:
                 self._mem[key] = Head(n, key[1], 1, now, arr)
                 self._evict_locked()
-            self._dirty = True
+            self._seq += 1
 
     def _saved_locked(self) -> list[Head]:
         now = time.time()
@@ -303,12 +332,14 @@ class WarmHeads:
 
     def save_now(self) -> None:
         """保存の対象の頭を JSON 1 つに原子的に書く(一時ファイル -> fsync -> os.replace。権限 0600)。
-        WarmHeads のスレッドから呼ぶ。失敗しても例外は出さず、60 秒あとにやり直す。"""
+        WarmHeads のスレッドから呼ぶ。失敗しても例外は出さず、60 秒あとにやり直す。
+        保存の対象が無くなった(期限切れ)ときは、前に書いたファイルを頭の無いファイルに置き換える。"""
         with self._lock:
             heads = self._saved_locked()
-            self._dirty = False
-        sig = tuple(h.key for h in heads)
-        if not heads:
+            seq = self._seq
+        sig = tuple(h.key for h in heads)       # 4 MiB に収める前の顔ぶれ(_maybe_save が比べるのはこれ)
+        if not heads and not self._saved_sig:
+            self._saved_seq = seq               # 書いたものも書くものも無い
             return
         while True:
             payload = {"version": FILE_VERSION, "turn_id": self.turn_id, "n_vocab": self._n_vocab,
@@ -319,7 +350,6 @@ class WarmHeads:
             if len(text) <= FILE_MAX_BYTES or len(heads) <= 1:
                 break
             heads = heads[:-1]                  # 4 MiB に収まるまで、回数の少ない頭から外す
-            sig = tuple(h.key for h in heads)
         if len(text) > FILE_MAX_BYTES:
             self._say(f"not saved: one head is larger than {FILE_MAX_BYTES >> 20} MiB as a file")
             self._retry_after = time.monotonic() + 3600
@@ -347,6 +377,7 @@ class WarmHeads:
                 except OSError:
                     pass
         self._saved_sig = sig
+        self._saved_seq = seq
         self._last_save = time.monotonic()
         self._say(f"saved {len(heads)} head(s) to {self.path}")
 
@@ -356,10 +387,8 @@ class WarmHeads:
             return
         with self._lock:
             sig = tuple(h.key for h in self._saved_locked())
-            dirty = self._dirty
-        if not sig:
-            return
-        if sig != self._saved_sig or (dirty and time.monotonic() - self._last_save >= SAVE_EVERY_S):
+            dirty = self._seq != self._saved_seq
+        if sig != self._saved_sig or (sig and dirty and time.monotonic() - self._last_save >= SAVE_EVERY_S):
             self.save_now()
 
     def _ensure_loaded(self, engine) -> None:
@@ -377,7 +406,7 @@ class WarmHeads:
                     cur.reuses = max(cur.reuses, h.reuses)
                     cur.last_used = max(cur.last_used, h.last_used)
             self._evict_locked()
-            self._saved_sig = tuple(x.key for x in self._saved_locked())
+        self._saved_sig = tuple(h.key for h in heads)  # ファイルにある顔ぶれ(期限切れなら次の _maybe_save で消える)
         self._last_save = time.monotonic()
         self._loaded = True
 
@@ -395,12 +424,17 @@ class WarmHeads:
             self._cv.notify_all()
 
     def arriving(self, ids) -> None:
-        """要求がエンジンに入る前に呼ぶ。温めている頭で始まらない要求なら、温めを止める(頭が同じなら止めない:
-        その要求は温めの残りを待ち、枠か主の履歴から頭を再利用する)。"""
+        """要求がエンジンに入る前に呼ぶ(対の leaving() を必ず呼ぶ)。要求があるあいだは温めを始めない。
+        温めがまだ命令を送っていなければ止める。送ったあとは、温めている頭で始まらない要求のときだけ止める(頭が同じなら
+        止めない: その要求は温めの残りを待ち、枠か主の履歴から頭を再利用する)。"""
         if not self.enabled:
             return
         with self._lock:
+            self._inflight += 1
             a = self._active
+            if a is not None and not a.started:
+                a.cancel.set()
+                return
         if a is None or a.cancel.is_set():
             return
         try:
@@ -408,6 +442,23 @@ class WarmHeads:
                 a.cancel.set()
         except Exception:                               # noqa: BLE001 - 判定できなければ止めない
             pass
+
+    def leaving(self) -> None:
+        """要求の終わり(Service._run のいちばん外の finally)。"""
+        if not self.enabled:
+            return
+        with self._lock:
+            self._inflight = max(0, self._inflight - 1)
+
+    def expect(self) -> None:
+        """要求が来た(Service.load。本文を ids にして arriving() を呼ぶ前): EXPECT_S 秒は温めを始めない。"""
+        if not self.enabled:
+            return
+        with self._lock:
+            self._expect_at = time.monotonic()
+
+    def _quiet_locked(self) -> bool:
+        return self._inflight == 0 and time.monotonic() - self._expect_at >= self.EXPECT_S
 
     def _loop(self) -> None:
         seen = 0
@@ -429,10 +480,11 @@ class WarmHeads:
                 self._say(f"failed: {type(e).__name__}: {e}")
 
     def _idle(self, engine) -> bool:
-        with engine.slot_cv:
-            if engine.waiting or engine.admitting or any(engine.slot_busy):
+        with self._lock:
+            if not self._quiet_locked():
                 return False
-        return not engine.ctl.locked()
+        turn = getattr(engine, "service_turn", None)
+        return self._idle_engine(engine) and not (turn is not None and turn.locked())
 
     def _wait_idle(self, engine, gen: int, idle_s: float) -> bool:
         """エンジンが idle_s 秒つづけて空くのを待つ。世代が変わった・エンジンが死んだときは False。"""
@@ -450,6 +502,7 @@ class WarmHeads:
                     return True
             else:
                 since = None
+            self._maybe_save()                          # 待つあいだも、新しく条件を満たした頭を保存する
             time.sleep(self.POLL)
 
     def _warm(self, engine) -> None:
@@ -457,6 +510,9 @@ class WarmHeads:
         self._attempts = 0
         if not getattr(engine, "batch", 0):
             self._say("not used: the engine runs one request at a time (no --batch)")
+            return
+        if not (getattr(engine, "info", None) or {}).get("engine"):
+            self._say("not used: this engine path was not checked (its INFO has no engine=, as the Qwen3.6 engine)")
             return
         heads = self.saved()
         if not heads:
@@ -470,16 +526,17 @@ class WarmHeads:
     def _warm_one(self, engine, gen: int, h: Head, idx: int, total: int) -> str:
         head = list(h.ids)
         w = head + [self.turn_id]
-        if h.n + 1 > int(getattr(engine, "max_context", 0) or 0) - 1:
-            self._say(f"failed: the {h.n}-token head does not fit the engine's context ({engine.max_context})")
-            return "failed"
         kh = getattr(engine, "keep_heads", None)
         applies = bool(kh is not None and kh.applies(engine.info or {}, getattr(engine, "slot_gs", 0)))
-        first = True
+        max_new = 2 if applies else 1
+        ctx = int(getattr(engine, "max_context", 0) or 0)
+        if len(w) + max_new + CTX_SLACK > ctx:
+            self._say(f"skipped: the {h.n}-token head does not fit the engine's context ({ctx})")
+            return "skipped"
+        idle_s = 0.0
         while True:
-            if not self._wait_idle(engine, gen, 0.0 if first else self.idle_s):
+            if not self._wait_idle(engine, gen, idle_s):
                 return "gone"
-            first = False
             if applies:
                 with engine.slot_cv:
                     for b in range(engine.batch):
@@ -491,39 +548,79 @@ class WarmHeads:
             if self._attempts >= self.tries:
                 self._say(f"giving up: {self._attempts} reads were stopped in this engine start")
                 return "failed"
-            self._attempts += 1
-            r = self._read(engine, gen, h, w, 2 if applies else 1, idx, total)
+            r = self._read(engine, gen, h, w, max_new, idx, total)
+            if r == "busy":                             # 始める前に要求か Service の番が来た: 空くのを待ち直す
+                time.sleep(self.POLL)
+                continue
             if r != "stopped" or not applies:
                 return r
+            idle_s = self.idle_s
             self._say(f"will try again when the engine has been idle {self.idle_s:g} s")
 
     def _read(self, engine, gen: int, h: Head, w: list, max_new: int, idx: int, total: int) -> str:
+        """1 回読む。"busy": 始める前に要求か Service の番が来た(読んでいない)。"stopped": 止められた。
+
+        始めるかどうかは、arriving() と同じ鍵の中で(要求が 1 本も無く expect() から EXPECT_S 秒たった)決めて登録する。
+        登録のあとに来た要求は arriving() で止める。Service の番(service_turn)は、エンジンに命令を送るまで持つ:
+        そのあいだ番を持つ処理(再起動のあとの VRAM の予約・/v1/vram・/load)は待つか busy を返し、温めの命令と応答を
+        取り合わない(送ったあとは温めが制御の行(ctl)を持ち、/v1/vram はそれも待つ)。"""
         cancel = threading.Event()
-        started = [False]
-        cancel._strata_queue_started = lambda: started.__setitem__(0, True)     # type: ignore[attr-defined]
-        with self._lock:
-            self._active = _Active(cancel, w[:-1], h.n)
-        self._say(f"reading a {h.n}-token head ({idx} of {total})")
-        t0 = time.monotonic()
+        act = _Active(cancel, w[:-1], h.n)
+        turn = getattr(engine, "service_turn", None)
+        if turn is not None and not turn.acquire(blocking=False):
+            return "busy"
+        held = [turn is not None]
+
+        def give_back():
+            if held[0]:
+                held[0] = False
+                turn.release()
+
+        def started():                                  # エンジンに命令を送った直後(制御の行を持っている)
+            with self._lock:
+                act.started = True
+            give_back()
+        cancel._strata_queue_started = started         # type: ignore[attr-defined]
         g = None
         try:
-            g = engine.generate(w, max_new, {}, cancel)
-            for _ in g:
-                pass
-        except Exception as e:                          # noqa: BLE001 - EngineDied など。この世代では止める
-            if not cancel.is_set():
-                self._say(f"failed: {type(e).__name__}: {e}")
-                return "failed"
+            with self._lock:
+                if not self._quiet_locked():
+                    return "busy"
+                self._active = act
+            if engine.gen != gen or not self._idle_engine(engine) or cancel.is_set():
+                return "busy"
+            self._say(f"reading a {h.n}-token head ({idx} of {total})")
+            t0 = time.monotonic()
+            try:
+                g = engine.generate(w, max_new, {}, cancel)
+                for _ in g:
+                    pass
+            except Exception as e:                      # noqa: BLE001 - EngineDied など。この世代では止める
+                if not cancel.is_set():
+                    self._say(f"failed: {type(e).__name__}: {e}")
+                    return "failed"
         finally:
             with self._lock:
-                self._active = None
+                if self._active is act:
+                    self._active = None
             if g is not None:
                 try:
                     g.close()
                 except Exception:                       # noqa: BLE001
                     pass
+            give_back()
         if cancel.is_set():
-            self._say("stopped: a request with another head came")
+            if act.started:
+                self._attempts += 1
+            self._say("stopped: a request with another head came" if act.started else
+                      "stopped: a request came before the read started")
             return "stopped"
         self._say(f"read in {time.monotonic() - t0:.1f} s")
         return "done"
+
+    def _idle_engine(self, engine) -> bool:
+        """_idle のうちエンジンの側だけ(Service の番は呼ぶ側が持っている)。"""
+        with engine.slot_cv:
+            if engine.waiting or engine.admitting or any(engine.slot_busy):
+                return False
+        return not engine.ctl.locked()
