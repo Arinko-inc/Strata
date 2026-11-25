@@ -166,6 +166,25 @@ inline int64_t length_cap(int64_t tokens, int64_t cap, int64_t short_chunk, int6
     return tc < base ? tc : base;
 }
 
+/// STRATA_PREFILL_TAIL_MERGE=<tokens> (the remote-stage main process): the chunk a read of `tokens` gets when a short tail would
+/// otherwise stand alone.  `chunk` is the chunk the tiers (length_cap) chose, `cap` the biggest chunk the stages take (--prefill).
+/// A read of `tokens` > `chunk` is `k` = tokens / chunk full chunks and a tail of `r` = tokens % chunk tokens; when 0 < r <=
+/// `tail_max` the tail does not become a chunk of its own (a chunk costs a fixed trip through the relay and the last worker, about
+/// 340 ms on the rig): the read is cut in the k chunks of equal size, ceil(tokens / k) rounded UP to 256, so the tail's tokens ride
+/// in the chunks before it.  The buffers are laid out once for the whole read and every chunk is at most that size, so the chunk is
+/// the loan (a last chunk of `chunk + r` alone would make the workers lend again in the middle of the read).  A result above `cap`
+/// leaves `chunk` as it is.  Unchanged as well: `tail_max` unset (<= 0), a read of one chunk or less, no tail (r = 0), a tail above
+/// `tail_max`.  The result is never below `chunk` and never above `cap` unless `chunk` already was.
+inline int64_t tail_merge_chunk(int64_t tokens, int64_t chunk, int64_t cap, int64_t tail_max) {
+    if (tail_max <= 0 || tokens <= 0 || chunk <= 0 || cap <= 0 || tokens <= chunk) return chunk;
+    const int64_t k = tokens / chunk, r = tokens - k * chunk;
+    if (r == 0 || r > tail_max) return chunk;
+    const int64_t per = tokens / k + (tokens % k != 0);
+    const int64_t merged = (per + 255) / 256 * 256;
+    if (merged > cap || merged < chunk) return chunk;
+    return merged;
+}
+
 /// One log line: what was chosen, why, and the reads it expects per prompt.
 inline std::string describe(const Pick& p, const Host& h, int64_t tokens) {
     char b[768];

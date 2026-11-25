@@ -8714,6 +8714,20 @@ int main(int argc, char** argv) {
         if (!remote_main) return cap;   // a worker lends for the chunk the main process sends; a local run has its own rules
         return strata::program::prefill_plan::length_cap(tokens, cap, short_chunk_env, short_max_env, tiny_chunk_env, tiny_max_env);
     };
+    // STRATA_PREFILL_TAIL_MERGE=<tokens> (the remote-stage MAIN process only): a segment whose last chunk would be a tail of at most
+    // this many tokens (a few tens of tokens past a multiple of the chunk; each chunk costs a fixed trip through the relay and the
+    // last worker, ~340 ms) is cut in one chunk fewer: the chunks of the segment are made equal, ceil(tokens / n) rounded up to 256
+    // (n = the full chunks the tiers' chunk gives), at most --prefill - the loan is laid out once for the whole read, so the
+    // workers do not lend again in the middle of it.  Only for a plain read of a text prompt (see the call of lend()); unset (the
+    // default): every segment is cut as before.
+    static const int64_t tail_merge_env = [] {
+        const char* v = std::getenv("STRATA_PREFILL_TAIL_MERGE");
+        return v != nullptr ? (int64_t) std::atoll(v) : (int64_t) 0;
+    }();
+    auto tail_merged_chunk = [&](int64_t tokens, int64_t chunk, int64_t cap) -> int64_t {
+        if (!remote_main || stage_worker) return chunk;
+        return strata::program::prefill_plan::tail_merge_chunk(tokens, chunk, cap, tail_merge_env);
+    };
     // #2824: the chunk a request of `tokens` reads in when the host-aware plan chose `plan` (< cap, the buffers' chunk = what the VRAM
     // scan picked).  A prompt that fits one chunk of `cap` keeps ONE chunk, as before (a single pass reads each expert once, so the
     // page cache cannot thrash, and splitting it would only add a pass); a longer one reads in n = ceil(tokens / plan) chunks of
@@ -13018,13 +13032,19 @@ int main(int argc, char** argv) {
         // rounded up to 256), laid out in the last of the slots it may borrow - per participant, out of that
         // participant's own cache, and marking only that participant's own layers
         int64_t seg_lend = 0;   // the loan the last lend left (the largest participant's chunk; 0: none)
-        auto lend = [&](int64_t tokens, std::string& e, int64_t exact) -> bool {
+        // `tail_ok` (the read of a request's segment on the remote-stage main process, see its call): STRATA_PREFILL_TAIL_MERGE may even
+        // the segment's chunks out.  A worker's lend, a planned read going on (`exact`), the host-aware plan (pf_plan_chunk), equal
+        // chunks (STRATA_PREFILL_EQUAL), the stages' small chunks (split_small), --prefill-head-alias, and --no-prefill-borrow (nothing
+        // lent: pf_parts is empty) never merge
+        auto lend = [&](int64_t tokens, std::string& e, int64_t exact, bool tail_ok = false) -> bool {
             seg_lend = 0;
             if (pf_parts.empty()) return true;                     // its own buffers: nothing to lend
             const auto t_ln = Clock::now();
             // what this segment needs, capped by the configured chunk: a request lends only what its own
             // prompt needs, so a large chunk costs a short prompt nothing
-            const int64_t want_full = planned_chunk(tokens, length_chunk_cap(tokens, o.prefill_chunk), pf_plan_chunk);
+            int64_t want_full = planned_chunk(tokens, length_chunk_cap(tokens, o.prefill_chunk), pf_plan_chunk);
+            if (tail_ok && exact <= 0 && pf_plan_chunk <= 0 && !equal_chunks && split_small <= 0 && !o.prefill_head_alias)
+                want_full = tail_merged_chunk(tokens, want_full, o.prefill_chunk);
             // #340: a short enough request reads in the stages' own S-token chunks (nothing lent)
             const int64_t want_seg = o.prefill_head_alias ? o.prefill_chunk
                                    : split_small > 0 && tokens <= split_small_max ? std::min(want_full, split_small)
@@ -13205,24 +13225,31 @@ int main(int argc, char** argv) {
             // worker must have been started with
             if (remote_main) {
                 const int64_t hello_chunk = std::min<int64_t>(me.chunk, length_chunk_cap(1, me.chunk));
+                // STRATA_PREFILL_TAIL_MERGE: the sentence the chunk line ends with (a line of its own when no tier is on)
+                const std::string tail_note = tail_merge_env > 0 ? "; a tail of up to " + std::to_string((long long) tail_merge_env) +
+                                                                       " tokens joins the chunk before it (STRATA_PREFILL_TAIL_MERGE)"
+                                                                 : std::string();
                 if (hello_chunk != me.chunk) {
                     // the chunk of a read just past TINY_MAX: the tier above tiny (short, or --prefill when that rule is off)
                     const int64_t above_tiny = length_chunk_cap(std::max<int64_t>(tiny_max_env + 1, 1), me.chunk);
                     if (hello_chunk < above_tiny && above_tiny < me.chunk)
                         std::fprintf(stderr, "strata serve: remote stage: reads of up to %lld tokens are cut in %lld-token chunks, up to %lld "
                                              "in %lld, longer ones in %lld (STRATA_PREFILL_TINY_CHUNK / _TINY_MAX, STRATA_PREFILL_SHORT_CHUNK / "
-                                             "_SHORT_MAX)\n",
+                                             "_SHORT_MAX)%s\n",
                                      (long long) tiny_max_env, (long long) hello_chunk, (long long) short_max_env, (long long) above_tiny,
-                                     (long long) me.chunk);
+                                     (long long) me.chunk, tail_note.c_str());
                     else if (hello_chunk < above_tiny)
                         std::fprintf(stderr, "strata serve: remote stage: reads of up to %lld tokens are cut in %lld-token chunks, longer ones "
-                                             "in %lld (STRATA_PREFILL_TINY_CHUNK / STRATA_PREFILL_TINY_MAX)\n",
-                                     (long long) tiny_max_env, (long long) hello_chunk, (long long) me.chunk);
+                                             "in %lld (STRATA_PREFILL_TINY_CHUNK / STRATA_PREFILL_TINY_MAX)%s\n",
+                                     (long long) tiny_max_env, (long long) hello_chunk, (long long) me.chunk, tail_note.c_str());
                     else
                         std::fprintf(stderr, "strata serve: remote stage: reads of up to %lld tokens are cut in %lld-token chunks, longer ones "
-                                             "in %lld (STRATA_PREFILL_SHORT_CHUNK / STRATA_PREFILL_SHORT_MAX)\n",
-                                     (long long) short_max_env, (long long) hello_chunk, (long long) me.chunk);
+                                             "in %lld (STRATA_PREFILL_SHORT_CHUNK / STRATA_PREFILL_SHORT_MAX)%s\n",
+                                     (long long) short_max_env, (long long) hello_chunk, (long long) me.chunk, tail_note.c_str());
                     me.chunk = hello_chunk;
+                } else if (tail_merge_env > 0) {
+                    std::fprintf(stderr, "strata serve: remote stage: reads are cut in %lld-token chunks%s\n", (long long) me.chunk,
+                                 tail_note.c_str());
                 }
             }
             me.handoff_floats = HBF;
@@ -18269,7 +18296,10 @@ int main(int argc, char** argv) {
                 // another, and the loan decides which experts are read in place: bits)
                 const int64_t plan_lend = resume_plan.chunk > 0 && at == resume_plan_at && to == resume_plan_end
                                               ? resume_plan.lend : 0;
-                if (!win && !lend(to - at, err, plan_lend)) {
+                // STRATA_PREFILL_TAIL_MERGE: only a plain read - no picture in the request, no local layer split (stages), not the
+                // rest of a read that gave way (BYIELD: it goes on in the chunk it was started with) or a planned segment
+                const bool tail_ok = req_imgs.empty() && stages.empty() && plan_lend == 0 && !(resume_plan_at >= 0 && at == resume_plan_at);
+                if (!win && !lend(to - at, err, plan_lend, tail_ok)) {
                     std::printf("ERR lending the prompt path its slots failed: %s\n", err.c_str());
                     return 1;
                 }

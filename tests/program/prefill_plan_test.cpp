@@ -179,6 +179,44 @@ int main() {
         CHECK(three <= two && three % 256 == 0);
     }
     CHECK(balanced_chunk(1777, length_cap(1777, 3072, 2048, 8192, 1024, 3584), 0) == 1024);   // a 1,777-token read: two 1024 chunks
+    // STRATA_PREFILL_TAIL_MERGE (tail_merge_chunk): a tail of up to N tokens rides in the chunks before it, not a chunk of its own
+    {
+        const int64_t cap = 3072;
+        // tiny tier (chunk 1024), N = 128: 2,086 tokens = 2 x 1024 + 38 -> 2 chunks of 1280 (not 3 chunks)
+        CHECK(tail_merge_chunk(2086, 1024, cap, 128) == 1280);
+        CHECK(tail_merge_chunk(2016, 1024, cap, 128) == 1024);     // 2 x 1024 - 32: the tail is 992: not a tail, as before
+        CHECK(tail_merge_chunk(2048, 1024, cap, 128) == 1024);     // no tail (r = 0)
+        CHECK(tail_merge_chunk(2048 + 128, 1024, cap, 128) == 1280);   // the tail is exactly the threshold: merged
+        CHECK(tail_merge_chunk(2048 + 129, 1024, cap, 128) == 1024);   // one more than the threshold: a chunk of its own
+        CHECK(tail_merge_chunk(1024 + 1, 1024, cap, 128) == 1280);     // 1 + 1024: one chunk of 1280 (the tail joins the only chunk)
+        CHECK(tail_merge_chunk(1024 + 129, 1024, cap, 128) == 1024);
+        // one chunk only (tokens <= chunk), or the flag off, or a bad input: nothing changes
+        CHECK(tail_merge_chunk(1024, 1024, cap, 128) == 1024);
+        CHECK(tail_merge_chunk(100, 1024, cap, 128) == 1024);
+        CHECK(tail_merge_chunk(0, 1024, cap, 128) == 1024);
+        CHECK(tail_merge_chunk(2086, 1024, cap, 0) == 1024);
+        CHECK(tail_merge_chunk(2086, 1024, cap, -1) == 1024);
+        CHECK(tail_merge_chunk(2086, 0, cap, 128) == 0);
+        CHECK(tail_merge_chunk(2086, 1024, 0, 128) == 1024);
+        // short tier (chunk 2048): 4,200 = 2 x 2048 + 104 -> 2 chunks of 2304
+        CHECK(tail_merge_chunk(4200, 2048, cap, 128) == 2304);
+        CHECK(tail_merge_chunk(4200, 2048, cap, 100) == 2048);     // 104 > 100
+        CHECK(tail_merge_chunk(2048 + 300, 2048, cap, 512) == 2560);   // one chunk of 2348 tokens, rounded up to 256
+        // the merged chunk would be above the cap (the stages' buffers): not merged
+        CHECK(tail_merge_chunk(2048 + 300, 2048, 2048 + 256, 512) == 2048);   // 2348 -> 2560 > 2304
+        CHECK(tail_merge_chunk(2048 + 200, 2048, 2048 + 256, 512) == 2304);   // 2248 -> 2304 = cap: allowed
+        // the long tier (chunk = cap): a bigger chunk does not fit, so nothing changes
+        CHECK(tail_merge_chunk(6144 + 50, 3072, cap, 512) == 3072);
+        CHECK(tail_merge_chunk(3072 + 50, 3072, cap, 512) == 3072);
+        // with the tiers: every length reads in fewer or equal chunks, never a chunk above the cap, a multiple of 256
+        for (int64_t t = 1; t < 20000; t += 7) {
+            const int64_t base = length_cap(t, cap, 2048, 8192, 1024, 3584);
+            const int64_t m = tail_merge_chunk(t, base, cap, 256);
+            const int64_t n0 = (t + base - 1) / base, n1 = (t + m - 1) / m;
+            CHECK(m >= base && m <= cap && m % 256 == 0 && n1 <= n0);
+            if (m != base) CHECK(n1 == n0 - 1 || (n0 == 2 && n1 == 1));   // exactly the tail's chunk is gone
+        }
+    }
     std::printf("%s\n", failed ? "FAILED" : "prefill_plan_test: ok");
     return failed ? 1 : 0;
 }
