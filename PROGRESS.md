@@ -2,6 +2,40 @@
 
 計画書: `~/work/strata-mesh/IMPL-PLAN-2026-11-26-relay-read.md`(arinkomac)。2026-11-26 01:00〜01:50 JST、Fable 5.2 low の子 1 本。
 
+## 2 回目(2026-11-26 01:52〜02:05 JST、同じ担当 R)の到達点: 実装まで。実機では 1 回も流していない
+親の指示は「専門家の区間(写し 72 + gate/up 101 + down 197 ms)を縮める」。親のセッションの区切りで止めた。2 回目の窓は開かなかった。
+
+### 書いたもの(コミット 6e1a4ad1d と、その次の WIP コミット)
+- **`src/prefill/moe_f16_q50.cu`・`.hpp`(新規)**: Q5_0 の down を gfx11 の F16 の matrix core で計算するカーネル。`moe_f16_kq.cu` の Q5_1 の down のカーネルを写し、ブロックの読み方(22 バイト・語の境界に揃わないので `__builtin_memcpy` で読む)と重みの式(d × (q − 16) = q × d + (−16 d))だけを変えた
+- `src/prefill/moe_fused_iq.cu` に口を 2 か所(`d_covered_on` と down の起動)、`CMakeLists.txt` に登録
+- **旗**: `STRATA_PF_FUSED=1 STRATA_PF_FUSED_KQ=1 STRATA_PF_F16=1 STRATA_PF_F16_Q50=1`(4 つとも要る。どれも既定は切)。これで当社の Q4_K / Q5_0 の層が、上流にすでにある fused の経路(`prefill.cpp` の `fused_l`)に乗るはず。この経路は (a) 専門家を枠から直接読む(`b.blob[]` = `device_slot`。グループのバッファへの写しが無い)、(b) 64 行のタイルごとに仕事を作る(MMQ のように 16 専門家の最大行数に合わせた列を計算しない)、(c) gate/up は既存の `f16kq::gate_up`(Q4_K)
+- `tools/relay_read/relay_mmq_bench.cpp`(新規、CMake の `relay_mmq_bench`、EXCLUDE_FROM_ALL): MMQ の 1 グループ(16 専門家)の積を、型(Q4_K / Q5_0)と形(1280x2560・2560x640・2560x768・2560x512・1280x640)と行数(16・48・64・96)を振って測る
+- ビルドは通った(trainsv、exe sha256 頭 999962f6f72415ec)。**動作・速さ・出力は未確認**
+
+### 確かめていないこと(次の担当が最初にやる)
+1. 旗 4 つで本当に fused の経路に入るか(ワーカーのログに `prompt experts on the fused int8 kernels` が出る)。入る条件は `stream_all`(塊 1,024 トークン以上・リング > STAGE・`m.src` あり)。256 トークンの塊は MMQ のまま
+2. `fused_ring()` が真になると読込のバッファとリングの配置が変わる(起動時の「the prompt path borrows N cache slots」の値が変わる)。中継の `STRATA_WK_LEND_SINGLE`・`STRATA_WK_REFILL_EARLY` と一緒に動くかは見ていない
+3. 出力は MMQ とビット一致しない(活性は 32 値ごとの int8、重みは F16 に 1 回丸める)。`DUMP=1024` で行を保存して `rows_cmp` で相対 L2 を見る。1e-2 程度なら丸めの差、1 に近ければカーネルの誤り
+4. 旗を付けないときに本番と同じハッシュ(3,072 で ad680b8c4f428e89)になること
+- 用意した待ち行列: `llmsv:~/wt/relay-read-logs/queue2.txt`(`q-ppf-t`・`q-f50-t`・`q-f50-n`・`q-ppf-n`・`STRATA_PF_F16_BN=64/128`・`STRATA_PF_BATCH=128`)。流し方: 窓の中で `DUMP=1024 REPS=3 ~/wt/relay-read-win.sh ~/wt/relay-read-logs/queue2.txt`、続けて `~/wt/relay-read-mmqb.sh`(`DONE-queue2.txt` を待って `relay_mmq_bench` を流し `mmqb.log` に書く)。READY は消してある
+
+### down の MMQ が遅い原因: 特定できていない
+- 分かったこと: 1 ブロックの時間は gate/up・down とも約 0.008 µs × J(J = タイルの列数)で、K に依らない。1 ブロックの積和は down が gate/up の 0.3 倍
+- 外した候補: (1) 書き戻しの飛び飛びの書き込み(同じ格子で 1 層分 0.55 ms。`mmq_wb_bench`、実測)、(2) Q5_0 の展開(`load_tiles_q5_0` は 1 値あたり数命令。ソースを読んだだけ)、(3) ホストの待ち(0〜1 ms、実測)、(4) 専門家の並び順による列の無駄(`STRATA_MMQ_GROUP_SORT`・`RESIDENT_SORT_NE` で時間もハッシュも変わらず。ただし雑音の入力は行数がほぼ均等なので、実際の文では別)
+- 残った候補(どれも未計測): (a) 32 値ごとの float の後処理(`vec_dot_q8_0_q8_1_mma` は 16x16 のタイルと 32 値ごとに整数 → float の変換と積和を 256 回)。ただしこれは K に比例するはずで、実測と合わない、(b) LDS の大きさ(x のタイル約 35 KB + y のタイル J × 272 B)による同時実行数、(c) `sum[]`(1 スレッド J × 64 / 128 個)のレジスタあふれ、(d) K = 640 が 256 の倍数でないことによる 3 回目の反復の読み越し
+- 切り分けの道具は `relay_mmq_bench`。q5_0 2560x640 と q5_0 1280x2560・q4_k 2560x768 を比べれば、型のせいか形のせいかが分かる。2560x768・2560x512 との比較で (d) が分かる
+
+### 専門家の写しを無くす形について
+- gfx1100 で枠から直接読めない理由は見つかっていない。MMQ のままやるなら `PROGRESS.md` 下の「次の手 3.」(連続した枠を `expert_bytes` = 枠の間隔で読む)。ただしグループの 16 専門家が連続した枠に並ぶのは全専門家に行が当たるときだけなので、実際の文では使える場面が限られる
+- fused の経路は最初から枠を直接読むので、上の Q5_0 のカーネルが動けば写しは無くなる。こちらを先に確かめる
+
+### 置き場(2 回目で増えたもの)
+- llmsv `~/wt/relay-read/strata.q50`(999962f6f72415ec。Q5_0 のカーネル入り)、`relay_mmq_bench`、`~/wt/relay-read-mmqb.sh`、`~/wt/relay-read-logs/queue2.txt`。`strata`(d79a8c2065870c74)は 1 回目のまま
+- trainsv `~/wt/relay-read/build-hip/`(`TARGETS="strata relay_mmq_bench" ~/wt/relay-read-hip.sh`、約 40 秒)
+
+---
+以下は 1 回目(01:00〜01:50 JST)の記録。
+
 ## 結論(01:50 JST 時点)
 - エンジンのコードは変えていない。変えたのは計測の道具(`tools/relay_read/`)だけ
 - **既存の旗 `STRATA_PF_GEMM=1 STRATA_PF_PAD=1` を中継に足すと、3,072 トークンの 1 塊が 656 → 582 ms(−11%)。出力行のハッシュは本番の旗と同じ**(256・1,024・2,048・3,072 の 1 塊と 12,288 = 4 塊の 5 通り、雑音の入力)。dense の FP16 GEMM(GDN の入出力の射影・QSA の射影・ルーター)が hipBLASLt から 128x256 の WMMA に替わる
