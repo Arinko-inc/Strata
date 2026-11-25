@@ -23,11 +23,15 @@
         std::exit(2);
     }
     const size_t st_hf = (size_t) HBF;
-    // one window's rows on `slot` (rows [0, S) of the hand-off, the same numbers every time)
-    auto st_fill = [&](int S) {
+    // one window's rows (rows [0, S) of the hand-off).  The pair's two windows (reference and deferred) get the same
+    // numbers; the two pairs different ones (合流 D, Sol P3: a deferred commit that read the window scratch the other
+    // pair's window overwrote would then differ)
+    auto st_pair = [](int slot) { return slot / 2; };
+    auto st_fill = [&](int S, int pair) {
         for (int t = 0; t < S; ++t)
             for (size_t i = 0; i < st_hf; ++i)
-                wk_in[(size_t) t * st_hf + i] = 0.05f * std::sin(0.0007f * (float) (i + 1) * (float) (t + 2));
+                wk_in[(size_t) t * st_hf + i] =
+                    0.05f * std::sin(0.0007f * (float) (i + 1) * (float) (t + 2) + 0.9f * (float) pair);
     };
     auto st_window = [&](bool deferred, int slot, int S, std::string& e) -> bool {
         int rows[strata::kernels::kVerifyMaxT] = {};
@@ -35,10 +39,10 @@
         int64_t pos[strata::kernels::kVerifyMaxT] = {};
         for (int t = 0; t < S; ++t) {
             rows[t] = slot;
-            tok[t] = 1000 + 7 * t;
+            tok[t] = 1000 + 7 * t + 300 * st_pair(slot);
             pos[t] = t;
         }
-        st_fill(S);
+        st_fill(S, st_pair(slot));
         if (!refill(e)) return false;
         drive.d.layers = 0;
         drive.d.experts = 0;
@@ -63,7 +67,7 @@
         int64_t pos[strata::kernels::kVerifyMaxT] = {};
         for (int t = 0; t < S; ++t) {
             rows[t] = slot;
-            tok[t] = 1000 + 7 * t;
+            tok[t] = 1000 + 7 * t + 300 * st_pair(slot);
             pos[t] = t;
         }
         std::vector<int> keep((size_t) st_ns, 0);
