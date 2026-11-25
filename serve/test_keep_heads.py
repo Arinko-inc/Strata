@@ -24,7 +24,7 @@ from serve.test_parallel import FakeEngineCase  # noqa: E402
 
 T = 248045                       # Qwen's <|im_start|>
 ON = {"STRATA_KEEP_HEADS": "1", "STRATA_KEEP_HEADS_MIN": "1000"}
-INFO = {"slot_cache": 1}
+INFO = {"slot_cache": 1, "engine": "0.1.39"}       # the Qwen3.8 path's INFO (the fake engine says engine= too)
 
 
 def sysp(n, seed=1):
@@ -79,17 +79,27 @@ class Env(unittest.TestCase):
 
     def test_03_usable(self):
         kh = kh_on()
-        self.assertTrue(kh.usable({"slot_cache": 1}, 0))
-        self.assertFalse(kh.usable({"slot_cache": 1}, 2))                       # pad rows: the idle slots are written
+        self.assertTrue(kh.usable(INFO, 0))
+        self.assertFalse(kh.usable(INFO, 2))                                    # pad rows: the idle slots are written
         self.assertFalse(kh.usable({}, 0))
         self.assertFalse(kh.usable({"slot_cache": 0}, 0))
         self.assertFalse(kh_on(STRATA_PARALLEL_SOLO="0").usable(INFO, 0))
         self.assertTrue(kh_on(STRATA_PARALLEL_SOLO="1").usable(INFO, 0))
-        self.assertFalse(kh.usable({"slot_cache": 1, "conversation_cache_mib": 512, "conversation_cache_slots": 4}, 0))
-        self.assertTrue(kh.usable({"slot_cache": 1, "conversation_cache_mib": 512, "conversation_cache_slots": 0}, 0))
-        self.assertTrue(kh.usable({"slot_cache": 1, "conversation_cache_mib": 0, "conversation_cache_slots": 4}, 0))
+        self.assertFalse(kh.usable({**INFO, "conversation_cache_mib": 512, "conversation_cache_slots": 4}, 0))
+        self.assertTrue(kh.usable({**INFO, "conversation_cache_mib": 512, "conversation_cache_slots": 0}, 0))
+        self.assertTrue(kh.usable({**INFO, "conversation_cache_mib": 0, "conversation_cache_slots": 4}, 0))
         self.assertFalse(kh_on(STRATA_SLOT_CKPT_MOVE="1").usable(INFO, 0))
         self.assertTrue(kh_on(STRATA_SLOT_CKPT_MOVE="0").usable(INFO, 0))
+
+    def test_03b_usable_only_on_the_checked_engine(self):
+        """Only the Qwen3.8 path without a control vector (review 2026-11-25 #3): the Qwen3.6 engine (src/qwen35,
+        INFO batch_slots=N slot_cache=1 and nothing else: no engine=) resumes a read with pictures from a slot, and
+        a loaded control vector splits the slots by projection."""
+        kh = kh_on()
+        self.assertFalse(kh.usable({"batch_slots": 4, "slot_cache": 1}, 0))    # Qwen3.6's INFO
+        self.assertFalse(kh.usable({**INFO, "cvec": "speed.gguf"}, 0))
+        self.assertTrue(kh.usable({**INFO, "cvec": "0"}, 0))
+        self.assertTrue(kh.usable({**INFO, "cvec": 0}, 0))
 
 
 class Rules(unittest.TestCase):
@@ -495,6 +505,41 @@ class Pick(unittest.TestCase):
                 e.slot_used = [5.0, 1.0, 2.0, 3.0]
                 self.assertEqual(e.pick_slot(p, images=True), 0, (groups, info))
 
+    def test_23b_on_but_not_usable_it_is_the_old_pick_slot(self):
+        """STRATA_KEEP_HEADS=1 where usable() is false (Qwen3.6's INFO, a control vector, slot_cache=0,
+        STRATA_PARALLEL_SOLO=0): pick_slot picks what it picks with no KeepHeads at all, with and without pictures
+        (review 2026-11-25 #3)."""
+        rng = random.Random(231)
+        cases = [(kh_on(), {"batch_slots": 4, "slot_cache": 1}), (kh_on(), {**INFO, "cvec": "speed.gguf"}),
+                 (kh_on(), {**INFO, "slot_cache": 0}), (kh_on(STRATA_PARALLEL_SOLO="0"), INFO)]
+        for groups in (1, 2):
+            e_old = self.engine(4, groups, None, pad_rows=False)
+            ons = [self.engine(4, groups, kh, pad_rows=False, info=info) for kh, info in cases]
+            seen = set()
+            for _ in range(1000):
+                prompt_ = [rng.choice((1, 2, 3, e_old.TURN_ID)) for _ in range(rng.randint(2, 600))]
+                held, used, busy = [], [], []
+                for _b in range(4):
+                    r = rng.random()
+                    if r < 0.3:
+                        held.append([])
+                    elif r < 0.6:
+                        held.append(prompt_[:rng.randint(1, len(prompt_))] + [rng.randint(1, 3)] * rng.randint(0, 3))
+                    else:
+                        held.append([rng.choice((1, 2, 3, e_old.TURN_ID)) for _ in range(rng.randint(1, 600))])
+                    used.append(float(rng.randint(0, 5)))
+                    busy.append(rng.random() < 0.3)
+                images = rng.random() < 0.5
+                got = []
+                for e in [e_old] + ons:
+                    e.slot_held = [list(h) for h in held]
+                    e.slot_used = list(used)
+                    e.slot_busy = list(busy)
+                    got.append(e.pick_slot(list(prompt_), images=images))
+                seen.add(got[0])
+                self.assertEqual(got, [got[0]] * len(got), (groups, images, held, used, busy))
+            self.assertGreater(len(seen), 2)
+
     def test_24c_on_but_not_usable_it_is_the_old_pick_slot(self):
         """pick_slot uses the rule only where decide() does (KeepHeads.usable): INFO slot_cache=0 or missing, a
         conversation cache, STRATA_PARALLEL_SOLO=0, STRATA_SLOT_CKPT_MOVE=1 (review 2026-11-25, P3)."""
@@ -672,20 +717,23 @@ class ServerPath(FakeEngineCase):
                 break
         return got
 
-    def test_28d_on_a_slot_of_the_other_projection_is_not_forgotten(self):
-        """The engine skips a slot whose control-vector setting differs (generate.cpp ~16655, `sl.cvec != want_cvec`)
-        but keeps it: decide does not count such a slot, so check_reuse never forgets it (review 2026-11-25 #2, P2)."""
+    def test_28d_on_with_a_control_vector_it_does_nothing(self):
+        """An engine with a control vector loaded (INFO cvec=...): the projection splits the slots (generate.cpp
+        ~16655), so the rule is off there (usable() false) - the same commands and record as without it (reviews
+        2026-11-25 #2 and #3)."""
         self.start_kh()
-        self.engine.info["cvec"] = "speed.gguf"                  # an engine with a control vector loaded
-        self.ask(self.SYSTEM + "S1 ", "LONGREPLY please")        # projection on (absent)
+        self.ask(self.SYSTEM + "S1 ", "LONGREPLY please")        # (no control vector yet: through a slot)
         self.wait_idle()
         slot = int(self.commands()[0].split()[1])
         before = list(self.engine.slot_held[slot])
         self.assertTrue(before)
-        self.ask(self.SYSTEM + "S1 ", "another question, LONGREPLY", experimental_speed_projection=False)
-        self.wait_idle()
-        self.assertEqual(self.engine.slot_held[slot], before)
-        self.assertTrue(self.engine.keep_heads.metas[slot].cvec)
+        self.engine.info["cvec"] = "speed.gguf"
+        n = len(self.commands())
+        for kw in ({"experimental_speed_projection": False}, {}):
+            self.ask(self.SYSTEM + "S1 ", "LONGREPLY please", **kw)
+            self.wait_idle()
+            self.assertEqual(self.engine.slot_held[slot], before, kw)
+        self.assertEqual([c.split()[0] for c in self.commands()[n:]], ["GEN", "GEN"])
 
     def test_28e_on_but_slot_cache_0_an_admission_does_not_restore_the_record(self):
         """INFO slot_cache=0: no slot is a cache, so the record is not given back after an admission that did not
@@ -735,6 +783,23 @@ class ServerPath(FakeEngineCase):
             self.only_free(slot, go)
         self.assertEqual(eng.last.get("finish"), "stop")          # (the shared figures were rewritten)
         self.assertEqual(eng.slot_held[slot], [])
+
+    def test_28g_on_but_parallel_solo_0_the_record_is_the_base_one(self):
+        """STRATA_KEEP_HEADS=1 with STRATA_PARALLEL_SOLO=0 (usable() false): an admission that does not continue
+        leaves the record as the base (7590c991e) does - empty after max_tokens 1 and after a first token that is
+        the stop token (the base clears it at BGEN and never gives it back; checked on the base tree with the same
+        fake engine, review 2026-11-25 #3)."""
+        with mock.patch.dict(os.environ, {"STRATA_PARALLEL_SOLO": "0"}):
+            self.start_kh()
+            self.assertFalse(self.engine.keep_heads.usable(self.engine.info, getattr(self.engine, "slot_gs", 0)))
+            metas = [SlotMeta(m.pin, m.ckpt, m.img) for m in self.engine.keep_heads.metas]
+            for ids, max_new in ((list(b"another short prompt"), 1),
+                                 (list(b"a prompt whose answer is already here: ok, done."), 64)):
+                self.engine.slot_held[0] = list(range(1, 400))
+                self.only_free(0, lambda: self.read_to_stop(ids, max_new=max_new))
+                self.assertEqual(self.engine.slot_held[0], [], max_new)
+            self.assertEqual([c.split()[:2] for c in self.commands()], [["BGEN", "0"], ["BGEN", "0"]])
+            self.assertEqual([SlotMeta(m.pin, m.ckpt, m.img) for m in self.engine.keep_heads.metas], metas)
 
     def test_29_on_max_tokens_1_does_not_forget_a_held_head(self):
         self.start_kh()

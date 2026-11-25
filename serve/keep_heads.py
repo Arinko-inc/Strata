@@ -27,7 +27,8 @@ This module decides, without the engine's help:
 Opt-in: STRATA_KEEP_HEADS=1 in the server's environment (anything else: off, the default path unchanged).
 STRATA_KEEP_HEADS_MIN=<tokens> (default 8192).  It acts only where the idle slots are caches and a slot request can
 go back to the solo path: no pad rows (StrataEngine.slot_gs == 0; a remote stage's main says INFO batch_pad=0),
-INFO slot_cache=1, no conversation cache, STRATA_PARALLEL_SOLO not 0 and STRATA_SLOT_CKPT_MOVE off.  Requests with
+INFO slot_cache=1, no conversation cache, STRATA_PARALLEL_SOLO not 0 and STRATA_SLOT_CKPT_MOVE off - on the Qwen3.8
+engine path (INFO engine=...; not the Qwen3.6 engine) with no control vector loaded (INFO cvec).  Requests with
 pictures are never sent to a slot for this (the engine keeps no slot cache of them).
 
 The checkpoints the server assumes a slot holds after an admission that continued (the engine's own rules,
@@ -56,8 +57,6 @@ class SlotMeta:
     pin: int = 0         # the pin=N it carried (0: none) - the engine took a pinned checkpoint there
     ckpt: bool = True    # False: it had ckpt=0 (no turn and no pin checkpoint; the root still)
     img: bool = False    # it had pictures: the engine never keeps such a slot as a cache (generate.cpp 19732, 15175)
-    cvec: bool = True    # its experimental_speed_projection (request_cvec): with a control vector loaded, the engine
-                         # resumes a prompt only from a slot of the same setting (generate.cpp ~16655, sl.cvec)
 
 
 @dataclass
@@ -97,16 +96,9 @@ def request_pin(sampling: dict) -> int:
     return 0
 
 
-def request_cvec(sampling: dict) -> bool:
-    """The request's projection setting as StrataEngine.projection_key sends it: sampling["experimental_speed_projection"]
-    when it is a bool, else True (the engine's cvec=1 when absent)."""
-    on = sampling.get("experimental_speed_projection") if isinstance(sampling, dict) else None
-    return on if isinstance(on, bool) else True
-
-
 def cvec_loaded(info: dict) -> bool:
-    """Whether the engine runs with a control vector (INFO cvec=..., as Service's history reads it): only then does
-    the projection setting split the slots (the engine's want_cvec is true for every request otherwise)."""
+    """Whether the engine runs with a control vector (INFO cvec=..., as Service's history reads it): then the
+    engine resumes a prompt only from a slot of the same projection setting (generate.cpp ~16655, sl.cvec)."""
     return str((info or {}).get("cvec", 0)) not in ("0", "", "None")
 
 
@@ -206,9 +198,14 @@ class KeepHeads:
         """Whether this engine fits the feature (enabled aside): idle slots are caches (slot_gs == 0), a slot request
         can go back to the solo path (INFO slot_cache=1 and STRATA_PARALLEL_SOLO not 0), no conversation cache
         (INFO conversation_cache_mib > 0 with conversation_cache_slots != 0, as Service.conversation_cache_on) and
-        STRATA_SLOT_CKPT_MOVE off (a give-back would move the slot's checkpoints out of it)."""
+        STRATA_SLOT_CKPT_MOVE off (a give-back would move the slot's checkpoints out of it).  Only the engine path it
+        was checked on: the Qwen3.8 one, whose INFO says engine=<version> (the Qwen3.6 engine, src/qwen35, says only
+        `INFO batch_slots=N slot_cache=1` and resumes a read with pictures from a slot), with no control vector
+        loaded (cvec_loaded: the projection setting would split the slots)."""
         info = info or {}
         if slot_gs != 0 or not info.get("slot_cache") or not self.parallel_solo or self.ckpt_move:
+            return False
+        if not info.get("engine") or cvec_loaded(info):
             return False
         mib, slots = info.get("conversation_cache_mib"), info.get("conversation_cache_slots")
         return not (isinstance(mib, int) and mib > 0 and slots != 0)
@@ -230,12 +227,8 @@ class KeepHeads:
             return None
         head = head_of(prompt, request_pin(sampling), request_ckpt(sampling), self.turn_id, self.root_min)
         served, best = 0, None
-        split = cvec_loaded(info)
-        want = request_cvec(sampling)
         for b in range(len(slot_held)):
             if slot_busy[b] or not len(slot_held[b]):
-                continue
-            if split and self.meta(b).cvec != want:      # the engine skips it for this request (and keeps it)
                 continue
             n = served_by(prompt, slot_held[b], self.meta(b), self.turn_id, self.root_min)
             if n > served:
@@ -265,8 +258,7 @@ class KeepHeads:
     def note_admitted(self, slot: int, sampling: dict, embeddings) -> None:
         """An admission continued in `slot` (BADM <slot> 1): remember its pin, ckpt and pictures (SlotMeta)."""
         if 0 <= slot < len(self.metas):
-            self.metas[slot] = SlotMeta(pin=request_pin(sampling), ckpt=request_ckpt(sampling), img=bool(embeddings),
-                                        cvec=request_cvec(sampling))
+            self.metas[slot] = SlotMeta(pin=request_pin(sampling), ckpt=request_ckpt(sampling), img=bool(embeddings))
 
     def held_after_admission(self, prev_held, cont: bool, yielded: bool, failed: bool, erred: bool):
         """What slot_held should be after an admission: `prev_held` (what it held before the BGEN) when the admission
