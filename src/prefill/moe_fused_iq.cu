@@ -1936,6 +1936,17 @@ bool native_supported(int gu_type, int d_type) {
         const char* v = std::getenv("STRATA_PF_FUSED");
         return v == nullptr || v[0] == '\0' ? -1 : (v[0] == '1' ? 1 : 0);
     }();
+#if defined(__HIPCC__)
+    // relay-read: STRATA_PF_FUSED_WHY=1 prints each term of this decision once (a diagnostic; nothing else changes)
+    if (static bool said = false; !said && std::getenv("STRATA_PF_FUSED_WHY") != nullptr) {
+        said = true;
+        const DevInfo& dd = dev_info();
+        std::fprintf(stderr, "strata fused why: types %d / %d: off %d env %d gu_covered %d dev ok %d w12 %d d_covered_on %d "
+                             "requested %d f16 %d kq %d q50 %d\n", gu_type, d_type, (int) off, env, (int) gu_covered(gu_type),
+                     (int) dd.ok, (int) dd.w12, (int) d_covered_on(d_type, dd), (int) requested(), (int) f16::requested(),
+                     (int) kq_on(), (int) f16q50::enabled());
+    }
+#endif
     if (off || env == 0 || !gu_covered(gu_type)) return false;
 #if !defined(__HIPCC__)
     // CUDA: unset, on by default on a compute capability 12.0 card with 80+ SMs (sm120_series.hpp, STRATA_SM120_PERF=0 off) for the gate/up

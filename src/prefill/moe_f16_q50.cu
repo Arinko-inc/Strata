@@ -151,15 +151,13 @@ __global__ void __launch_bounds__(THREADS) down_kernel(const Batch b, const Nati
 }  // namespace
 
 bool enabled() {
-#if STRATA_F16_DEVICE
+    // the host pass of a HIP build does not see the device's __gfx11xx__ macros (STRATA_F16_DEVICE is 0 there): the
+    // variable alone, as f16::requested(); the callers have the device (d_covered_on: gfx11, not gfx12)
     static const bool on = [] {
         const char* v = std::getenv("STRATA_PF_F16_Q50");
         return v != nullptr && v[0] == '1';
     }();
     return on;
-#else
-    return false;
-#endif
 }
 
 void down(const Batch& b, const NativeGeom& g, const int32_t* ts, const int2* tiles, const int32_t* off, int64_t n, int n_expert,

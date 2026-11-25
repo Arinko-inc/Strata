@@ -1,0 +1,12 @@
+DUMP=1024 REPS=3 ~/wt/relay-read-run.sh r3-f50-t /home/arinko/wt/relay-read/strata.q50 STRATA_PREFILL_TIMING=1 STRATA_PF_GEMM=1 STRATA_PF_PAD=1 STRATA_PF_FUSED=1 STRATA_PF_FUSED_KQ=1 STRATA_PF_F16=1 STRATA_PF_F16_Q50=1
+DUMP=1024 REPS=3 ~/wt/relay-read-run.sh r3-ppf-t /home/arinko/wt/relay-read/strata.q50 STRATA_PREFILL_TIMING=1 STRATA_PF_GEMM=1 STRATA_PF_PAD=1
+REPS=3 ~/wt/relay-read-run.sh r3-f50-n /home/arinko/wt/relay-read/strata.q50 STRATA_PF_GEMM=1 STRATA_PF_PAD=1 STRATA_PF_FUSED=1 STRATA_PF_FUSED_KQ=1 STRATA_PF_F16=1 STRATA_PF_F16_Q50=1
+REPS=3 ~/wt/relay-read-run.sh r3-ppf-n /home/arinko/wt/relay-read/strata.q50 STRATA_PF_GEMM=1 STRATA_PF_PAD=1
+DUMP=1024 REPS=3 PROBE_ARGS="--skew 64" ~/wt/relay-read-run.sh r3-sk-f50-t /home/arinko/wt/relay-read/strata.q50 STRATA_PREFILL_TIMING=1 STRATA_PF_GEMM=1 STRATA_PF_PAD=1 STRATA_PF_FUSED=1 STRATA_PF_FUSED_KQ=1 STRATA_PF_F16=1 STRATA_PF_F16_Q50=1
+DUMP=1024 REPS=3 PROBE_ARGS="--skew 64" ~/wt/relay-read-run.sh r3-sk-ppf-t /home/arinko/wt/relay-read/strata.q50 STRATA_PREFILL_TIMING=1 STRATA_PF_GEMM=1 STRATA_PF_PAD=1
+REPS=3 PROBE_ARGS="--skew 64" ~/wt/relay-read-run.sh r3-sk-f50-n /home/arinko/wt/relay-read/strata.q50 STRATA_PF_GEMM=1 STRATA_PF_PAD=1 STRATA_PF_FUSED=1 STRATA_PF_FUSED_KQ=1 STRATA_PF_F16=1 STRATA_PF_F16_Q50=1
+REPS=3 PROBE_ARGS="--skew 64" ~/wt/relay-read-run.sh r3-sk-ppf-n /home/arinko/wt/relay-read/strata.q50 STRATA_PF_GEMM=1 STRATA_PF_PAD=1
+REPS=3 LONG=0 ~/wt/relay-read-run.sh r3-f50b64-t /home/arinko/wt/relay-read/strata.q50 STRATA_PREFILL_TIMING=1 STRATA_PF_GEMM=1 STRATA_PF_PAD=1 STRATA_PF_FUSED=1 STRATA_PF_FUSED_KQ=1 STRATA_PF_F16=1 STRATA_PF_F16_Q50=1 STRATA_PF_F16_BN=64
+REPS=3 LONG=0 ~/wt/relay-read-run.sh r3-f50b128-t /home/arinko/wt/relay-read/strata.q50 STRATA_PREFILL_TIMING=1 STRATA_PF_GEMM=1 STRATA_PF_PAD=1 STRATA_PF_FUSED=1 STRATA_PF_FUSED_KQ=1 STRATA_PF_F16=1 STRATA_PF_F16_Q50=1 STRATA_PF_F16_BN=128
+REPS=3 LONG=0 ~/wt/relay-read-run.sh r3-f50pb-t /home/arinko/wt/relay-read/strata.q50 STRATA_PREFILL_TIMING=1 STRATA_PF_GEMM=1 STRATA_PF_PAD=1 STRATA_PF_FUSED=1 STRATA_PF_FUSED_KQ=1 STRATA_PF_F16=1 STRATA_PF_F16_Q50=1 STRATA_PF_BATCH=128
+REPS=3 ~/wt/relay-read-run.sh r3-prod-n /home/arinko/wt/relay-read/strata.q50

@@ -4268,6 +4268,15 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     const bool fused_nat = (use_mmq || fused_only) && stream_all && no_peer && lay.native && !had_gu && !had_d &&
                                            fused::native_supported(mmq_gt, mmq_dt);
                     const bool fused_l = (use_mmq && stream_all && no_peer && !lay.native && fused::enabled()) || fused_nat;
+                    // relay-read: STRATA_PF_FUSED_WHY=1 prints the terms of the decision once per chunk size class (a diagnostic)
+                    if (static int said = 0; said < 4 && l == LB && std::getenv("STRATA_PF_FUSED_WHY") != nullptr) {
+                        ++said;
+                        std::fprintf(stderr, "strata fused why: T %lld use_mmq %d fused_only %d stream_all %d ring %d src %d no_peer %d "
+                                             "native %d had %d/%d types %d/%d supported %d fused_ring %d fused_bufs %d -> fused_l %d\n",
+                                     (long long) T, (int) use_mmq, (int) fused_only, (int) stream_all, (int) m.ring, (int) (m.src != nullptr),
+                                     (int) no_peer, (int) lay.native, (int) had_gu, (int) had_d, mmq_gt, mmq_dt,
+                                     (int) fused::native_supported(mmq_gt, mmq_dt), (int) fused_ring(), (int) m.fused_bufs, (int) fused_l);
+                    }
                     // #583 / #954: the fused layout's GU/H/Xq hold the grouping tables and the int8 rows, sized for
                     // stream_all_min() - 1 tokens of MMQ's rows, so a layer that takes MMQ or the FP16 path at the FULL
                     // chunk would write T*K rows into a (stream_all_min() - 1)*K-row buffer: an illegal access, or a kernel
