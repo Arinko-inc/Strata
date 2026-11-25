@@ -678,6 +678,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   add_library(strata_engine STATIC src/core/layer.cpp src/core/session.cpp src/core/expert_source.cpp src/core/remote_experts.cpp
     src/core/remote_expert_opt.cu
     src/core/expert_cache.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp src/core/dflash2.cpp
+    src/core/verify_deferred.cpp   # L1 (Arinko-inc): a remote stage worker's deferred windows
     src/core/conversation_snapshot.cpp src/core/conversation_state.cpp src/core/conversation_memory.cpp src/core/peer_experts.cpp
     src/core/arch_defaults.cpp src/core/nv_defaults.cpp src/core/vmm.cpp src/core/conversation_file.cpp)
   target_include_directories(strata_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -1795,6 +1796,22 @@ if(STRATA_BUILD_TESTS OR STRATA_BUILD_CONVERSATION_TESTS)
   endif()
   add_test(NAME stage_link_batch_test COMMAND stage_link_batch_test)
   set_tests_properties(stage_link_batch_test PROPERTIES TIMEOUT 120)
+  # L1 (Arinko-inc, strata-mesh IMPL-PLAN-2026-11-26-batch-drafts.md): the deferred windows over the link (loopback,
+  # no GPU), the worker's table of them and the main process's decision to draft (header-only, CPU)
+  add_executable(stage_link_deferred_test src/net/stage_link_deferred_test.cpp src/net/stage_link.cpp)
+  target_include_directories(stage_link_deferred_test PRIVATE include)
+  target_link_libraries(stage_link_deferred_test PRIVATE Threads::Threads)
+  if(WIN32)
+    target_link_libraries(stage_link_deferred_test PRIVATE ws2_32)
+  endif()
+  add_test(NAME stage_link_deferred_test COMMAND stage_link_deferred_test)
+  set_tests_properties(stage_link_deferred_test PROPERTIES TIMEOUT 120)
+  add_executable(stage_deferred_test src/net/stage_deferred_test.cpp)
+  target_include_directories(stage_deferred_test PRIVATE include)
+  add_test(NAME stage_deferred_test COMMAND stage_deferred_test)
+  add_executable(remote_piped_mtp_test src/program/remote_piped_mtp_test.cpp)
+  target_include_directories(remote_piped_mtp_test PRIVATE include)
+  add_test(NAME remote_piped_mtp_test COMMAND remote_piped_mtp_test)
   # STRATA_LOGPOS_IDS / STRATA_LOGPOS_SPLIT_AT (measurement hooks, header-only, CPU)
   add_executable(logpos_ids_test src/core/logpos_ids_test.cpp)
   target_include_directories(logpos_ids_test PRIVATE include)
