@@ -2778,3 +2778,10 @@ if(STRATA_BUILD_DSV41 AND NOT STRATA_ENABLE_CUDA AND NOT STRATA_ENABLE_HIP AND N
     target_compile_definitions(ds4_gg_bench PRIVATE STRATA_DSV41_TQ_CPU=1)
   endif()
 endif()
+
+# relay-read (strata-mesh IMPL-PLAN-2026-11-26-relay-read.md): the prompt MMQ's expert products timed by shape on HIP
+if(STRATA_ENABLE_HIP AND STRATA_PREFILL_MMQ AND TARGET strata_mmq AND TARGET strata_prefill)
+  add_executable(relay_mmq_bench EXCLUDE_FROM_ALL tools/relay_read/relay_mmq_bench.cpp)
+  target_include_directories(relay_mmq_bench PRIVATE "${_strata_gg}/include")
+  target_link_libraries(relay_mmq_bench PRIVATE strata_prefill)
+endif()
