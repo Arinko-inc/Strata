@@ -471,6 +471,30 @@ class Pick(unittest.TestCase):
         e_old.slot_held, e_old.slot_used = e.slot_held, e.slot_used
         self.assertEqual(e_old.pick_slot(prompt(5000, 8, 9, seed=20)), 0)
 
+    def test_24d_on_a_request_with_pictures_skips_the_held_prefix_step(self):
+        """pick_slot's first step (a slot whose whole stream or last turn starts the prompt) does not look at pictures,
+        but the engine neither resumes a read with pictures from a slot nor keeps that slot as a cache: with the rule
+        on, a request with pictures goes through KeepHeads.pick (images=True) over every free slot (Astra 2026-11-25)."""
+        a = held_of(prompt(5000, 1, 2, seed=11))                # the long text head A
+        p = prompt(5000, 1, 2, 3, seed=11)                       # agrees with A up to A's last turn
+        for groups in (1, 2):
+            e = self.engine(4, groups, kh_on(), pad_rows=False)
+            e.slot_held = [list(a), [], held_of(prompt(300, 4, 5, seed=12)), []]
+            e.slot_used = [5.0, 1.0, 2.0, 3.0]
+            with mock.patch("builtins.print"):
+                self.assertEqual(e.pick_slot(p), 0, groups)                       # text: the first step, as before
+                b = e.pick_slot(p, images=True)
+                self.assertNotEqual(b, 0, groups)                                 # pictures: A stays
+                self.assertEqual(e.slot_held[b], [], groups)                      # (an empty slot first)
+                for x in (1, 2, 3):                                               # only A's slot free: it is used
+                    e.slot_busy[x] = True
+                self.assertEqual(e.pick_slot(p, images=True), 0, groups)
+            for kh, info in ((None, INFO), (KeepHeads(4, env={}), INFO), (kh_on(), {"slot_cache": 0})):
+                e = self.engine(4, groups, kh, pad_rows=False, info=info)         # off / not usable: as before
+                e.slot_held = [list(a), [], held_of(prompt(300, 4, 5, seed=12)), []]
+                e.slot_used = [5.0, 1.0, 2.0, 3.0]
+                self.assertEqual(e.pick_slot(p, images=True), 0, (groups, info))
+
     def test_24c_on_but_not_usable_it_is_the_old_pick_slot(self):
         """pick_slot uses the rule only where decide() does (KeepHeads.usable): INFO slot_cache=0 or missing, a
         conversation cache, STRATA_PARALLEL_SOLO=0, STRATA_SLOT_CKPT_MOVE=1 (review 2026-11-25, P3)."""

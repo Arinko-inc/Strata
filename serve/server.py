@@ -2335,10 +2335,14 @@ class StrataEngine:
                 return len(h)
             k = len(h) - 1 - h[::-1].index(self.TURN_ID) if self.TURN_ID in h else 0
             return k if 0 < k < len(prompt) and prompt[:k] == h[:k] else 0
-        best = max(free, key=held_prefix)
-        # without --batch-groups a held prefix of any length is taken, as before
-        if held_prefix(best) >= (self.SLOT_PREFIX_MIN if self.slot_groups > 1 else 1):
-            return best
+        kh = getattr(self, "keep_heads", None)          # Arinko-inc: a slot holding a long head nobody else keeps goes last
+        kh = kh if kh is not None and kh.applies(getattr(self, "info", None) or {}, gs) else None
+        # (keep heads: the engine resumes no read with pictures from a slot, so a held prefix is no reason to take one)
+        if kh is None or not images:
+            best = max(free, key=held_prefix)
+            # without --batch-groups a held prefix of any length is taken, as before
+            if held_prefix(best) >= (self.SLOT_PREFIX_MIN if self.slot_groups > 1 else 1):
+                return best
         # with --batch-groups: the group with the fewest busy slots first, so the requests spread over the
         # pipeline's stages (two requests in one group leave the other stage idle); then empty, then least recent
         busy_in = {}
@@ -2348,8 +2352,7 @@ class StrataEngine:
         def base(b):
             return (busy_in.get(self.slot_group[b], 0) if self.slot_groups > 1 else 0,
                     bool(self.slot_held[b]), self.slot_used[b])
-        kh = getattr(self, "keep_heads", None)          # Arinko-inc: a slot holding a long head nobody else keeps goes last
-        if kh is not None and kh.applies(getattr(self, "info", None) or {}, gs):
+        if kh is not None:
             b, note = kh.pick(prompt, free, self.slot_held, base, images=images)
             if note:
                 kh.say(note)
