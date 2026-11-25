@@ -364,6 +364,8 @@ int main(int argc, char** argv) {
     int windows = 32;
     int64_t bench = 0;   // --bench N: a prompt of N tokens (noise rows), each chunk's time and hash; --reps R times
     int reps = 1;
+    int skew = 0;            // --skew C: the bench rows are C cluster centres (Zipf weights) + half-size noise, not plain noise
+    std::string dump;        // --dump FILE: the bench's first chunk's output rows (rep 0), raw fp32
     for (int i = 2; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&]() -> const char* {
@@ -382,6 +384,8 @@ int main(int argc, char** argv) {
         else if (a == "--bench") bench = std::atoll(next());
         else if (a == "--chunk") kChunk = std::atoll(next());
         else if (a == "--reps") reps = std::atoi(next());
+        else if (a == "--skew") skew = std::atoi(next());
+        else if (a == "--dump") dump = next();
         else { std::fprintf(stderr, "unknown option %s\n", a.c_str()); return 2; }
     }
     if (bench > 0) pr.max_context = (bench + 8191) / 8192 * 8192;
@@ -427,6 +431,20 @@ int main(int argc, char** argv) {
         std::uniform_int_distribution<int> td(1000, 100000);
         std::vector<float> rows((size_t) (kVar * kChunk * pr.g.D));
         for (float& v : rows) v = nd(rng);
+        if (skew > 0) {
+            // routing with a skew, as text has: each row is one of `skew` centres (centre c with weight 1 / (c + 1))
+            // plus the noise at half size, so the rows of a centre route alike and some experts take many rows
+            std::vector<float> cen((size_t) skew * (size_t) pr.g.D);
+            for (float& v : cen) v = nd(rng);
+            std::vector<double> w((size_t) skew);
+            for (int c = 0; c < skew; ++c) w[(size_t) c] = 1.0 / (c + 1);
+            std::discrete_distribution<int> pick(w.begin(), w.end());
+            for (int64_t r = 0; r < kVar * kChunk; ++r) {
+                const float* c = cen.data() + (size_t) pick(rng) * (size_t) pr.g.D;
+                float* x = rows.data() + (size_t) r * (size_t) pr.g.D;
+                for (int64_t d = 0; d < pr.g.D; ++d) x[d] = c[d] + 0.5f * x[d];
+            }
+        }
         std::vector<int64_t> tok((size_t) (kVar * kChunk));
         for (auto& t : tok) t = td(rng);
         std::vector<float> out((size_t) (kChunk * pr.g.D));
@@ -446,6 +464,12 @@ int main(int argc, char** argv) {
                     return 1;
                 }
                 const double ms = ms_since(t0);
+                if (!dump.empty() && rep == 0 && c0 == 0) {
+                    if (FILE* f = std::fopen(dump.c_str(), "wb")) {
+                        std::fwrite(out.data(), 4, (size_t) (T * pr.g.D), f);
+                        std::fclose(f);
+                    }
+                }
                 const uint64_t hsh = fnv(out.data(), (size_t) (T * pr.g.D) * 4);
                 all = fnv(&hsh, sizeof hsh, all);
                 std::printf("  bench rep %d chunk T=%lld at %lld: %.1f ms %016" PRIx64 "\n", rep, (long long) T, (long long) c0, ms, hsh);
