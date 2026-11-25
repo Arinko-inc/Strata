@@ -1228,6 +1228,8 @@ class StrataEngine:
         self.slot_held: list[list[int]] = [[] for _ in range(self.batch)]
         self.slot_used = [0.0] * self.batch
         self.slot_live: list[dict | None] = [None] * self.batch   # /metrics: the request in each slot
+        from serve.keep_heads import KeepHeads          # Arinko-inc: long heads kept in the idle slots (serve/keep_heads.py)
+        self.keep_heads = KeepHeads(self.batch, turn_id=self.TURN_ID)
         # #1012: the admission state belongs to the server, not to one engine process.  restart() runs this again
         # while requests still wait on it (they hold these very objects), so it is made once and kept: new ones
         # would leave the waiters on a lock and a condition nobody notifies, with their counts missing from the
@@ -1898,6 +1900,8 @@ class StrataEngine:
         yields, solo_again, refused = 0, 0, 0
         adm_failures = 0          # admissions the engine failed (`BADM <slot> 0 failed`): continued once, then an error
         admit_wait, admit_since, admit_said = False, 0.0, False   # #1603: waiting for a slot, since when, said
+        kh = getattr(self, "keep_heads", None)          # Arinko-inc: serve/keep_heads.py (STRATA_KEEP_HEADS=1)
+        kh = kh if kh is not None and kh.enabled else None
         try:
             while True:   # a request in a slot that is left alone goes back to the solo path
                 if not holding:
@@ -1905,9 +1909,15 @@ class StrataEngine:
                     if not ok:
                         return
                     holding, born = True, self.gen                  # (the engine it now has the control lines of)
+                kept = None
                 with self.slot_cv:
                     alone = not any(self.slot_busy) and self.waiting == 0
-                if alone and left > 1:
+                    if kh is not None and alone and left > 1 and not out and adm_failures == 0:
+                        kept = kh.decide(prompt, sampling or {}, embeddings, self.slot_held, self.slot_busy,
+                                         self.info or {}, getattr(self, "slot_gs", 0))
+                if kept is not None and kept.to_slot:
+                    kh.say(kept.reason)                     # alone, but through a slot: its head stays there
+                if alone and left > 1 and not (kept is not None and kept.to_slot):
                     head = f"GENI {left}{keys} {embeddings}" if embeddings else f"GEN {left}{keys}"
                     self._last_done = None                  # (#879: this request's DONE decides below)
                     deadline = getattr(cancel, "_strata_queue_deadline", None)
@@ -1953,6 +1963,11 @@ class StrataEngine:
                         yield t
                     if self._done_finish() == "nonfinite":    # #879 (never promoted to a slot)
                         raise EngineNonFinite("the engine's logits became non-finite (#879)")
+                    if kept is not None and kept.slot is not None:   # keep heads: the slot did not serve what it held
+                        gone = kh.check_reuse(kept, (self.last or {}).get("reused") if isinstance(self.last, dict) else None)
+                        if gone is not None:
+                            kh.say(f"slot {gone} gave less than the {kept.served} tokens it was thought to hold; forgotten")
+                            self.slot_held[gone] = []
                     if self._yielded is not None and reserved is not None and self._yielded[0] == reserved:
                         slot, reserved = reserved, None     # gave way: the read goes on in that slot (below)
                     elif reserved is not None:              # it did not give way: the slot is free again
@@ -2048,6 +2063,7 @@ class StrataEngine:
                     started = getattr(cancel, "_strata_queue_started", None)
                     if started is not None:
                         started()
+                    prev_held = self.slot_held[slot]        # (keep heads: an admission that does not continue keeps it)
                     self.slot_held[slot] = []               # the admission overwrites what the slot held
                     phase = "admit"
                     self._ctl_mode, self._ctl_result, self._yielded = "batch", None, None
@@ -2104,6 +2120,14 @@ class StrataEngine:
                         yield t
                     if not cont and self._done_finish() == "nonfinite":   # #879
                         raise EngineNonFinite("the engine's logits became non-finite (#879)")
+                    if kh is not None:                      # keep heads: what the slot holds now, as the engine has it
+                        if cont:
+                            kh.note_admitted(slot, sampling or {}, embeddings)
+                        else:
+                            again = kh.held_after_admission(prev_held, cont, self._yielded is not None,
+                                                            bool(getattr(self, "_adm_failed", False)), self._ctl_erred)
+                            if again is not None:
+                                self.slot_held[slot] = again
                     if not cont and self._yielded is not None and self._yielded[0] == slot and not cancel.is_set():
                         continue                            # gave way: again once the shorter request is in
                     break
@@ -2304,8 +2328,16 @@ class StrataEngine:
         for b in range(self.batch):
             if self.slot_busy[b]:
                 busy_in[self.slot_group[b]] = busy_in.get(self.slot_group[b], 0) + 1
-        return min(free, key=lambda b: (busy_in.get(self.slot_group[b], 0) if self.slot_groups > 1 else 0,
-                                        bool(self.slot_held[b]), self.slot_used[b]))
+        def base(b):
+            return (busy_in.get(self.slot_group[b], 0) if self.slot_groups > 1 else 0,
+                    bool(self.slot_held[b]), self.slot_used[b])
+        kh = getattr(self, "keep_heads", None)          # Arinko-inc: a slot holding a long head nobody else keeps goes last
+        if kh is not None and kh.enabled:
+            b, note = kh.pick(prompt, free, self.slot_held, base)
+            if note:
+                kh.say(note)
+            return b
+        return min(free, key=base)
 
     def slots_view(self) -> list[dict]:
         """/metrics: each batch slot - idle (with the tokens it holds for a next turn), reading or decoding."""
