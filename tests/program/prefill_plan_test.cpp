@@ -142,6 +142,43 @@ int main() {
     // with the rule on, a read's chunk is still rounded to 256 and at most the cap: 153 tokens read in 256 as before
     CHECK(balanced_chunk(153, length_cap(153, 3072, 2048, 4096), 0) == 256);
     CHECK(balanced_chunk(4177, length_cap(4177, 3072, 2048, 4096), 0) == 3072);
+    // tiny tier (STRATA_PREFILL_TINY_CHUNK / _MAX): 1024 up to 3584, 2048 up to 8192, 3072 beyond
+    CHECK(length_cap(1, 3072, 2048, 8192, 1024, 3584) == 1024);
+    CHECK(length_cap(3584, 3072, 2048, 8192, 1024, 3584) == 1024);   // the limit itself still counts as tiny
+    CHECK(length_cap(3585, 3072, 2048, 8192, 1024, 3584) == 2048);
+    CHECK(length_cap(8192, 3072, 2048, 8192, 1024, 3584) == 2048);
+    CHECK(length_cap(8193, 3072, 2048, 8192, 1024, 3584) == 3072);
+    CHECK(length_cap(40000, 3072, 2048, 8192, 1024, 3584) == 3072);
+    CHECK(length_cap(100, 3072, 2048, 8192, 1100, 3584) == 1024);    // the tiny chunk rounds down to 256
+    // tiny off (0 / 0, not given, chunk of 256 or more after rounding fails, max unset, not below the short chunk): same as two tiers
+    for (int64_t t : {0, 1, 153, 2048, 3584, 3585, 8192, 8193, 80000}) {
+        const int64_t two = length_cap(t, 3072, 2048, 8192);
+        CHECK(length_cap(t, 3072, 2048, 8192, 0, 0) == two);
+        CHECK(length_cap(t, 3072, 2048, 8192, 1024, 0) == two);
+        CHECK(length_cap(t, 3072, 2048, 8192, 0, 3584) == two);
+        CHECK(length_cap(t, 3072, 2048, 8192, 255, 3584) == two);
+        CHECK(length_cap(t, 3072, 2048, 8192, -1, -1) == two);
+        CHECK(length_cap(t, 3072, 2048, 8192, 2048, 3584) == two);   // not below the short chunk
+        CHECK(length_cap(t, 3072, 2048, 8192, 3072, 3584) == two);
+        CHECK(length_cap(t, 3072, 2048, 8192, 4096, 3584) == two);
+    }
+    // the short rule off, tiny on: tiny up to its max, --prefill beyond
+    CHECK(length_cap(500, 3072, 0, 0, 1024, 3584) == 1024);
+    CHECK(length_cap(3584, 3072, 0, 0, 1024, 3584) == 1024);
+    CHECK(length_cap(3585, 3072, 0, 0, 1024, 3584) == 3072);
+    CHECK(length_cap(500, 3072, 4096, 8192, 1024, 3584) == 1024);   // short chunk not below cap = rule off; tiny still applies
+    CHECK(length_cap(0, 3072, 0, 0, 1024, 3584) == 3072);
+    // tiny_max above short_max: a read in between gets the short chunk when that is smaller than tiny's, never a bigger chunk than before
+    CHECK(length_cap(3000, 3072, 512, 4096, 1024, 8192) == 512);    // short (512) is below tiny (1024): short stays
+    CHECK(length_cap(5000, 3072, 512, 4096, 1024, 8192) == 1024);   // beyond short_max the old result is cap, tiny is below it
+    CHECK(length_cap(9000, 3072, 512, 4096, 1024, 8192) == 3072);
+    // tiny never raises a chunk: for every length the result is at most the two-tier result, and a multiple of 256
+    for (int64_t t = 1; t < 20000; t += 53) {
+        const int64_t two = length_cap(t, 3072, 2048, 8192);
+        const int64_t three = length_cap(t, 3072, 2048, 8192, 1024, 3584);
+        CHECK(three <= two && three % 256 == 0);
+    }
+    CHECK(balanced_chunk(1777, length_cap(1777, 3072, 2048, 8192, 1024, 3584), 0) == 1024);   // a 1,777-token read: two 1024 chunks
     std::printf("%s\n", failed ? "FAILED" : "prefill_plan_test: ok");
     return failed ? 1 : 0;
 }

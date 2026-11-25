@@ -8690,6 +8690,9 @@ int main(int argc, char** argv) {
     // segment of at most SHORT_MAX tokens is cut at SHORT_CHUNK (rounded down to 256) instead of --prefill, a longer one at
     // --prefill.  With the stages started at a bigger --prefill (3072) this keeps today's chunk for short reads, and the
     // bigger chunk, which is faster per token, for long ones.  Unset (the default): every read is cut as before.
+    // STRATA_PREFILL_TINY_CHUNK=<tokens> + STRATA_PREFILL_TINY_MAX=<tokens> (both needed): a third, smaller tier - a segment of at
+    // most TINY_MAX tokens is cut at TINY_CHUNK (rounded down to 256) when that is below the chunk the two tiers above gave it, e.g.
+    // 1024 up to 3584 tokens, 2048 up to 8192, --prefill beyond.  Unset (the default): the two tiers alone decide, as before.
     static const int64_t short_chunk_env = [] {
         const char* v = std::getenv("STRATA_PREFILL_SHORT_CHUNK");
         return v != nullptr ? (int64_t) std::atoll(v) : (int64_t) 0;
@@ -8698,9 +8701,17 @@ int main(int argc, char** argv) {
         const char* v = std::getenv("STRATA_PREFILL_SHORT_MAX");
         return v != nullptr ? (int64_t) std::atoll(v) : (int64_t) 0;
     }();
+    static const int64_t tiny_chunk_env = [] {
+        const char* v = std::getenv("STRATA_PREFILL_TINY_CHUNK");
+        return v != nullptr ? (int64_t) std::atoll(v) : (int64_t) 0;
+    }();
+    static const int64_t tiny_max_env = [] {
+        const char* v = std::getenv("STRATA_PREFILL_TINY_MAX");
+        return v != nullptr ? (int64_t) std::atoll(v) : (int64_t) 0;
+    }();
     auto length_chunk_cap = [&](int64_t tokens, int64_t cap) -> int64_t {
         if (!remote_main) return cap;   // a worker lends for the chunk the main process sends; a local run has its own rules
-        return strata::program::prefill_plan::length_cap(tokens, cap, short_chunk_env, short_max_env);
+        return strata::program::prefill_plan::length_cap(tokens, cap, short_chunk_env, short_max_env, tiny_chunk_env, tiny_max_env);
     };
     // #2824: the chunk a request of `tokens` reads in when the host-aware plan chose `plan` (< cap, the buffers' chunk = what the VRAM
     // scan picked).  A prompt that fits one chunk of `cap` keeps ONE chunk, as before (a single pass reads each expert once, so the
@@ -13156,15 +13167,29 @@ int main(int argc, char** argv) {
             me.kv_type = g.n_qsa_layers() > 0 ? (int32_t) ss.qsa_states[ss.qsa_primary()].kv_mode : -1;
             me.max_context = o.max_context;
             me.chunk = sp.chunk();
-            // STRATA_PREFILL_SHORT_CHUNK: the hello names the SHORT chunk, so the workers lend their buffers for it (as for today's
-            // chunk) until a read longer than STRATA_PREFILL_SHORT_MAX sends bigger ones (a worker lends for max(chunk it is sent,
-            // the hello's)); the buffers stay sized for --prefill, which every worker must have been started with
+            // STRATA_PREFILL_SHORT_CHUNK / STRATA_PREFILL_TINY_CHUNK: the hello names the SMALLEST chunk (tiny if that tier is on, else
+            // short), so the workers lend their buffers for it (as for today's chunk) until a read longer than the tier's max sends
+            // bigger ones (a worker lends for max(chunk it is sent, the hello's)); the buffers stay sized for --prefill, which every
+            // worker must have been started with
             if (remote_main) {
                 const int64_t hello_chunk = std::min<int64_t>(me.chunk, length_chunk_cap(1, me.chunk));
                 if (hello_chunk != me.chunk) {
-                    std::fprintf(stderr, "strata serve: remote stage: reads of up to %lld tokens are cut in %lld-token chunks, longer ones "
-                                         "in %lld (STRATA_PREFILL_SHORT_CHUNK / STRATA_PREFILL_SHORT_MAX)\n",
-                                 (long long) short_max_env, (long long) hello_chunk, (long long) me.chunk);
+                    // the chunk of a read just past TINY_MAX: the tier above tiny (short, or --prefill when that rule is off)
+                    const int64_t above_tiny = length_chunk_cap(std::max<int64_t>(tiny_max_env + 1, 1), me.chunk);
+                    if (hello_chunk < above_tiny && above_tiny < me.chunk)
+                        std::fprintf(stderr, "strata serve: remote stage: reads of up to %lld tokens are cut in %lld-token chunks, up to %lld "
+                                             "in %lld, longer ones in %lld (STRATA_PREFILL_TINY_CHUNK / _TINY_MAX, STRATA_PREFILL_SHORT_CHUNK / "
+                                             "_SHORT_MAX)\n",
+                                     (long long) tiny_max_env, (long long) hello_chunk, (long long) short_max_env, (long long) above_tiny,
+                                     (long long) me.chunk);
+                    else if (hello_chunk < above_tiny)
+                        std::fprintf(stderr, "strata serve: remote stage: reads of up to %lld tokens are cut in %lld-token chunks, longer ones "
+                                             "in %lld (STRATA_PREFILL_TINY_CHUNK / STRATA_PREFILL_TINY_MAX)\n",
+                                     (long long) tiny_max_env, (long long) hello_chunk, (long long) me.chunk);
+                    else
+                        std::fprintf(stderr, "strata serve: remote stage: reads of up to %lld tokens are cut in %lld-token chunks, longer ones "
+                                             "in %lld (STRATA_PREFILL_SHORT_CHUNK / STRATA_PREFILL_SHORT_MAX)\n",
+                                     (long long) short_max_env, (long long) hello_chunk, (long long) me.chunk);
                     me.chunk = hello_chunk;
                 }
             }

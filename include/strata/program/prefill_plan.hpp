@@ -149,13 +149,21 @@ inline int64_t balanced_chunk(int64_t tokens, int64_t cap, int64_t plan) {
 }
 
 /// The chunk cap a read of `tokens` gets when the remote-stage main process picks it by the read's length
-/// (STRATA_PREFILL_SHORT_CHUNK / STRATA_PREFILL_SHORT_MAX): a read of at most `short_max` tokens is cut at `short_chunk` (rounded
-/// down to 256), a longer one at `cap` (the buffers' chunk, --prefill).  Either value unset (<= 0), a short chunk of 256 or less
-/// than 256 after rounding, or one that is not below `cap` leaves `cap` as it is - the rule is off and every read is cut as before.
-inline int64_t length_cap(int64_t tokens, int64_t cap, int64_t short_chunk, int64_t short_max) {
+/// (STRATA_PREFILL_SHORT_CHUNK / STRATA_PREFILL_SHORT_MAX, and the third tier STRATA_PREFILL_TINY_CHUNK / STRATA_PREFILL_TINY_MAX):
+/// a read of at most `short_max` tokens is cut at `short_chunk` (rounded down to 256), a longer one at `cap` (the buffers' chunk,
+/// --prefill).  Either value unset (<= 0), a short chunk of 256 or less than 256 after rounding, or one that is not below `cap`
+/// leaves `cap` as it is - the rule is off and every read is cut as before.
+/// The tiny tier sits on top of that result: a read of at most `tiny_max` tokens is cut at `tiny_chunk` (rounded down to 256) when
+/// that is below what the two tiers above chose for it, whatever `short_max` is (so tiny can be on while the short rule is off).
+/// `tiny_chunk` of 256 or more after rounding and `tiny_max` > 0 are needed; otherwise the tier is off (the default: 0, 0).
+inline int64_t length_cap(int64_t tokens, int64_t cap, int64_t short_chunk, int64_t short_max, int64_t tiny_chunk = 0,
+                          int64_t tiny_max = 0) {
     const int64_t sc = short_chunk / 256 * 256;
-    if (tokens <= 0 || cap <= 0 || sc < 256 || short_max <= 0 || sc >= cap) return cap;
-    return tokens > short_max ? cap : sc;
+    if (tokens <= 0 || cap <= 0) return cap;
+    const int64_t base = (sc < 256 || short_max <= 0 || sc >= cap) ? cap : (tokens > short_max ? cap : sc);
+    const int64_t tc = tiny_chunk / 256 * 256;
+    if (tc < 256 || tiny_max <= 0 || tokens > tiny_max) return base;
+    return tc < base ? tc : base;
 }
 
 /// One log line: what was chosen, why, and the reads it expects per prompt.
