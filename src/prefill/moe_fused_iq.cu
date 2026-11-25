@@ -28,6 +28,7 @@
 #if defined(__HIPCC__)
 #include "moe_f16_common.cuh"
 #include "moe_f16_kq.hpp"
+#include "moe_f16_q50.hpp"
 #endif
 
 #include <cuda_fp16.h>
@@ -1866,6 +1867,8 @@ bool d_covered(int t) {
 bool d_covered_on(int t, const DevInfo& d) {
 #if defined(__HIPCC__)
     if (t == T_Q8_0 && !d.w12 && f16::requested()) return true;
+    // relay-read: OrcaRouter Q4_K_S's Q5_0 down, gfx11's F16 kernel only (opt-in STRATA_PF_F16_Q50=1, moe_f16_q50.cu)
+    if (t == GGML_TYPE_Q5_0 && !d.w12 && f16::requested() && kq_on() && f16q50::enabled()) return true;
 #endif
     (void) d;
     return d_covered(t);
@@ -2039,7 +2042,8 @@ void experts_native(const Batch& b, const NativeGeom& g, int n_expert, int64_t n
         }
 #undef STRATA_NW_GU
 #define STRATA_NW_D(T) do { if (occ_d) native_w11_kernel<T, false, true, NW_LB><<<g_d, NW_THREADS, 0, s>>>(b, g, tb, ha8, src, nullptr, dm); else native_w11_kernel<T, false><<<g_d, NW_THREADS, 0, s>>>(b, g, tb, ha8, src, nullptr, dm); } while (0)
-        if (f16 && f16kq::covers_down(g.d_type)) f16kq::down(b, g, tb.ts, tb.tiles, tb.off, n, n_expert, tiles, ha8, dm, s);
+        if (f16 && g.d_type == GGML_TYPE_Q5_0 && f16q50::enabled()) f16q50::down(b, g, tb.ts, tb.tiles, tb.off, n, n_expert, tiles, ha8, dm, s);
+        else if (f16 && f16kq::covers_down(g.d_type)) f16kq::down(b, g, tb.ts, tb.tiles, tb.off, n, n_expert, tiles, ha8, dm, s);
         else if (f16 && f16_d(g.d_type)) {
             if (g.d_type == T_Q2_0) STRATA_F16_LAUNCH(T_Q2_0, false, f16::D_NFB, ha8, nullptr, dm);
             else if (g.d_type == T_Q8_0) STRATA_F16_LAUNCH(T_Q8_0, false, f16::D_NFB, ha8, nullptr, dm);

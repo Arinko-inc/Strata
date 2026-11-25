@@ -2373,6 +2373,7 @@ if(STRATA_NATIVE_EXPERTS)
       src/prefill/moe_fused.cu
       src/prefill/moe_fused_iq.cu
       src/prefill/moe_f16_kq.cu
+      src/prefill/moe_f16_q50.cu
       src/prefill/ggml_cuda_host.cu
       "${_strata_quantize_cu}")
     if(STRATA_MMQ_KQUANTS)
@@ -2390,7 +2391,7 @@ if(STRATA_NATIVE_EXPERTS)
     endif()
     set_source_files_properties(${_strata_mmq_sources} PROPERTIES LANGUAGE HIP)
     # moe_fused.cu is Strata's own CUDA-shaped source: it takes the HIP compat headers, ggml's MMQ sources do not
-    set_source_files_properties(src/prefill/moe_fused.cu src/prefill/moe_fused_iq.cu src/prefill/moe_f16_kq.cu
+    set_source_files_properties(src/prefill/moe_fused.cu src/prefill/moe_fused_iq.cu src/prefill/moe_f16_kq.cu src/prefill/moe_f16_q50.cu
                                 PROPERTIES INCLUDE_DIRECTORIES "${STRATA_HIP_COMPAT_INCLUDE_DIR}")
     add_library(strata_mmq STATIC ${_strata_mmq_sources})
     target_include_directories(strata_mmq
@@ -2751,7 +2752,8 @@ if(STRATA_HIP_GFX906)
       endforeach()
       list(APPEND _strata_cu ${_strata_tq_hip})
     endif()
-    target_sources(strata_mmq PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/prefill/moe_f16_kq.cu)
+    target_sources(strata_mmq PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/prefill/moe_f16_kq.cu
+                                      ${CMAKE_CURRENT_SOURCE_DIR}/src/prefill/moe_f16_q50.cu)
   endif()
   set_source_files_properties(${_strata_cu} PROPERTIES LANGUAGE HIP)
 endif()
