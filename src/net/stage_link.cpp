@@ -1,5 +1,6 @@
 // src/net/stage_link.cpp - see include/strata/net/stage_link.hpp.
 #include "strata/net/stage_link.hpp"
+#include "strata/net/stage_link_coalesce.hpp"
 
 #include <algorithm>
 #include <cfloat>
@@ -611,6 +612,10 @@ bool recv_all(sock_t fd, void* p, size_t n, std::string& err) {
 
 // header + up to two payload parts, as one logical message
 bool send_msg(sock_t fd, const StageHeader& h, const void* p1, size_t n1, const void* p2, size_t n2, std::string& err) {
+    if (coalesce::on()) {   // STRATA_LINK_COALESCE: the same bytes in one sendmsg
+        const coalesce::Part ps[3] = {{&h, sizeof h}, {p1, n1}, {p2, n2}};
+        return coalesce::send_parts((int) fd, kSendFlags, ps, 3, err);
+    }
     return send_all(fd, &h, sizeof h, err) && (n1 == 0 || send_all(fd, p1, n1, err)) &&
            (n2 == 0 || send_all(fd, p2, n2, err));
 }
@@ -650,6 +655,44 @@ bool recv_rows(sock_t fd, StageRows f, float* dst, size_t rows, size_t width, st
         conv_ms += ms_since(t);
     }
     return true;
+}
+
+// h + p1 + the rows: one sendmsg for the header and the first slice under STRATA_LINK_COALESCE (the same bytes)
+bool send_head_rows(sock_t fd, const StageHeader& h, const void* p1, size_t n1, StageRows f, const float* src,
+                    size_t rows, size_t width, std::vector<unsigned char>& buf, double& conv_ms, std::string& err) {
+    if (coalesce::on())
+        return coalesce::send_msg_rows((int) fd, kSendFlags, h, p1, n1, f, src, rows, width, slice_rows(width), buf,
+                                       conv_ms, err);
+    return send_msg(fd, h, p1, n1, nullptr, 0, err) && send_rows(fd, f, src, rows, width, buf, conv_ms, err);
+}
+
+// a window's body after its header: the ids (up to 3 parts) and the rows, in one recvmsg under STRATA_LINK_COALESCE
+// when the rows are one slice (fp32 straight into dst; another format into `wire`, then decoded); else as before
+bool recv_ids_rows(sock_t fd, const coalesce::Sink* ids, int n_ids, StageRows f, float* dst, size_t rows, size_t width,
+                   std::vector<unsigned char>& wire, double& conv_ms, std::string& err) {
+    if (coalesce::on() && n_ids >= 0 && n_ids <= 3 && rows * width > 0 &&
+        (f == StageRows::F32 || rows <= slice_rows(width))) {
+        coalesce::Sink sk[4];
+        int n = 0;
+        for (int i = 0; i < n_ids; ++i) sk[n++] = ids[i];
+        const size_t bytes = stage_rows_bytes(f, rows, width);
+        if (f == StageRows::F32) {
+            sk[n++] = {dst, bytes};
+        } else {
+            wire.resize(bytes);
+            sk[n++] = {wire.data(), bytes};
+        }
+        if (!coalesce::recv_parts((int) fd, sk, n, err)) return false;
+        if (f != StageRows::F32) {
+            const Clock::time_point t = Clock::now();
+            stage_rows_decode(f, wire.data(), rows, width, dst);
+            conv_ms += ms_since(t);
+        }
+        return true;
+    }
+    for (int i = 0; i < n_ids; ++i)
+        if (!recv_all(fd, ids[i].p, ids[i].n, err)) return false;
+    return recv_rows(fd, f, dst, rows, width, wire, conv_ms, err);
 }
 
 bool recv_header(sock_t fd, StageHeader& h, std::string& err) {
@@ -1051,8 +1094,8 @@ bool StageClient::run(int T, const int32_t* tokens, int64_t pos0, const float* r
     h.b = pos0;
     h.bytes = (uint64_t) T * sizeof(int32_t) + in_bytes;
     if (f32 ? !send_msg(S(fd_), h, tokens, (size_t) T * sizeof(int32_t), rows_in, in_bytes, err)
-            : !send_msg(S(fd_), h, tokens, (size_t) T * sizeof(int32_t), nullptr, 0, err) ||
-                  !send_rows(S(fd_), rows_, rows_in, (size_t) T, w_in, tx_, stats_.ms_encode, err)) {
+            : !send_head_rows(S(fd_), h, tokens, (size_t) T * sizeof(int32_t), rows_, rows_in, (size_t) T, w_in, tx_,
+                              stats_.ms_encode, err)) {
         break_();
         return false;
     }
@@ -1108,8 +1151,8 @@ bool StageClient::prefill_send(const int64_t* tokens, int64_t T, int64_t pos0, i
     }
     double encode_ms = 0;
     if (f32 ? !send_msg(S(fd_), h, tokens, (size_t) T * sizeof(int64_t), rows_in, in_bytes, err)
-            : !send_msg(S(fd_), h, tokens, (size_t) T * sizeof(int64_t), nullptr, 0, err) ||
-                  !send_rows(S(fd_), rows_, rows_in, (size_t) T, row_floats, tx_, encode_ms, err)) {
+            : !send_head_rows(S(fd_), h, tokens, (size_t) T * sizeof(int64_t), rows_, rows_in, (size_t) T, row_floats,
+                              tx_, encode_ms, err)) {
         break_();
         return false;
     }
@@ -1241,8 +1284,8 @@ bool StageClient::slot_send_(int S, const int32_t* slots, const int32_t* tokens,
         std::lock_guard<std::mutex> lq(q_mu_);
         slot_sent_.push_back(SlotSent{Clock::now(), tag, S});
     }
-    if (!send_msg((sock_t) fd_, h, head.data(), head.size(), nullptr, 0, err) ||
-        !send_rows((sock_t) fd_, rows_, rows_in, (size_t) S, w, tx_, stats_.ms_encode, err)) {
+    if (!send_head_rows((sock_t) fd_, h, head.data(), head.size(), rows_, rows_in, (size_t) S, w, tx_,
+                        stats_.ms_encode, err)) {
         break_();
         return false;
     }
@@ -1805,9 +1848,9 @@ int serve_stage(const std::string& bind_addr, int port, const std::string& token
                         } else {
                             in.tok32.resize((size_t) T);
                             in.rows.resize(rows);
-                            if (!recv_all(fd, in.tok32.data(), (size_t) T * 4, in.err) ||
-                                !recv_rows(fd, fmt, in.rows.data(), (size_t) T, (size_t) buf.handoff_floats, wire,
-                                           in.decode_ms, in.err))
+                            const coalesce::Sink ids[1] = {{in.tok32.data(), (size_t) T * 4}};
+                            if (!recv_ids_rows(fd, ids, 1, fmt, in.rows.data(), (size_t) T,
+                                               (size_t) buf.handoff_floats, wire, in.decode_ms, in.err))
                                 in.closed = true;
                         }
                     } else if (type == StageMsg::Prefill) {
@@ -1871,11 +1914,11 @@ int serve_stage(const std::string& bind_addr, int port, const std::string& token
                             in.tok32.resize((size_t) S);
                             in.pos64.resize((size_t) S);
                             in.rows.resize((size_t) S * (size_t) buf.handoff_floats);
-                            if (!recv_all(fd, in.slots32.data(), (size_t) S * 4, in.err) ||
-                                !recv_all(fd, in.tok32.data(), (size_t) S * 4, in.err) ||
-                                !recv_all(fd, in.pos64.data(), (size_t) S * 8, in.err) ||
-                                !recv_rows(fd, fmt, in.rows.data(), (size_t) S, (size_t) buf.handoff_floats, wire,
-                                           in.decode_ms, in.err))
+                            const coalesce::Sink ids[3] = {{in.slots32.data(), (size_t) S * 4},
+                                                           {in.tok32.data(), (size_t) S * 4},
+                                                           {in.pos64.data(), (size_t) S * 8}};
+                            if (!recv_ids_rows(fd, ids, 3, fmt, in.rows.data(), (size_t) S,
+                                               (size_t) buf.handoff_floats, wire, in.decode_ms, in.err))
                                 in.closed = true;
                         }
                     } else if (type == StageMsg::SlotCommit) {
@@ -2205,9 +2248,9 @@ int serve_stage(const std::string& bind_addr, int port, const std::string& token
                     if (!replies_out() || !send_msg(fd, r, buf.run_out, (size_t) r.bytes, nullptr, 0, err)) keep = false;
                 } else {   // (the link's format, converted as it goes out)
                     r.bytes = stage_rows_bytes(rows_fmt, (size_t) T, (size_t) buf.handoff_floats);
-                    if (!replies_out() || !send_msg(fd, r, nullptr, 0, nullptr, 0, err) ||
-                        !send_rows(fd, rows_fmt, buf.run_out, (size_t) T, (size_t) buf.handoff_floats, run_tx,
-                                   stats.ms_encode, err))
+                    if (!replies_out() ||
+                        !send_head_rows(fd, r, nullptr, 0, rows_fmt, buf.run_out, (size_t) T,
+                                        (size_t) buf.handoff_floats, run_tx, stats.ms_encode, err))
                         keep = false;
                 }
                 stats.bytes_out += sizeof r + r.bytes;
@@ -2267,8 +2310,8 @@ int serve_stage(const std::string& bind_addr, int port, const std::string& token
                         }
                     }
                     if (fmt == StageRows::F32) return send_msg(fd, r, src, (size_t) r.bytes, nullptr, 0, reply_err);
-                    const bool sent = send_msg(fd, r, nullptr, 0, nullptr, 0, reply_err) &&
-                                      send_rows(fd, fmt, src, back_rows, D, pf_tx, reply_encode_ms, reply_err);
+                    const bool sent =
+                        send_head_rows(fd, r, nullptr, 0, fmt, src, back_rows, D, pf_tx, reply_encode_ms, reply_err);
                     if (sent && remote_timing())
                         std::fprintf(stderr, "strata stage worker: chunk T=%lld: its rows to %s in %.0f ms\n",
                                      (long long) T, stage_rows_name(fmt), reply_encode_ms);
@@ -2409,8 +2452,8 @@ int serve_stage(const std::string& bind_addr, int port, const std::string& token
                         }
                         // this window's time here: from its arrival to its rows (the next worker's included)
                         r.a = (int64_t) (ms_since(t0) * 1000.0);
-                        return send_msg(fd, r, nullptr, 0, nullptr, 0, reply_err) &&
-                               send_rows(fd, fmt, out, (size_t) S, hf, sr_tx, reply_encode_ms, reply_err);
+                        return send_head_rows(fd, r, nullptr, 0, fmt, out, (size_t) S, hf, sr_tx, reply_encode_ms,
+                                              reply_err);
                     });
                     stats.bytes_out += sizeof r + r.bytes;
                     ++stats.slot_runs;
@@ -2435,9 +2478,8 @@ int serve_stage(const std::string& bind_addr, int port, const std::string& token
                 r.a = (int64_t) (ms_since(t0) * 1000.0);   // the worker's own time, microseconds
                 r.c = in.h.c;                              // the window's tag, as it came
                 r.bytes = stage_rows_bytes(rows_fmt, (size_t) S, (size_t) buf.handoff_floats);
-                if (!send_msg(fd, r, nullptr, 0, nullptr, 0, err) ||
-                    !send_rows(fd, rows_fmt, buf.run_out, (size_t) S, (size_t) buf.handoff_floats, run_tx,
-                               stats.ms_encode, err))
+                if (!send_head_rows(fd, r, nullptr, 0, rows_fmt, buf.run_out, (size_t) S,
+                                    (size_t) buf.handoff_floats, run_tx, stats.ms_encode, err))
                     keep = false;
                 stats.bytes_out += sizeof r + r.bytes;
                 ++stats.slot_runs;
