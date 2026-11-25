@@ -13414,7 +13414,12 @@ int main(int argc, char** argv) {
                                                                             (int) strata::net::kDeferredMaxRows);
                         { const char* sc = std::getenv("STRATA_BATCH_SELF_COMMIT"); pin.self_commit = sc != nullptr && sc[0] != '\0' && sc[0] != '0'; }
                         pin.probe_rows = probe_r;
-                        const rpm::Result pr = rpm::decide(pin);
+                        rpm::Result pr = rpm::decide(pin);
+                        if (pr.on && !piped_mtp) {   // (合流 D, Sol P2: --batch-groups auto decided one group at the start)
+                            pr.on = false;
+                            pr.why = "the slot drafters were not set up at the start (--batch-groups auto: give the number, "
+                                     "e.g. --batch-groups 2)";
+                        }
                         if (pr.on) {
                             pm_drafts = pr.drafts;
                             std::fprintf(stderr, "strata serve: remote stage: STRATA_PIPED_MTP: the %d pipelined groups of %d slot%s "
@@ -15700,6 +15705,11 @@ int main(int argc, char** argv) {
             // rows - the last stage's final residuals - are copied on THAT stage's stream, so its next window, which
             // rewrites them, runs after the copy; the chain waits for the copy.
             const size_t stride = (size_t) g.hc * (size_t) g.n_embd;
+            // (合流 D, Sol P1: the next proposals stay inside the context: as the window cuts its rows (nd <= max_context - p - 2),
+            // this cuts the chain that drafts them; one always, as before)
+            auto pm_chain_n = [&](const BSlot& sl) {
+                return (int) std::max<int64_t>(1, std::min<int64_t>(pm_drafts, o.max_context - sl.p - 2));
+            };
             for (const Blk& blk : blks) {
                 BSlot& sl = bs[(size_t) blk.b];
                 if (!sl.active) continue;   // it ended: no more drafts for it
@@ -15711,7 +15721,7 @@ int main(int argc, char** argv) {
                     cudaEventRecord(pm_copied[(size_t) blk.b], vk.stream()) != cudaSuccess ||
                     cudaStreamWaitEvent(slot_mtp[(size_t) blk.b]->stream(), pm_copied[(size_t) blk.b], 0) != cudaSuccess ||
                     !slot_mtp[(size_t) blk.b]->chain_launch(blk.n, outb + blk.f, G.pos[blk.f], blk.keep - 1, nullptr, 0,
-                                                            pm_drafts, 0, err)) {
+                                                            pm_chain_n(sl), 0, err)) {
                     std::printf("ERR batch MTP slot %d: %s\n", blk.b,
                                 err.empty() ? "the proposal's chain did not start" : err.c_str());
                     return false;

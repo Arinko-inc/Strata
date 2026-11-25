@@ -84,7 +84,10 @@ if (wk_dfr_on) {
             return slot_run_prev(S, slots, tokens, pos, flags, e);
         }
         const WkBusy busy("stage worker deferred window");
-        wk_win_S = 0;   // a window that fails leaves nothing for a SlotCommit
+        if (wk_win_S != 0) {   // (合流 D, Sol P3: refused without touching the window that waits for its SlotCommit)
+            e = "stage worker: bad slot window: a deferred window came before the last window's SlotCommit";
+            return false;
+        }
         if (flags != strata::net::kStageSlotDeferred) {
             e = "stage worker: a deferred batch window's flags " + std::to_string(flags) + " are not known here";
             return false;
