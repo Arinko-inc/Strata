@@ -360,6 +360,12 @@ if(STRATA_BUILD_TESTS)
   target_include_directories(prefill_plan_test PRIVATE include)
   add_test(NAME prefill_plan_test COMMAND prefill_plan_test)
 
+  # STRATA_ADAPT_EARLY: the flag's rule and the one-window runner of the adaptive round: header-only, no GPU
+  add_executable(adapt_early_test tests/program/adapt_early_test.cpp)
+  target_include_directories(adapt_early_test PRIVATE include)
+  target_link_libraries(adapt_early_test PRIVATE Threads::Threads)
+  add_test(NAME adapt_early_test COMMAND adapt_early_test)
+
   # the default CPU prefill share is not armed when every expert is resident (#1595): header-only rule, no GPU
   add_executable(share_rules_test tests/prefill/share_rules_test.cpp)
   target_include_directories(share_rules_test PRIVATE include)

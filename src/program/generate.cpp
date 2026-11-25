@@ -99,6 +99,7 @@
 #include "strata/platform/host_limits.hpp"
 #include "strata/program/split_ring.hpp"
 #include "strata/program/prefill_plan.hpp"
+#include "strata/program/adapt_early.hpp"
 #include "strata/program/draft_kv_plan.hpp"
 #include "strata/program/message_boundary.hpp"
 #include "strata/spec/draft_policy.hpp"
@@ -10267,6 +10268,7 @@ int main(int argc, char** argv) {
         }
         using RemoteRunFn = std::function<bool(int, const int32_t*, int64_t, std::string&)>;
         std::function<RemoteRunFn(const float*, float*)> remote_run_of;   // remote-stage: see ver_same.set_remote
+        strata::program::adapt_early::Runner adapt_early;   // STRATA_ADAPT_EARLY (C1): fired by the remote stage's send
         if (n_stages > 1) {
             // pipelined slot groups write their rows at hbase = group * rows-per-group, so with more than
             // kVerifyMaxT slots in groups the hand-off holds one row per slot (otherwise kVerifyMaxT, as before)
@@ -10353,8 +10355,9 @@ int main(int argc, char** argv) {
                 gap.on = [] { const char* v = std::getenv("STRATA_REMOTE_TIMING"); return v && v[0] == '1'; }();
                 // a head stage's window: stage 0's rows out of `out0`, the worker's back into `rx` (both host side).
                 // --pipeline-windows: the odd windows' head stage gets its own pair (and runs this on its job thread)
-                remote_run_of = [&remote_link, HBF](const float* out0, float* rx) -> RemoteRunFn {
-                    return [&remote_link, out0, rx, HBF](int T, const int32_t* tokens, int64_t pos0, std::string& e) {
+                remote_run_of = [&remote_link, &adapt_early, HBF](const float* out0, float* rx) -> RemoteRunFn {
+                    return [&remote_link, &adapt_early, out0, rx, HBF](int T, const int32_t* tokens, int64_t pos0, std::string& e) {
+                        adapt_early.fire();   // STRATA_ADAPT_EARLY (C1): the armed window's adaptive round starts as the rows go out (else a no-op)
                         const auto t0 = Clock::now();
                         if (gap.on && gap.last.time_since_epoch().count() != 0) {
                             const double d = std::chrono::duration<double, std::milli>(t0 - gap.last).count();
@@ -12001,6 +12004,35 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata serve: the adaptive tier's evictions reach the device's table before the next "
                                      "window (STRATA_ADAPT_EVICT_SYNC=0: when its copies land)\n");
         }
+        // STRATA_ADAPT_EARLY (C1, IMPL-PLAN-2026-11-26-main-small.md): the adaptive round of a window starts when the
+        // rows go to the remote stage; unset: nothing here, =0: the same windows, timed apart (the decode timing line)
+        const auto early_mode = strata::program::adapt_early::mode(std::getenv("STRATA_ADAPT_EARLY"));
+        const char* early_why = nullptr;
+        {
+            strata::program::adapt_early::Input ei;
+            ei.mode = early_mode;
+            ei.remote_main = !o.remote_stage.empty();
+            ei.tier_on = !drive.d.usage.empty();
+            ei.serial_windows = serial_windows;
+            ei.local_split = multi_gpu || !stages.empty();
+            ei.helpers = peer.valid() || remote_opt || drive.d.remote_count > 0;
+            ei.adapt_async = o.adapt_async;
+            ei.pipeline_windows = o.pipeline_windows > 0;
+            ei.pre_launch_hook = drive.d.fetch_admit > 0 || drive.d.evict_sync || res_checking;
+            ei.pin_blobs = pin_blobs_on();
+            ei.lagged = adapt_lag() != 1 || adapt_nowait();
+            ei.resident_ram = src.complement_ready();
+            early_why = strata::program::adapt_early::off_reason(ei);
+        }
+        const bool early_on = early_mode == strata::program::adapt_early::Mode::On && early_why == nullptr;
+        strata::program::adapt_early::Stats early_stats;
+        if (early_on)
+            std::fprintf(stderr, "strata serve: adaptive early start (STRATA_ADAPT_EARLY=1): a round of the adaptive tier starts when the rows "
+                                 "go to the remote stage (the same swaps, chosen from the same counts)\n");
+        else if (early_mode == strata::program::adapt_early::Mode::On)
+            std::fprintf(stderr, "strata serve: STRATA_ADAPT_EARLY=1 is off: %s\n", early_why);
+        else if (early_mode == strata::program::adapt_early::Mode::Off)
+            std::fprintf(stderr, "strata serve: adaptive early start: off (STRATA_ADAPT_EARLY=0: the windows after a round are timed apart)\n");
         // --pipeline-windows: set while the tier adapts beside windows in flight (see its use in adapt)
         std::function<void()> adapt_fence;
         int64_t adapt_nswaps = 0;   // the blocking tier's swaps chosen, cumulative (the decode timing line's swaps/window)
@@ -18371,6 +18403,7 @@ int main(int argc, char** argv) {
             strata::core::MtpDrafter::DraftResult generation;
             strata::core::gated::Packet proposal; // immutable through the synchronous verifier call
             bool first_window = true;
+            bool early_prev_round = false;   // STRATA_ADAPT_EARLY: the window before this one had its adaptive round (the timing line)
             int64_t produced_n = 0, sfx_windows = 0, sfx_drafts = 0, sfx_ok = 0;
             // on by default on every backend (measured on HIP: 4 x R9700, Qwen3.8-Flash-Next IQ3_S, 0 of 16 continuations fell back to
             // the older checkpoint against 4 of 16 without it, #4677; it changes no emitted token, only which accepted rows the
@@ -19321,9 +19354,25 @@ int main(int argc, char** argv) {
                 if (gated_proposal) ver.set_spec_proposal(proposal.n_q ? proposal.mu.data() : nullptr, proposal.n_q);
                 else if (use_mtp && mtp.prob() && !from_sfx && !first_window && T_mtp > 1) ver.set_spec_q(mtp.spec_q(), T_mtp - 1);
                 const auto decode_pool_fn = use_mtp && mtp.prob() ? invariant_win_pool_fn : win_pool_fn;
+                // STRATA_ADAPT_EARLY (C1): this window's round, if one is due, starts when the rows go to the remote stage
+                const bool round_due = !drive.d.usage.empty() && !ajob && ((rounds + 1) % o.adapt_iv(rounds)) == 0;
+                strata::program::adapt_early::Window early_win(adapt_early, early_on && round_due
+                    ? strata::program::adapt_early::Runner::Job([&]() -> bool {
+                          strata::platform::name_this_thread("strata-adapt");
+                          strata::aux_cpus::pin_current_thread();
+                          if (aflipped) apply_pending(true);   // adapt every window: the last round's copies landed in this window's layers
+                          return adapt();
+                      })
+                    : strata::program::adapt_early::Runner::Job());
                 if (!ver.run(T, window.data(), p, decode_pool_fn, win_pool_user, outv.data(), err) || drive.d.failed) {
                     std::printf("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
                     return 1;
+                }
+                const strata::program::adapt_early::Runner::Result early_r = early_win.finish();   // joined before the tables are read below
+                if (early_r.fired) {
+                    ++early_stats.early; early_stats.host_ms += early_r.host_ms; early_stats.wait_ms += early_r.wait_ms;
+                    dt_adapt_join += early_r.wait_ms; asw_wait_ms += early_r.wait_ms;
+                    if (!early_r.ok) { std::printf("ERR an adaptive refill failed\n"); return 1; }
                 }
                 if (aflipped) apply_pending(true);   // 0.1.43: every layer's copies were waited for in the window; the bookkeeping now
                 // Diagnostics (as in generate): STRATA_DUMP_FIRST_LOGITS=<path> writes the logits of each request's first
@@ -19360,8 +19409,9 @@ int main(int argc, char** argv) {
                 std::thread adapt_thr;   // the adaptive tier beside the commit and the draft (as in generate)
                 bool adapt_ok = true;
                 // (--adapt-async 1: the asynchronous tier above instead, ticked before the window)
-                if (!drive.d.usage.empty() && !ajob && ((rounds + 1) % o.adapt_iv(rounds)) == 0)
+                if (!drive.d.usage.empty() && !ajob && ((rounds + 1) % o.adapt_iv(rounds)) == 0 && !early_r.fired)
                     adapt_thr = std::thread([&] { strata::platform::name_this_thread("strata-adapt"); strata::aux_cpus::pin_current_thread(); adapt_ok = adapt(); });
+                if (early_on && round_due && !early_r.fired) ++early_stats.late;   // the window never reached the send
                 if (!ver.commit(a + 1, err)) {
                     if (adapt_thr.joinable()) adapt_thr.join();
                     std::printf("ERR %s\n", err.c_str());
@@ -19430,6 +19480,11 @@ int main(int argc, char** argv) {
                 if (!adapt_ok) {
                     std::printf("ERR an adaptive refill failed\n");
                     return 1;
+                }
+                if (early_mode != strata::program::adapt_early::Mode::Unset) {   // STRATA_ADAPT_EARLY: the window after a round, timed apart
+                    if (timed_round)
+                        early_stats.window(early_prev_round, std::chrono::duration<double, std::milli>(Clock::now() - round0).count());
+                    early_prev_round = round_due;
                 }
                 // the session's choice of the adaptive tier (adapt_async_default.hpp): ~64 windows on the blocking tier, then
                 // ~64 on the asynchronous one if the swaps held the windows up, kept only if the decode got faster
@@ -19514,6 +19569,15 @@ int main(int argc, char** argv) {
                 if (aov)
                     std::fprintf(stderr, "strata decode adapt overlap: %lld windows took swaps still landing, a layer waited %.2f ms in all so far\n",
                                  (long long) aov_flips, ver.ms_gate);
+                if (early_mode != strata::program::adapt_early::Mode::Unset) {
+                    const auto& es = early_stats;
+                    std::fprintf(stderr, "strata decode adapt early: %lld rounds at the remote send, %lld after the window; host %.3f ms and "
+                                         "wait %.3f ms per round; windows after a round %.2f ms (%lld), others %.2f ms (%lld)\n",
+                                 es.early, es.late, es.early > 0 ? es.host_ms / (double) es.early : 0.0,
+                                 es.early > 0 ? es.wait_ms / (double) es.early : 0.0,
+                                 es.after_n > 0 ? es.after_ms / (double) es.after_n : 0.0, es.after_n,
+                                 es.other_n > 0 ? es.other_ms / (double) es.other_n : 0.0, es.other_n);
+                }
                 for (int st = 0; st < n_stages; ++st) {   // every stage's GPU profile, not only the first card's
                     const std::string pr = stage_ver(st).profile_report();
                     if (pr.empty()) continue;
