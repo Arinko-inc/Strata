@@ -80,6 +80,23 @@ int main() {
         check(rp::decide(in).on && rp::decide(in).drafts == 1, "3 slots per group in 6 rows: on with 1 draft");
     }
 
+    std::printf("decide: the workers' saved rows a slot (STRATA_WK_PIPED_MTP_ROWS, 合流 D)\n");
+    {
+        rp::Input in = good();
+        in.peer_max_t = 6;
+        in.pm_drafts = 2;
+        check(rp::decide(in).on && rp::decide(in).drafts == 2, "no slot limit (0): 2 slots in 6 rows, N=2: 2 drafts");
+        in.peer_slot_rows = 2;
+        check(rp::decide(in).on && rp::decide(in).drafts == 1, "2 rows a slot (the default): N=2 cut to 1 draft");
+        in.batch = 2;
+        in.pm_drafts = 3;
+        check(rp::decide(in).on && rp::decide(in).drafts == 1, "1 slot per group in 6 rows, N=3, 2 rows a slot: 1 draft");
+        in.peer_slot_rows = 4;
+        check(rp::decide(in).on && rp::decide(in).drafts == 3, "1 slot per group, N=3, 4 rows a slot: 3 drafts");
+        in.peer_slot_rows = 1;
+        check(off_with_reason(in), "1 row a slot: off (no room for a draft)");
+    }
+
     std::printf("decide: each missing condition\n");
     {
         rp::Input in = good();

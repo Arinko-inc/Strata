@@ -4017,7 +4017,11 @@ bool Verifier::init_deferred_commit(int rows, std::string& err) {
     const ModelGeometry& g = *g_;
     const uint64_t R = (uint64_t) rows, C = (uint64_t) g.ssm_conv_channels, HV = (uint64_t) g.ssm_v_heads;
     const uint64_t ID = (uint64_t) g.idx_key_dim;
-    const uint64_t nG = (uint64_t) std::max<int64_t>(g.n_gdn_layers(), 1), nQ = (uint64_t) std::max<int64_t>(g.n_qsa_layers(), 1);
+    // L1 (Arinko-inc): the saved rows of this stage's layers [lb_, le_) only (a remote relay's free VRAM is tens of
+    // MiB; every layer of the model was 4x its own).  capture_deferred indexes them from this stage's first layer.
+    int64_t own_gdn = 0, own_qsa = 0;
+    for (int64_t l = lb_; l < le_; ++l) (is_qsa_layer(g, l) ? own_qsa : own_gdn) += 1;
+    const uint64_t nG = (uint64_t) std::max<int64_t>(own_gdn, 1), nQ = (uint64_t) std::max<int64_t>(own_qsa, 1);
     const uint64_t HS = (uint64_t) strata::kernels::NG_HIST * strata::kernels::NG_HC_DIM;
     const uint64_t CB = 2 + (uint64_t) max_t_, nS = (uint64_t) slots_.size();
     const uint64_t floats[6] = {nG * R * C, nG * R * C, nG * R * HV, nG * R * HV, nQ * R * ID, R * HS};
@@ -4064,6 +4068,10 @@ bool Verifier::capture_deferred(const int* rows, int S, int hbase, std::string& 
         qsa_index = gdn_index = 0;
         for (int64_t l = 0; l < lb_; ++l) (is_qsa_layer(g, l) ? qsa_index : gdn_index) += 1;
     };
+    // L1 (Arinko-inc): the saved rows hold this stage's layers only (init_deferred_commit): their layer index counts
+    // from this stage's first layer (g0 / q0: the GDN / QSA layers before it; 0 for a stage that starts at layer 0)
+    int64_t q0 = 0, g0 = 0;
+    layer_index(q0, g0);
     auto finish = [&](cudaGraphExec_t& ex, bool ok, const char* what) {
         cudaGraph_t graph = nullptr;
         const cudaError_t ce = cudaStreamEndCapture(cs_, &graph);
@@ -4090,13 +4098,13 @@ bool Verifier::capture_deferred(const int* rows, int S, int hbase, std::string& 
         };
         for (int64_t l = lb_; l < le_; ++l) {
             if (!is_qsa_layer(g, l)) {
-                copy(dc_qkv_ + (size_t) (gdn_index * R + hbase) * C, qkv_L_ + (size_t) gdn_index * MT * C, S * C);
-                copy(dc_h_ + (size_t) (gdn_index * R + hbase) * C, h_L_ + (size_t) gdn_index * MT * C, S * C);
-                copy(dc_gate_ + (size_t) (gdn_index * R + hbase) * HV, gate_L_ + (size_t) gdn_index * MT * HV, S * HV);
-                copy(dc_beta_ + (size_t) (gdn_index * R + hbase) * HV, beta_L_ + (size_t) gdn_index * MT * HV, S * HV);
+                copy(dc_qkv_ + (size_t) ((gdn_index - g0) * R + hbase) * C, qkv_L_ + (size_t) gdn_index * MT * C, S * C);
+                copy(dc_h_ + (size_t) ((gdn_index - g0) * R + hbase) * C, h_L_ + (size_t) gdn_index * MT * C, S * C);
+                copy(dc_gate_ + (size_t) ((gdn_index - g0) * R + hbase) * HV, gate_L_ + (size_t) gdn_index * MT * HV, S * HV);
+                copy(dc_beta_ + (size_t) ((gdn_index - g0) * R + hbase) * HV, beta_L_ + (size_t) gdn_index * MT * HV, S * HV);
                 ++gdn_index;
             } else {
-                copy(dc_idx_ + (size_t) (qsa_index * R + hbase) * ID, idx_raw_L_ + (size_t) qsa_index * MT * ID, S * ID);
+                copy(dc_idx_ + (size_t) ((qsa_index - q0) * R + hbase) * ID, idx_raw_L_ + (size_t) qsa_index * MT * ID, S * ID);
                 ++qsa_index;
             }
         }
@@ -4131,7 +4139,7 @@ bool Verifier::capture_deferred(const int* rows, int S, int hbase, std::string& 
                         const int32_t* keep = commitd_ + (size_t) rows[first] * CB;
                         float* state = sx.gdn_state + (size_t) (gdn_index - sx.gdn_ord0) * gdn_floats;
                         float* conv = state + (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
-                        const int64_t row = gdn_index * R + hbase + first;
+                        const int64_t row = (gdn_index - g0) * R + hbase + first;
                         gdn_conv_commit(conv, dc_qkv_ + (size_t) row * C, (int) C, keep, cs_);
                         // z only feeds the norm's output, which the commit discards (y_dummy_): the window scratch will do
                         gdn_step_norm_multi(state, dc_h_ + (size_t) row * C, (int) C, dc_gate_ + (size_t) row * HV,
@@ -4151,7 +4159,7 @@ bool Verifier::capture_deferred(const int* rows, int S, int hbase, std::string& 
                         copy_from_mapped(st.idx_tail, tail_snap_b_ + ((size_t) rows[first] * nQ + qsa_index) * TS, TS, cs_);
                         const QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};
                         for (int u = first; u < t; ++u)
-                            native_qsa_indexer_append(dc_idx_ + (size_t) (qsa_index * R + hbase + u) * ID,
+                            native_qsa_indexer_append(dc_idx_ + (size_t) ((qsa_index - q0) * R + hbase + u) * ID,
                                                       commitd_ + (size_t) rows[first] * CB + 2 + (u - first),
                                                       slot_pos_base(rows[first]),
                                                       (const float*) wikn->data, EPS, ib, s, st.max_cells,
@@ -4205,7 +4213,15 @@ bool Verifier::batch_launch_rows(const int* rows, int S, int hbase, const int32_
 bool Verifier::batch_commit_rows(const int* rows, int S, int hbase, const int* keep, const int32_t* tokens,
                                  const int64_t* pos, std::string& err) {
     const OnDevice on_device(device_);
-    const auto it = dcommit_bm_.find(bkey(rows, S, hbase));
+    auto it = dcommit_bm_.find(bkey(rows, S, hbase));
+    if (it == dcommit_bm_.end() || it->second == nullptr) {
+        // L1 (Arinko-inc, 合流 D): the doorbell variant (#871: ar_off_, the key's last entry) flipped between the window
+        // and this commit (refresh_ar).  The commit reads no doorbell: the other variant's graph, captured with the
+        // window, is the same commit
+        std::vector<int> other = bkey(rows, S, hbase);
+        other.back() = other.back() != 0 ? 0 : 1;
+        it = dcommit_bm_.find(other);
+    }
     if (it == dcommit_bm_.end() || it->second == nullptr) { err = "verify: a deferred commit without its window"; return false; }
     const int64_t CB = 2 + max_t_;
     // Each slot's accepted prefix.  The graph reads it from mapped memory when it runs; this slot's entry is written

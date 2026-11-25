@@ -25,6 +25,9 @@ struct Input {
     uint32_t peer_batch_flags = 0;                   ///< the worker's hello (strata::net::kStageBatchDeferred, bit 3)
     int peer_max_t = 0;                              ///< the rows a window may hold: the worker's hello max_t (generate.cpp passes the
                                                      ///< narrowest of it and this process's two verifiers)
+    /// the most rows one slot may have in a deferred window: the workers' saved rows a slot (STRATA_WK_PIPED_MTP_ROWS,
+    /// default 2; the hello does not carry it, so generate.cpp reads the same variable here).  0: no such limit
+    int peer_slot_rows = 0;
     bool self_commit = false;                        ///< STRATA_BATCH_SELF_COMMIT
     int probe_rows = 0;                              ///< STRATA_PIPE_PROBE_ROWS (stage 0's measurement; not with drafts)
 };
@@ -73,7 +76,12 @@ inline Result decide(const Input& in) {
     // 全枠が動いたときの 1 組の窓: 枠ごとにトークン 1 行 + 下書き n 行。受けられる行の数は一番狭い相手で決まる
     const int per_group = in.batch / in.groups;
     const int cap = std::min(kMaxWindowRows, in.peer_max_t);
-    const int n = std::min(in.pm_drafts, cap / per_group - 1);
+    if (in.peer_slot_rows == 1) {
+        r.why = "the workers save one row a slot for a deferred window (STRATA_WK_PIPED_MTP_ROWS=1): no room for a draft";
+        return r;
+    }
+    int n = std::min(in.pm_drafts, cap / per_group - 1);
+    if (in.peer_slot_rows > 1) n = std::min(n, in.peer_slot_rows - 1);   // (合流 D: the workers' saved rows a slot)
     if (n < 1) {
         r.why = "a group's window (its slots' tokens and one proposal each) does not fit in the rows a window takes "
                 "(this process's verifiers and the worker's max_t)";

@@ -13408,6 +13408,10 @@ int main(int argc, char** argv) {
                         pin.peer_batch_flags = remote_peer.batch_flags;
                         // the rows one window can hold: the narrowest of this process's two verifiers and the worker's hello
                         pin.peer_max_t = std::min({(int) remote_peer.max_t, ver.max_t(), ver_same.max_t()});
+                        // the workers' saved rows a slot (合流 D): the hello does not carry it - the workers' default (2),
+                        // or STRATA_WK_PIPED_MTP_ROWS set here as on the workers
+                        pin.peer_slot_rows = strata::net::wk_piped_mtp_rows(std::getenv("STRATA_WK_PIPED_MTP_ROWS"),
+                                                                            (int) strata::net::kDeferredMaxRows);
                         { const char* sc = std::getenv("STRATA_BATCH_SELF_COMMIT"); pin.self_commit = sc != nullptr && sc[0] != '\0' && sc[0] != '0'; }
                         pin.probe_rows = probe_r;
                         const rpm::Result pr = rpm::decide(pin);
@@ -13415,8 +13419,9 @@ int main(int argc, char** argv) {
                             pm_drafts = pr.drafts;
                             std::fprintf(stderr, "strata serve: remote stage: STRATA_PIPED_MTP: the %d pipelined groups of %d slot%s "
                                                  "draft up to %d proposal%s per slot (the worker keeps each window until its "
-                                                 "SlotCommit: kStageSlotDeferred)\n", o.batch_groups, o.batch / o.batch_groups,
-                                         o.batch / o.batch_groups == 1 ? "" : "s", pm_drafts, pm_drafts == 1 ? "" : "s");
+                                                 "SlotCommit: kStageSlotDeferred; the workers save %d rows a slot)\n",
+                                         o.batch_groups, o.batch / o.batch_groups, o.batch / o.batch_groups == 1 ? "" : "s",
+                                         pm_drafts, pm_drafts == 1 ? "" : "s", pin.peer_slot_rows);
                         } else {
                             pmtp_remote_ok = false;
                             piped_mtp = false;
@@ -15475,6 +15480,7 @@ int main(int argc, char** argv) {
             int64_t tag = 0;                ///< L1: 遠隔の組の窓の札(SlotRun の tag。判定のあとの SlotCommit が名指す)
         };
         std::vector<PGroup> pg((size_t) (piped ? o.batch_groups : 0));
+        int64_t pmtp_uncommitted = 0;   // L1 (合流 D): deferred windows sent whose SlotCommit has not gone yet
         std::vector<int> stage_group((size_t) n_pipe, -1);
         // ---- remote-batch stage 2 (strata-mesh IMPL-PLAN-remote-batch-stage2.md 2.2): with remote_pipe, a group's
         // stage 0 window done goes out as a SlotRun (kStageSlotKeepAll: the worker keeps every row, no SlotCommit);
@@ -15642,6 +15648,7 @@ int main(int argc, char** argv) {
                     keep32[blk.b] = (int32_t) blk.keep;
                 }
                 if (!remote_link.slot_commit(keep32, remote_slots_n, G.tag, err, true)) return rpipe_fail(err);
+                --pmtp_uncommitted;
                 if (rpt.on) {
                     rpt.acc += bt_accepted - acc_before;
                     rpt.tok += bt_tokens - tok_before;
@@ -15792,6 +15799,7 @@ int main(int argc, char** argv) {
                     for (int t = 0; t < G.S; ++t) s32[t] = (int32_t) G.rows[t];
                     // L1: 下書きの組は確定を判定のあとへ回す窓(kStageSlotDeferred)で送り、札を覚える。SlotCommit が名指す
                     G.tag = ++remote_slot_tag;
+                    if (pmtp) ++pmtp_uncommitted;   // (合流 D: its SlotCommit goes with its verdict, before G.inflight drops)
                     if (!rpipe->send(gi, G.S, s32, G.tok, G.pos,
                                      pmtp ? strata::net::kStageSlotDeferred : strata::net::kStageSlotKeepAll, G.tag,
                                      rb_out0 + (size_t) G.hbase * (size_t) rb_hbf, (size_t) G.S * (size_t) rb_hbf,
@@ -16116,6 +16124,11 @@ int main(int argc, char** argv) {
             if (remote_pipe && rpipe->outstanding() != 0)
                 return rpipe_fail("the pipelined windows did not drain (" + std::to_string(rpipe->outstanding()) +
                                   " still out)");
+            // L1 (合流 D): every deferred window has had its SlotCommit - the worker refuses a prompt chunk, a reset, a
+            // slot save / load and any other window while it holds one
+            if (remote_pipe && pmtp_uncommitted != 0)
+                return rpipe_fail("the pipelined draft windows did not drain (" + std::to_string(pmtp_uncommitted) +
+                                  " without their SlotCommit)");
             return pmtp_settle();
         };
         for (;;) {
