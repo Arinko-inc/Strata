@@ -365,6 +365,29 @@ class Pick(unittest.TestCase):
         self.assertEqual(b, 0)
         self.assertIsNone(note)
 
+    def test_21b_a_request_with_pictures_shares_nothing(self):
+        """A request with pictures neither resumes from a slot nor stays in one (generate.cpp: the slot source needs
+        req_imgs empty; such a slot is no cache): the head it shares with a slot is lost too (review 2026-11-25, P2)."""
+        held = [held_of(prompt(5000, 1, 2, seed=11)),           # the head the new prompt shares, newer
+                held_of(prompt(2000, 3, 4, seed=12))]           # an unrelated, shorter head, older
+        used = [2.0, 1.0]
+        p = prompt(5000, 8, 9, seed=11)                          # the same system prompt, another conversation
+        b, _ = self.pick(kh_on(2), p, held, used)
+        self.assertEqual(b, 0)                                   # text: slot 0's root is copied back in
+        b, note = kh_on(2).pick(p, [0, 1], held, self.base_for(held, used), images=True)
+        self.assertEqual(b, 1)                                   # pictures: slot 0 would lose 5000+, slot 1 2000+
+        self.assertIsNone(note)                                  # (the old order picks slot 1 too)
+        held[1] = held_of(prompt(7000, 3, 4, seed=12))
+        b, note = kh_on(2).pick(p, [0, 1], held, self.base_for(held, used), images=True)
+        self.assertEqual(b, 0)
+        self.assertIn("instead of slot 1", note)
+        e = self.engine(2, 1, kh_on(2), pad_rows=False)
+        e.slot_held, e.slot_used = [list(h) for h in held], [2.0, 1.0]
+        e.slot_held[1] = held_of(prompt(2000, 3, 4, seed=12))
+        with mock.patch("builtins.print"):
+            self.assertEqual(e.pick_slot(p), 0)
+            self.assertEqual(e.pick_slot(p, images=True), 1)
+
     def test_22_below_min_the_old_order_stays(self):
         held = [held_of(prompt(300, 1, 2, seed=11)), held_of(prompt(300, 3, 4, seed=12)), [], held_of(prompt(300, 5, 6, seed=13))]
         for used in ([0.0, 1.0, 2.0, 3.0], [3.0, 2.0, 1.0, 0.0], [2.0, 0.0, 3.0, 1.0]):
@@ -377,8 +400,9 @@ class Pick(unittest.TestCase):
         self.assertIsNone(note)
 
     @staticmethod
-    def engine(batch, groups, with_kh, pad_rows=True):
+    def engine(batch, groups, with_kh, pad_rows=True, info=INFO):
         e = object.__new__(StrataEngine)            # pick_slot reads only the slot tables (as test_slot_alloc)
+        e.info = dict(info)                         # (and INFO slot_cache, for KeepHeads.applies)
         gs = batch // groups
         e.batch = batch
         e.slot_order = [g * gs + t for t in range(gs) for g in range(groups)]
@@ -446,6 +470,21 @@ class Pick(unittest.TestCase):
         e_old = self.engine(4, 1, None)
         e_old.slot_held, e_old.slot_used = e.slot_held, e.slot_used
         self.assertEqual(e_old.pick_slot(prompt(5000, 8, 9, seed=20)), 0)
+
+    def test_24c_on_but_not_usable_it_is_the_old_pick_slot(self):
+        """pick_slot uses the rule only where decide() does (KeepHeads.usable): INFO slot_cache=0 or missing, a
+        conversation cache, STRATA_PARALLEL_SOLO=0, STRATA_SLOT_CKPT_MOVE=1 (review 2026-11-25, P3)."""
+        held = [held_of(prompt(5000, 1, 2, seed=11)), held_of(prompt(100, 1, 2, seed=12)),
+                held_of(prompt(5000, 3, 4, seed=13)), held_of(prompt(5000, 5, 6, seed=14))]
+        cases = [(kh_on(), {"slot_cache": 0}), (kh_on(), {}),
+                 (kh_on(), {"slot_cache": 1, "conversation_cache_mib": 512, "conversation_cache_slots": 4}),
+                 (kh_on(STRATA_PARALLEL_SOLO="0"), INFO), (kh_on(STRATA_SLOT_CKPT_MOVE="1"), INFO)]
+        for kh, info in cases:
+            e = self.engine(4, 1, kh, pad_rows=False, info=info)
+            e.slot_held, e.slot_used = [list(h) for h in held], [1.0, 2.0, 3.0, 4.0]
+            with mock.patch("builtins.print") as said:
+                self.assertEqual(e.pick_slot(prompt(5000, 8, 9, seed=20)), 0, info)
+            said.assert_not_called()
 
     def test_25_speed(self):
         n = 260_000
@@ -539,12 +578,9 @@ class ServerPath(FakeEngineCase):
         self.assertEqual(self.engine.slot_held[slot], [])         # the fake engine reused 0: the record is forgotten
         self.assertEqual(self.engine.keep_heads.metas[slot], SlotMeta())
 
-    @unittest.expectedFailure
-    def test_28b_known_gap_an_answer_that_ends_at_its_stop_token_never_reaches_check_reuse(self):
-        """server.py generate_batched: Service stops reading at the stop token, which closes the generator at its
-        `yield t` inside the solo leg's loop, so the check_reuse call after the loop does not run for an answer that
-        ends normally (it runs when the answer is cut at max_tokens, test 28).  Move the call to where the DONE is
-        known (the `finally`, after the drain) and this test starts to pass: remove the decorator then."""
+    def test_28b_an_answer_that_ends_at_its_stop_token_also_reaches_check_reuse(self):
+        """Service stops reading at the stop token, which closes the generator at its `yield t` inside the solo leg's
+        loop: the check runs in the `finally` too, after the drained DONE (review 2026-11-25, P2)."""
         self.start_kh()
         self.ask(self.SYSTEM + "S1 ", "LONGREPLY please")
         self.wait_idle()
@@ -552,6 +588,41 @@ class ServerPath(FakeEngineCase):
         self.ask(self.SYSTEM + "S1 ", "another question, LONGREPLY")
         self.wait_idle()
         self.assertEqual(self.engine.slot_held[slot], [])
+        self.assertEqual(self.engine.keep_heads.metas[slot], SlotMeta())
+
+    def test_28c_on_an_admission_whose_first_token_is_the_stop_token_keeps_the_record(self):
+        """A BGEN whose first token is the stop token: Service closes the generator before the BADM is read (the
+        `finally` drains it).  `BADM <slot> 0`: the engine left the slot as it was, so does the record (review
+        2026-11-25, P2)."""
+        import threading
+        self.start_kh()
+        self.ask(self.SYSTEM + "S1 ", "LONGREPLY please")
+        self.wait_idle()
+        slot = int(self.commands()[0].split()[1])
+        before = list(self.engine.slot_held[slot])
+        meta = self.engine.keep_heads.metas[slot]
+        self.assertTrue(before)
+        n = len(self.commands())
+        for b in range(4):                                       # only `slot` is free: not alone, a plain BGEN
+            self.engine.slot_busy[b] = b != slot
+        try:
+            ids = list(b"a prompt whose answer is already here: ok, done.")   # the fake's reply: only its stop token
+            g = self.engine.generate(ids, 64, {}, threading.Event())
+            got = []
+            for t in g:                                          # as Service: it stops reading at the stop token
+                if t is None:
+                    continue
+                got.append(t)
+                if t in self.svc.stop_ids:
+                    g.close()
+                    break
+        finally:
+            for b in range(4):
+                self.engine.slot_busy[b] = False
+        self.assertEqual(len(got), 1)
+        self.assertEqual([c.split()[:2] for c in self.commands()[n:]], [["BGEN", str(slot)]])
+        self.assertEqual(self.engine.slot_held[slot], before)
+        self.assertEqual(self.engine.keep_heads.metas[slot], meta)
 
     def test_29_on_max_tokens_1_does_not_forget_a_held_head(self):
         self.start_kh()

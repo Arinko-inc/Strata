@@ -153,16 +153,18 @@ def value_of(held, meta: SlotMeta, turn_id: int, root_min: int = ROOT_MIN) -> in
     return max(root, last if meta.ckpt else 0, meta.pin if meta.ckpt else 0)
 
 
-def loss_of(b: int, prompt, slot_held, metas, turn_id: int, root_min: int = ROOT_MIN) -> int:
+def loss_of(b: int, prompt, slot_held, metas, turn_id: int, root_min: int = ROOT_MIN, images: bool = False) -> int:
     """The tokens of head an admission of `prompt` into slot b would lose for good: value_of(slot b) minus the most
     of it that survives - what the new prompt shares with it (served_by(prompt, slot b): the admission copies those
     checkpoints back in) or what another slot c != b serves of slot b's stream (served_by(slot_held[b], slot c)).
-    Never below 0."""
+    `images`: the new prompt has pictures - the engine neither copies a slot's checkpoints into such a read
+    (generate.cpp ~16647: a slot source needs req_imgs empty) nor keeps the slot as a cache after it, so what it
+    shares with slot b does not survive.  Never below 0."""
     held = slot_held[b]
     value = value_of(held, metas[b], turn_id, root_min)
     if value <= 0:
         return 0
-    survives = served_by(prompt, held, metas[b], turn_id, root_min)
+    survives = 0 if images else served_by(prompt, held, metas[b], turn_id, root_min)
     for c in range(len(slot_held)):
         if c != b and survives < value:
             survives = max(survives, served_by(held, slot_held[c], metas[c], turn_id, root_min))
@@ -195,6 +197,10 @@ class KeepHeads:
             return False
         mib, slots = info.get("conversation_cache_mib"), info.get("conversation_cache_slots")
         return not (isinstance(mib, int) and mib > 0 and slots != 0)
+
+    def applies(self, info: dict, slot_gs: int) -> bool:
+        """enabled and usable(): pick_slot uses pick() only then, as decide() acts only then."""
+        return self.enabled and self.usable(info, slot_gs)
 
     def meta(self, b: int) -> SlotMeta:
         """The record of slot b (a default one for a slot this object does not know)."""
@@ -250,14 +256,30 @@ class KeepHeads:
             return None
         return list(prev_held or [])
 
-    def pick(self, prompt, free: list[int], slot_held, base_key) -> tuple[int, str | None]:
+    def after_drained_badm(self, slot: int, line, prev_held, sampling: dict, embeddings, asked: bool, finish):
+        """An admission whose consumer left before its BADM was read (an answer that ended at its first token):
+        generate_batched's `finally` drained the control lines up to `line`.  The same as the normal path does after
+        BADM: `BADM <slot> 1` -> note_admitted, `BADM <slot> 0` -> held_after_admission.  The drain does not see a
+        YIELDED line, so `asked` (a BYIELD was sent for this read) counts as yielded; a DONE that said "nonfinite"
+        (`finish`, from the drained DONE) keeps the record empty.  Returns what slot_held should be (None: leave it)."""
+        f = line.split() if isinstance(line, str) else []
+        if f[:1] != ["BADM"] or len(f) < 3:
+            return None                                  # an ERR, or the engine ended: nothing is known
+        if f[2] == "1":
+            self.note_admitted(slot, sampling, embeddings)
+            return None
+        if finish == "nonfinite":
+            return None
+        return self.held_after_admission(prev_held, False, bool(asked), f[3:4] == ["failed"], False)
+
+    def pick(self, prompt, free: list[int], slot_held, base_key, images: bool = False) -> tuple[int, str | None]:
         """The free slot for an admission of `prompt` (pick_slot's last step, `free` in pick_slot's order) and a log
         line when this rule changed the pick (None: the same slot as base_key alone).  Order: slots whose loss_of()
         is below min_tokens first, by base_key (pick_slot's own order: the less busy group, empty, least recently
-        used); then the others by their loss, then base_key."""
+        used); then the others by their loss, then base_key.  `images`: the prompt has pictures (loss_of)."""
         held = [h if isinstance(h, list) else list(h) for h in slot_held]
         metas = [self.meta(b) for b in range(len(held))]
-        loss = {b: loss_of(b, prompt, held, metas, self.turn_id, self.root_min) for b in free}
+        loss = {b: loss_of(b, prompt, held, metas, self.turn_id, self.root_min, images) for b in free}
 
         def key(b):
             return (0, base_key(b)) if loss[b] < self.min_tokens else (1, loss[b], base_key(b))

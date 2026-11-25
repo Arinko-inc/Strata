@@ -1902,6 +1902,16 @@ class StrataEngine:
         admit_wait, admit_since, admit_said = False, 0.0, False   # #1603: waiting for a slot, since when, said
         kh = getattr(self, "keep_heads", None)          # Arinko-inc: serve/keep_heads.py (STRATA_KEEP_HEADS=1)
         kh = kh if kh is not None and kh.enabled else None
+        kept, prev_held, asked = None, None, False
+
+        def check_kept():   # keep heads: after the solo leg's DONE, a slot that served less than it was thought to hold
+            nonlocal kept
+            k, kept = kept, None
+            if k is not None and k.slot is not None:
+                gone = kh.check_reuse(k, (self.last or {}).get("reused") if isinstance(self.last, dict) else None)
+                if gone is not None:
+                    kh.say(f"slot {gone} gave less than the {k.served} tokens it was thought to hold; forgotten")
+                    self.slot_held[gone] = []
         try:
             while True:   # a request in a slot that is left alone goes back to the solo path
                 if not holding:
@@ -1963,11 +1973,8 @@ class StrataEngine:
                         yield t
                     if self._done_finish() == "nonfinite":    # #879 (never promoted to a slot)
                         raise EngineNonFinite("the engine's logits became non-finite (#879)")
-                    if kept is not None and kept.slot is not None:   # keep heads: the slot did not serve what it held
-                        gone = kh.check_reuse(kept, (self.last or {}).get("reused") if isinstance(self.last, dict) else None)
-                        if gone is not None:
-                            kh.say(f"slot {gone} gave less than the {kept.served} tokens it was thought to hold; forgotten")
-                            self.slot_held[gone] = []
+                    if kh is not None:
+                        check_kept()                        # (a consumer that left at the stop token: the `finally`)
                     if self._yielded is not None and reserved is not None and self._yielded[0] == reserved:
                         slot, reserved = reserved, None     # gave way: the read goes on in that slot (below)
                     elif reserved is not None:              # it did not give way: the slot is free again
@@ -1998,7 +2005,7 @@ class StrataEngine:
                             if deadline is not None and time.monotonic() >= deadline:
                                 raise QueueWaitExpired("the inference queue wait deadline expired; retry later")
                             with self.slot_cv:
-                                slot = self.pick_slot(prompt)
+                                slot = self.pick_slot(prompt, images=bool(embeddings))
                                 if slot is not None:
                                     self.slot_busy[slot] = True
                                     self.slot_claims.add(slot)
@@ -2234,11 +2241,18 @@ class StrataEngine:
                     phase = "none"                      # #1059: it ended on the engine's ERR: no DONE to wait 300 s for
                 if phase == "solo":
                     self._send("STOP")
-                    self._drain_control("DONE", born=born)
+                    line = self._drain_control("DONE", born=born)
+                    if kh is not None and line and line.startswith("DONE"):
+                        check_kept()                        # keep heads: this leg's DONE is in self.last now
                 elif phase == "admit":
                     line = self._drain_control("BADM", born=born)
                     if line and line.startswith("BADM ") and line.split()[2:3] == ["1"]:
                         phase = "slot"
+                    if kh is not None and slot is not None:   # keep heads: as after BADM on the normal path
+                        again = kh.after_drained_badm(slot, line, prev_held, sampling or {}, embeddings, asked,
+                                                      (self.last or {}).get("finish") if isinstance(self.last, dict) else None)
+                        if again is not None:
+                            self.slot_held[slot] = again
             except EngineDied:
                 pass
             bdone_in = False
@@ -2286,7 +2300,7 @@ class StrataEngine:
     SLOT_PREFIX_MIN = 512   # a held prefix shorter than this is not worth unbalancing the pipeline's groups
     TURN_ID = 248045        # <|im_start|>: the engine's default --turn-token (its turn checkpoint sits at the last one)
 
-    def pick_slot(self, prompt: list[int]) -> int | None:
+    def pick_slot(self, prompt: list[int], images: bool = False) -> int | None:
         """A free slot for `prompt` (the caller holds slot_cv): the one whose held tokens are the longest start of the
         prompt (the engine then reads only the rest), else an empty one, else the one used longest ago - so the
         conversations other slots hold stay for their next turns.  None: every slot is busy."""
@@ -2332,8 +2346,8 @@ class StrataEngine:
             return (busy_in.get(self.slot_group[b], 0) if self.slot_groups > 1 else 0,
                     bool(self.slot_held[b]), self.slot_used[b])
         kh = getattr(self, "keep_heads", None)          # Arinko-inc: a slot holding a long head nobody else keeps goes last
-        if kh is not None and kh.enabled:
-            b, note = kh.pick(prompt, free, self.slot_held, base)
+        if kh is not None and kh.applies(getattr(self, "info", None) or {}, gs):
+            b, note = kh.pick(prompt, free, self.slot_held, base, images=images)
             if note:
                 kh.say(note)
             return b
