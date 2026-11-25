@@ -2,8 +2,9 @@
 // stage_deferred.hpp), header-only, no GPU.  strata-mesh IMPL-PLAN-2026-11-26-batch-drafts.md 3.4.
 //
 // The flag's reading and the bound (the skeleton's), and the table's tests (担当 F):
-// add (S bounds, slots in range, a slot's rows contiguous, windows on overlapping slots refused, a tag held twice
-// refused, save_base = rows[0] * rows_per_region), take (by tag in any order, an unknown tag, a window taken twice),
+// add (S bounds, slots in range, a slot's rows contiguous and at most rows_per_region, windows on overlapping slots
+// refused, a tag held twice refused, save_base = rows[0] * rows_per_region, saved rows past the end or over a held
+// window's refused), STRATA_WK_PIPED_MTP_ROWS's reading (合流 D), take (by tag in any order, an unknown tag, a window taken twice),
 // slot_held / empty / size, reset, and keep_ok (1..rows on the window's slots, 0 elsewhere, keep_by_slot padded).
 #include "strata/net/stage_deferred.hpp"
 
@@ -48,8 +49,9 @@ int main() {
     {
         sn::DeferredWindow w = win(1, {});
         check(!d.add(w, e) && !e.empty() && d.empty(), "add: 0 rows refused");
-        w = win(1, {0, 0, 0, 0, 1});
-        check(!d.add(w, e) && d.empty(), "add: more rows than a region holds refused (5 of 4)");
+        w = win(1, {0, 0, 0, 0, 0});
+        check(!d.add(w, e) && d.empty() && e.find("more than 4 rows") != std::string::npos,
+              "add: a slot with more rows than its region refused (5 of 4)");
         w = win(1, {4});
         check(!d.add(w, e) && d.empty(), "add: a slot outside the link's slots refused");
         w = win(1, {-1});
@@ -87,6 +89,41 @@ int main() {
         check(d.add(y2, e) && y2.save_base == 12, "add: save_base = rows[0] * rows_per_region (3 * 4)");
         d.reset(4, 4);
         check(d.add(a, e) && d.add(b, e), "the two windows again");
+    }
+    // STRATA_WK_PIPED_MTP_ROWS (合流 D): the saved rows of one slot, default 2, clamped to the window's rows
+    check(sn::kDeferredSlotRowsDefault == 2 && sn::wk_piped_mtp_rows(nullptr, 6) == 2 && sn::wk_piped_mtp_rows("", 6) == 2 &&
+              sn::wk_piped_mtp_rows("x", 6) == 2 && sn::wk_piped_mtp_rows("3x", 6) == 2,
+          "STRATA_WK_PIPED_MTP_ROWS: unset, empty or not a number: 2");
+    check(sn::wk_piped_mtp_rows("4", 6) == 4 && sn::wk_piped_mtp_rows("9", 6) == 6 && sn::wk_piped_mtp_rows("9", 12) == 8 &&
+              sn::wk_piped_mtp_rows("0", 6) == 1 && sn::wk_piped_mtp_rows("-3", 6) == 1 && sn::wk_piped_mtp_rows("3", 2) == 2,
+          "STRATA_WK_PIPED_MTP_ROWS: clamped to 1..min(the window's rows, 8)");
+    {   // regions of 2 rows (the default): the main process's 2 groups x 2 slots x (a token + one draft)
+        sn::DeferredWindows r2;
+        r2.reset(4, 2);
+        sn::DeferredWindow g0 = win(21, {0, 0, 1, 1}), g1 = win(22, {2, 2, 3, 3});
+        check(r2.add(g0, e) && g0.save_base == 0 && r2.add(g1, e) && g1.save_base == 4 && r2.size() == 2,
+              "rows 2: two groups of 2 slots x 2 rows held, saved rows [0,4) and [4,8)");
+        sn::DeferredWindow o;
+        check(r2.take(21, o, e), "rows 2: the first group committed");
+        sn::DeferredWindow g0b = win(23, {1, 1});
+        check(r2.add(g0b, e) && g0b.save_base == 2, "rows 2: the group with only its second slot live, save_base 2");
+        check(r2.take(23, o, e) && r2.take(22, o, e) && r2.empty(), "rows 2: none held");
+        sn::DeferredWindow three = win(24, {0, 0, 0});
+        e.clear();
+        check(!r2.add(three, e) && r2.empty() && e.find("STRATA_WK_PIPED_MTP_ROWS") != std::string::npos,
+              "rows 2: a slot with 3 rows refused (a token + 2 drafts)");
+        sn::DeferredWindow one = win(25, {1});
+        check(r2.add(one, e) && one.save_base == 2, "rows 2: a window on slot 1 alone held");
+        sn::DeferredWindow gap = win(26, {0, 0, 2, 2});
+        e.clear();
+        check(!r2.add(gap, e) && r2.size() == 1 && e.find("overlap") != std::string::npos,
+              "rows 2: slots 0 and 2 (saved rows [0,4)) over slot 1's held [2,3) refused");
+        check(r2.take(25, o, e) && r2.add(gap, e) && gap.save_base == 0, "rows 2: the same window with slot 1 free held");
+        check(r2.take(26, o, e), "rows 2: taken");
+        sn::DeferredWindow tail = win(27, {3, 3, 0});
+        e.clear();
+        check(!r2.add(tail, e) && r2.empty() && e.find("past the last") != std::string::npos,
+              "rows 2: saved rows from slot 3's region past the end (6 + 3 > 8) refused");
     }
     // take: by tag, any order
     {

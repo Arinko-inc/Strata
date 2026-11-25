@@ -4,8 +4,11 @@
 // save graph queued on cs_ behind the window.  The commit is upstream's batch_commit_rows (verify.cpp).
 //
 // The graphs' keys: the window's is run_slot_rows' (rows, S, 0) - shared with the same rows' kStageSlotKeepAll window;
-// the save and the deferred commit are (rows, S, save_base).  A worker's save_base is its first row's slot * max_t, so
-// a layout has one of each.
+// the save and the deferred commit are (rows, S, save_base).  A worker's save_base is its first row's slot * its saved
+// rows per slot (STRATA_WK_PIPED_MTP_ROWS), so a layout has one of each.  The keys also hold the doorbell variant
+// (#871: ar_off_), which refresh_ar may flip between a window and its commit (a prompt loan beside the windows); the
+// save and the commit read no doorbell, so batch_commit_rows takes the other variant's commit graph when the current
+// one has none (合流 D: in place of capturing both variants here, which doubled the graphs on the relay's VRAM).
 #include "strata/core/verify.hpp"
 
 #include "strata/core/on_device.hpp"
@@ -31,16 +34,6 @@ bool Verifier::run_slot_rows_deferred(const int* rows, int S, int save_base, con
     // (the window is done and its rows are in the hand-off: cs_ is idle, and the scratch the save reads stays as it
     // is until this stage's next window, which the stream orders behind the save)
     if (!ran || !capture_deferred(rows, S, save_base, err)) return false;
-    // bkey holds the doorbell variant (#871: ar_off_), which refresh_ar may flip between this window and its commit
-    // (a prompt loan beside the windows) - batch_commit_rows would then look its commit graph up under the other key
-    // and find none.  The save and the commit read no doorbell, so on a stage that can flip (all_resident_) both
-    // variants' keys get their graphs now.
-    if (all_resident_) {
-        ar_off_ = !ar_off_;
-        const bool both = capture_deferred(rows, S, save_base, err);
-        ar_off_ = !ar_off_;
-        if (!both) return false;
-    }
     const auto it = save_bm_.find(bkey(rows, S, save_base));
     if (it == save_bm_.end() || it->second == nullptr) { err = "verify: a deferred window without its save graph"; return false; }
     const cudaError_t le = cudaGraphLaunch(it->second, cs_);

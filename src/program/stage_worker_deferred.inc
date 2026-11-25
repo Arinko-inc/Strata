@@ -14,6 +14,8 @@
 // handler stays the B block's and the worker runs as before.  With both it allocates the saved rows of this worker's
 // layers (Verifier::init_deferred_commit, n_slots * max_t rows), wraps hs.hello / hs.disconnected / hs.slot_run /
 // hs.slot_commit / hs.slot_save / hs.slot_load / hs.reset / hs.prefill and sets hs.slot_commit_deferred.
+// The saved rows are n_slots * STRATA_WK_PIPED_MTP_ROWS (default 2: a slot's token and one draft; 合流 D, for the
+// relay's VRAM): a deferred window with more rows on one slot is refused (an error for that window; the link goes on).
 //
 // Which held window a deferred SlotCommit commits: hs.slot_run is not given the SlotRun's tag (StageHandlers' signature
 // has no tag), so this worker cannot match the commit's tag against the window's.  It finds the window from keep[]
@@ -23,6 +25,8 @@
 // own tag (wk_next_tag) and names that tag in the commit it sends on, as the protocol says.
 static_assert(strata::net::kDeferredMaxRows == strata::kernels::kVerifyMaxT, "a deferred window's rows: kVerifyMaxT");
 const bool wk_dfr_asked = strata::net::wk_piped_mtp_on(std::getenv("STRATA_WK_PIPED_MTP"));
+// the saved rows of one slot (the most rows one slot may have in a deferred window)
+const int wk_dfr_slot_rows = strata::net::wk_piped_mtp_rows(std::getenv("STRATA_WK_PIPED_MTP_ROWS"), ver.max_t());
 strata::net::DeferredWindows wk_dfr;   // per connection: the windows held uncommitted
 bool wk_dfr_on = false;                // the saved rows are allocated: this worker can keep deferred windows
 bool wk_dfr_link = false;              // this link's hello said kStageBatchDeferred
@@ -41,7 +45,7 @@ if (wk_dfr_asked && o.batch > 0) {
         size_t dfr_free0 = 0, dfr_free1 = 0, dfr_total = 0;
         (void) cudaMemGetInfo(&dfr_free0, &dfr_total);
         std::string de;
-        if (!ver.init_deferred_commit(ver.n_slots() * ver.max_t(), de)) {
+        if (!ver.init_deferred_commit(ver.n_slots() * wk_dfr_slot_rows, de)) {
             (void) cudaGetLastError();
             std::fprintf(stderr, "strata serve: stage worker: STRATA_WK_PIPED_MTP is off: %s (VRAM free %.1f MiB)\n",
                          de.c_str(), (double) dfr_free0 / 1048576.0);
@@ -50,8 +54,8 @@ if (wk_dfr_asked && o.batch > 0) {
             wk_dfr_on = true;
             (void) cudaMemGetInfo(&dfr_free1, &dfr_total);
             std::fprintf(stderr, "strata serve: stage worker: STRATA_WK_PIPED_MTP=1: deferred batch windows (%d slots x "
-                                 "%d rows of saved rows, %.1f MiB of VRAM: free %.1f -> %.1f MiB; up to 64 window "
-                                 "layouts keep their graphs)\n", ver.n_slots(), ver.max_t(),
+                                 "%d rows of saved rows (STRATA_WK_PIPED_MTP_ROWS), %.1f MiB of VRAM: free %.1f -> %.1f "
+                                 "MiB; up to 64 window layouts keep their graphs)\n", ver.n_slots(), wk_dfr_slot_rows,
                          (double) (dfr_free0 > dfr_free1 ? dfr_free0 - dfr_free1 : 0) / 1048576.0,
                          (double) dfr_free0 / 1048576.0, (double) dfr_free1 / 1048576.0);
         }
@@ -85,7 +89,7 @@ if (wk_dfr_on) {
         wk_dfr_link = wk_slot_n > 0 && wk_slot_n <= ver.n_slots() && next_has;
         if (wk_dfr_link) {
             mine.batch_flags |= strata::net::kStageBatchDeferred;
-            wk_dfr.reset(wk_slot_n, ver.max_t());
+            wk_dfr.reset(wk_slot_n, wk_dfr_slot_rows);
         }
         std::fprintf(stderr, "strata stage worker: deferred batch windows: %s\n",
                      wk_dfr_link ? "this link takes them (kStageBatchDeferred)"
