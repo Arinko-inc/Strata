@@ -371,6 +371,10 @@ if(STRATA_BUILD_TESTS)
   target_include_directories(waitb_split_test PRIVATE include)
   add_test(NAME waitb_split_test COMMAND waitb_split_test)
 
+  add_executable(waitb_overlap_test tests/core/waitb_overlap_test.cpp)
+  target_include_directories(waitb_overlap_test PRIVATE include)
+  add_test(NAME waitb_overlap_test COMMAND waitb_overlap_test)
+
   # the default CPU prefill share is not armed when every expert is resident (#1595): header-only rule, no GPU
   add_executable(share_rules_test tests/prefill/share_rules_test.cpp)
   target_include_directories(share_rules_test PRIVATE include)

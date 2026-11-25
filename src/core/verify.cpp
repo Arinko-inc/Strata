@@ -754,6 +754,8 @@ Verifier::~Verifier() {
     if (cs_) cudaStreamSynchronize(cs_);
     if (sh_cs_) cudaStreamSynchronize(sh_cs_);
     if (wbs_dev_ != nullptr) cudaFree(wbs_dev_);
+    if (wbo_cs_) cudaStreamSynchronize(wbo_cs_);
+    if (wbo_dev_ != nullptr) cudaFree(wbo_dev_);
     for (auto& row : exec_)
         for (auto& e : row)
             if (e) cudaGraphExecDestroy(e);
@@ -781,6 +783,9 @@ Verifier::~Verifier() {
     if (logit_bias_device_) cudaFree(logit_bias_device_);
     if (cs_ && cs_ != ext_stream_) cudaStreamDestroy(cs_);   // set_stream: the stage's stream, shared, not ours
     if (sh_cs_) cudaStreamDestroy(sh_cs_);
+    if (wbo_cs_) cudaStreamDestroy(wbo_cs_);
+    for (cudaEvent_t e : {wbo_fork_[0], wbo_fork_[1], wbo_join_[0], wbo_join_[1]})
+        if (e) cudaEventDestroy(e);
     if (copy_) { cudaStreamSynchronize(copy_); cudaStreamDestroy(copy_); }
     if (side_) cudaStreamDestroy(side_);
     if (side2_) cudaStreamDestroy(side2_);
@@ -1206,6 +1211,38 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         cudaEventCreateWithFlags(&ev_join_, cudaEventDisableTiming) != cudaSuccess) {
         err = "verify: event create failed";
         return false;
+    }
+    // STRATA_WAITB_OVERLAP=1 (opt-in, CUDA only; waitb_overlap.hpp): a stream for the PCIe share's flag-B wait and copy
+    // beside the VRAM experts.  Whether a window uses it is decided at its capture (set_pcie_mode comes after init).
+    if (strata::core::waitb_overlap::on(std::getenv("STRATA_WAITB_OVERLAP")) && wbo_cs_ == nullptr) {
+#if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906) && !defined(STRATA_GPU_METAL)
+        wbo_on_ = make_stream(&wbo_cs_, gp_mid) == cudaSuccess;
+        if (!wbo_on_) wbo_cs_ = nullptr;
+        for (cudaEvent_t* e : {&wbo_fork_[0], &wbo_fork_[1], &wbo_join_[0], &wbo_join_[1]})
+            if (wbo_on_ && cudaEventCreateWithFlags(e, cudaEventDisableTiming) != cudaSuccess) { *e = nullptr; wbo_on_ = false; }
+        if (!wbo_on_) {
+            cudaGetLastError();
+            std::fprintf(stderr, "strata verify: STRATA_WAITB_OVERLAP is off: %s\n",
+                         strata::core::waitb_overlap::off_reason({true, true, false, 2, false, false}));
+        } else {
+            std::fprintf(stderr, "strata verify: STRATA_WAITB_OVERLAP: the PCIe share's copy on its own stream beside the VRAM experts\n");
+            if (wbs_dev_ != nullptr && wbo_dev_ == nullptr) {   // STRATA_WAITB_SPLIT: what is left of the wait
+                const size_t nl = (size_t) g.n_layers;
+                if (cudaMalloc((void**) &wbo_dev_, nl * 2 * 8) == cudaSuccess) {
+                    cudaMemset(wbo_dev_, 0, nl * 2 * 8);
+                    wbo_h_.assign(nl * 2, 0);
+                    std::fprintf(stderr, "strata verify: STRATA_WAITB_SPLIT under STRATA_WAITB_OVERLAP: stamps on the copy's stream "
+                                         "(the GPU profile's line ends with \"waitB overlap\")\n");
+                } else {
+                    wbo_dev_ = nullptr;
+                    cudaGetLastError();
+                }
+            }
+        }
+#else
+        std::fprintf(stderr, "strata verify: STRATA_WAITB_OVERLAP is off: %s\n",
+                     strata::core::waitb_overlap::off_reason({true, false, false, 2, false, false}));
+#endif
     }
     {   // STRATA_DF_BRANCH=1 (opt-in): the mixer's side branches.  Off by default: on Linux (open modules, GSP) a
         // stage's window with the branches stopped inside its graph when an NVML query (nvidia-smi) came between
@@ -2285,6 +2322,16 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     }();
     const bool fuse_head_gr = fuse_head_gr_env && (le_ == g.n_layers) && lb_ < le_ && !no_head_ &&
                               (head_ != nullptr && head_->loaded()) && !cvec().covers(g.n_layers - 1);
+    // STRATA_WAITB_OVERLAP: this window's layers stage the PCIe share beside the VRAM experts (waitb_overlap.hpp)
+    bool wbo = false;
+    if (wbo_on_) {
+        const char* why = strata::core::waitb_overlap::off_reason(
+            {true, true, wbo_cs_ != nullptr, sink_.pcie_mode, device_plan_, m_bal_ != nullptr});
+        wbo = why == nullptr;
+        if (!wbo && !wbo_noted_) std::fprintf(stderr, "strata verify: STRATA_WAITB_OVERLAP is off: %s\n", why);
+        wbo_noted_ = true;
+        wbo_live_ = wbo;
+    }
     auto post = [&](int64_t l, int grp) -> bool {
         const int tb = tb_[grp], te = te_[grp], n = te - tb;
         const uint32_t ring = (uint32_t) ((l - lb_) * G + grp + 1);
@@ -2347,6 +2394,38 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 }
             }
             stamp(l, 19, grp);
+            if (wbo) {
+                // STRATA_WAITB_OVERLAP: the flag-B wait and the copy on wbo_cs_, beside the VRAM experts.  The plan is
+                // on the device (the copy above, on cs before the fork).  The branch reads the plan's PCIe half
+                // (counts[2], p_ptr2, p_dst2) and writes this group's half of staging and p_ptr2; the VRAM experts
+                // read the VRAM half (counts[0..1], p_ptr, p_start, p_dst, p_tok) and write hit_scratch_ / hit_out.
+                // cs joins before the PCIe groups, which read staging and p_ptr2; the next plan copy and the next
+                // fork are on cs after that.
+                const int64_t per = G == 2 ? kStagingBlobs / 2 : kStagingBlobs;
+                uint8_t* stage = staging_ + (size_t) (grp * per) * lay.max_blob;
+                const unsigned long long* p_dst2 = (const unsigned long long*) (pl + dst2_off_);   // STRATA_ADAPT_FETCH
+                const bool wst = wbo_dev_ != nullptr && grp == 0;   // STRATA_WAITB_SPLIT: the branch's two stamps
+                if (cudaEventRecord(wbo_fork_[grp], cs) != cudaSuccess ||
+                    cudaStreamWaitEvent(wbo_cs_, wbo_fork_[grp], 0) != cudaSuccess) {
+                    err = "verify: the PCIe copy's branch could not fork (STRATA_WAITB_OVERLAP)";
+                    return false;
+                }
+                wait_flag_ge(m_flagB_, ring, wbo_cs_);             // the PCIe share is mapped
+                if (wst) gpu_stamp(wbo_dev_, (int) l * 2, wbo_cs_);
+                fetch_blobs(p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), (int) per, wbo_cs_, p_dst2);
+                rebase_ptrs((unsigned long long*) p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), wbo_cs_, p_dst2);
+                if (wst) gpu_stamp(wbo_dev_, (int) l * 2 + 1, wbo_cs_);
+                if (cudaEventRecord(wbo_join_[grp], wbo_cs_) != cudaSuccess) {
+                    err = "verify: the PCIe copy's branch could not end (STRATA_WAITB_OVERLAP)";
+                    return false;
+                }
+                grouped(p_ptr, p_start, p_counts, 0, hit_out, true);   // the VRAM experts on cs, as before
+                stamp(l, 20, grp);
+                if (cudaStreamWaitEvent(cs, wbo_join_[grp], 0) != cudaSuccess) {
+                    err = "verify: the PCIe copy's branch could not join (STRATA_WAITB_OVERLAP)";
+                    return false;
+                }
+            } else {
             grouped(p_ptr, p_start, p_counts, 0, hit_out, true);
             stamp(l, 20, grp);
             if (device_plan_) wait_flag_ge_or(m_flagB_, ring, skip_ + grp, cs);
@@ -2361,6 +2440,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 fetch_blobs(p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), (int) per, cs, p_dst2);
                 rebase_ptrs((unsigned long long*) p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), cs, p_dst2);
             }
+            }   // (!wbo)
             stamp(l, 21, grp);
             // the PCIe share is pcie_frac of the misses: a few groups when the cache is cold, usually none (always none at
             // pcie_frac 0), so its launch is kPcieGroupRows block rows striding over the groups, not cap of them
@@ -2654,6 +2734,8 @@ std::string Verifier::profile_report() {
     out += b;
     out += wbs_.report();   // STRATA_WAITB_SPLIT: empty unless the flag is on
     wbs_.reset();
+    out += wbo_.report();   // ... under STRATA_WAITB_OVERLAP: what is left of the wait
+    wbo_.reset();
     for (auto& r : prof_sum_) for (double& d : r) d = 0;
     prof_windows_ = 0;
     return out;
@@ -3001,8 +3083,27 @@ void Verifier::collect_profile() {
 // right after collect_profile() (prof_h_ is the same window's).
 void Verifier::collect_waitb_split() {
     if (wbs_dev_ == nullptr) return;
-    cudaMemcpy(wbs_h_.data(), wbs_dev_, wbs_h_.size() * 8, cudaMemcpyDeviceToHost);
     const auto& lay = strata::kernels::cpu::expert_layout();
+    if (wbo_live_ && wbo_dev_ != nullptr) {   // STRATA_WAITB_OVERLAP: the copy ran beside the VRAM experts
+        cudaMemcpy(wbo_h_.data(), wbo_dev_, wbo_h_.size() * 8, cudaMemcpyDeviceToHost);
+        for (int64_t l = lb_; l < le_; ++l) {
+            const unsigned long long* p = prof_h_.data() + (size_t) l * kProfPer;
+            strata::core::waitb_overlap::Layer x;
+            x.fork = p[19];
+            x.hits1 = p[20];
+            x.join = p[21];
+            x.pcie1 = p[22];
+            x.cpu1 = p[23];
+            x.flagb = wbo_h_[(size_t) l * 2];
+            x.copy1 = wbo_h_[(size_t) l * 2 + 1];
+            x.n_fetch = wbs_n_[(size_t) l];
+            x.blob_bytes = (uint64_t) lay.blob_bytes(l);
+            wbo_.add(x);
+        }
+        wbo_.end_window();
+        return;
+    }
+    cudaMemcpy(wbs_h_.data(), wbs_dev_, wbs_h_.size() * 8, cudaMemcpyDeviceToHost);
     for (int64_t l = lb_; l < le_; ++l) {
         const unsigned long long* p = prof_h_.data() + (size_t) l * kProfPer;
         strata::core::waitb_split::Layer x;

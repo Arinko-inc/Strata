@@ -27,6 +27,7 @@
 #include "strata/core/flag_order.hpp"
 #include "strata/core/layer.hpp"
 #include "strata/core/session.hpp"
+#include "strata/core/waitb_overlap.hpp"
 #include "strata/core/waitb_split.hpp"
 #include "strata/kernels/sampler.hpp"
 
@@ -657,6 +658,15 @@ private:
     std::vector<unsigned long long> wbs_h_;
     std::vector<int32_t> wbs_n_;
     strata::core::waitb_split::Sums wbs_;
+    // STRATA_WAITB_OVERLAP (waitb_overlap.hpp): the PCIe share's flag-B wait and copy on wbo_cs_, forked after the plan
+    // is on the device and joined before the PCIe groups (per token group).  wbo_live_: the last captured window took
+    // that path.  With STRATA_WAITB_SPLIT: 2 stamps per layer on wbo_cs_ (wbo_dev_) and their sums (wbo_)
+    bool wbo_on_ = false, wbo_live_ = false, wbo_noted_ = false;
+    cudaStream_t wbo_cs_ = nullptr;
+    cudaEvent_t wbo_fork_[2] = {}, wbo_join_[2] = {};
+    unsigned long long* wbo_dev_ = nullptr;
+    std::vector<unsigned long long> wbo_h_;
+    strata::core::waitb_overlap::Sums wbo_;
     double prof_sum_[2][kProfPer] = {};   // [GDN / QSA layers][stage]
     int64_t prof_windows_ = 0;
     double prof_t_sum_[9][2][kProfPer] = {};   // the same per window size T (1..8), for profile_by_t_report
