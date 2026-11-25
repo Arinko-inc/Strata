@@ -61,7 +61,7 @@ if (wk_dfr_on) {
             " deferred window(s) wait for their commit (the main process commits them first)";
     };
     auto hello_prev = hs.hello;
-    hs.hello = [&, hello_prev](const strata::net::StageHello& theirs, strata::net::StageHello& mine,
+    hs.hello = [&, hello_prev, dfr_forget](const strata::net::StageHello& theirs, strata::net::StageHello& mine,
                                std::string& e) -> bool {
         if (!hello_prev(theirs, mine, e)) return false;
         mine.batch_flags |= strata::net::kStageBatchDeferred;
@@ -69,12 +69,12 @@ if (wk_dfr_on) {
         return true;
     };
     auto disconnected_prev = hs.disconnected;
-    hs.disconnected = [&, disconnected_prev] {
+    hs.disconnected = [&, disconnected_prev, dfr_forget] {
         if (disconnected_prev) disconnected_prev();
         dfr_forget();
     };
     auto slot_run_prev = hs.slot_run;
-    hs.slot_run = [&, slot_run_prev](int S, const int32_t* slots, const int32_t* tokens, const int64_t* pos,
+    hs.slot_run = [&, slot_run_prev, dfr_held_error](int S, const int32_t* slots, const int32_t* tokens, const int64_t* pos,
                                      int64_t flags, std::string& e) -> bool {
         if ((flags & strata::net::kStageSlotDeferred) == 0) {
             if (!wk_dfr.empty()) {   // (the main process commits its deferred windows before any other window)
@@ -195,28 +195,28 @@ if (wk_dfr_on) {
     };
     // everything else that touches the slots' state or the window scratch is refused while a window is held
     auto slot_commit_prev = hs.slot_commit;
-    hs.slot_commit = [&, slot_commit_prev](const int32_t* keep, int n, std::string& e) -> bool {
+    hs.slot_commit = [&, slot_commit_prev, dfr_held_error](const int32_t* keep, int n, std::string& e) -> bool {
         if (!wk_dfr.empty()) { dfr_held_error("a slot commit (without kStageCommitDeferred)", e); return false; }
         return slot_commit_prev(keep, n, e);
     };
     auto slot_save_prev = hs.slot_save;
-    hs.slot_save = [&, slot_save_prev](int slot, int64_t L, std::string& e) -> bool {
+    hs.slot_save = [&, slot_save_prev, dfr_held_error](int slot, int64_t L, std::string& e) -> bool {
         if (!wk_dfr.empty()) { dfr_held_error("a slot save", e); return false; }
         return slot_save_prev(slot, L, e);
     };
     auto slot_load_prev = hs.slot_load;
-    hs.slot_load = [&, slot_load_prev](int slot, int64_t L, int64_t ckpt_id, std::string& e) -> bool {
+    hs.slot_load = [&, slot_load_prev, dfr_held_error](int slot, int64_t L, int64_t ckpt_id, std::string& e) -> bool {
         if (!wk_dfr.empty()) { dfr_held_error("a slot load", e); return false; }
         return slot_load_prev(slot, L, ckpt_id, e);
     };
     auto reset_prev = hs.reset;
-    hs.reset = [&, reset_prev](const std::vector<int64_t>& keep, std::string& e) -> bool {
+    hs.reset = [&, reset_prev, dfr_held_error](const std::vector<int64_t>& keep, std::string& e) -> bool {
         if (!wk_dfr.empty()) { dfr_held_error("a reset", e); return false; }
         return reset_prev(keep, e);
     };
     if (hs.prefill) {
         auto prefill_prev = hs.prefill;
-        hs.prefill = [&, prefill_prev](const int64_t* tokens, int64_t T, int64_t p0, int64_t flags, int64_t skip,
+        hs.prefill = [&, prefill_prev, dfr_held_error](const int64_t* tokens, int64_t T, int64_t p0, int64_t flags, int64_t skip,
                                        const float* rows_in, float* rows_out, std::string& e) -> bool {
             if (!wk_dfr.empty()) { dfr_held_error("a prompt chunk", e); return false; }
             return prefill_prev(tokens, T, p0, flags, skip, rows_in, rows_out, e);
