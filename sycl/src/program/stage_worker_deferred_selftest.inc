@@ -16,7 +16,7 @@
 // rewrites a slot completely), and nothing else: this process exits.  Run it only as a test: B70 is a production GPU.
 {
     std::string st_e;
-    const int st_ns = ver.n_slots(), st_mt = wk_max_s;
+    const int st_ns = ver.n_slots(), st_mt = wk_dfr_slot_rows;   // (the saved rows of one slot: wk_max_s in a self-test)
     if (st_ns < 4 || st_mt < 3) {
         std::fprintf(stderr, "strata stage worker: SELFTEST: needs 4 slots and windows of 3 rows (have %d and %d): "
                              "skipped\n", st_ns, st_mt);

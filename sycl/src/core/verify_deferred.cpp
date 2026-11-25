@@ -358,7 +358,15 @@ catch (sycl::exception const& exc) {
 bool Verifier::batch_commit_rows(const int* rows, int S, int hbase, const int* keep, const int32_t* tokens,
                                  const int64_t* pos, std::string& err) try {
     const OnDevice on_device(device_);
-    const auto it = dcommit_bm_.find(bkey(rows, S, hbase));
+    auto it = dcommit_bm_.find(bkey(rows, S, hbase));
+    if (it == dcommit_bm_.end() || it->second == nullptr) {
+        // 合流 D: the doorbell variant (#871: ar_off_, the key's last entry) flipped between the window and this commit
+        // (refresh_ar).  The commit reads no doorbell: the other variant's graph, captured with the window, is the
+        // same commit (the CUDA tree's batch_commit_rows does the same)
+        std::vector<int> other = bkey(rows, S, hbase);
+        other.back() = other.back() != 0 ? 0 : 1;
+        it = dcommit_bm_.find(other);
+    }
     if (it == dcommit_bm_.end() || it->second == nullptr) { err = "verify: a deferred commit without its window"; return false; }
     const int64_t CB = 2 + max_t_;
     // Each slot's accepted prefix.  The graph reads it from mapped memory when it runs; this slot's entry is written

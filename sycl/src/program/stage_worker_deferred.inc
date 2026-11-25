@@ -12,7 +12,9 @@
 //
 // Without STRATA_WK_PIPED_MTP=1 (or without --batch) this sets nothing: no allocation, no handler wrapped, no hello
 // bit - the worker runs as before.  With it: the saved rows (Verifier::init_deferred_commit: this stage's layers only,
-// wk_cap * wk_max_s rows), the batch graph limit, and the handlers below.
+// wk_cap * STRATA_WK_PIPED_MTP_ROWS rows, default 2 a slot: its token and one draft; 合流 D), the batch graph limit,
+// and the handlers below.  A deferred window with more rows on one slot is refused (an error for that window; the
+// link goes on).  STRATA_WK_PIPED_MTP_SELFTEST=1 saves wk_max_s rows a slot (its windows have 3 rows).
 //
 // A deferred window (SlotRun with kStageSlotDeferred) runs its layers now with no commit; right behind it the rows its
 // commit replays go to the saved rows of its first slot; its rows are answered at once.  The main process's
@@ -25,6 +27,10 @@
 // the commit keeps exactly that window's slots and no others.  The tag itself is not checked here.
 static_assert(strata::net::kDeferredMaxRows == strata::kernels::kVerifyMaxT, "a deferred window's rows: kVerifyMaxT");
 const bool wk_dfr_asked = strata::net::wk_piped_mtp_on(std::getenv("STRATA_WK_PIPED_MTP"));
+// the saved rows of one slot (the most rows one slot may have in a deferred window; the self-test's windows: wk_max_s)
+const int wk_dfr_slot_rows = strata::net::wk_piped_mtp_on(std::getenv("STRATA_WK_PIPED_MTP_SELFTEST"))
+    ? std::min(wk_max_s, (int) strata::net::kDeferredMaxRows)
+    : strata::net::wk_piped_mtp_rows(std::getenv("STRATA_WK_PIPED_MTP_ROWS"), wk_max_s);
 strata::net::DeferredWindows wk_dfr;        // the windows held uncommitted
 std::vector<int64_t> wk_dfr_of_slot;        // slot -> the count of the held window that has a row on it (0: none)
 int64_t wk_dfr_seq = 0;                     // this worker's own count of deferred windows
@@ -33,21 +39,21 @@ int64_t wk_dfr_windows = 0, wk_dfr_rows = 0;
 bool wk_dfr_on = false;
 if (wk_dfr_asked && o.batch > 0 && wk_cap > 0) {
     std::string de;
-    if (!ver.init_deferred_commit(wk_cap * wk_max_s, de)) {
+    if (!ver.init_deferred_commit(wk_cap * wk_dfr_slot_rows, de)) {
         std::fprintf(stderr, "strata serve: stage worker: STRATA_WK_PIPED_MTP: %s: off\n", de.c_str());
     } else {
         ver.set_batch_graph_limit(64);   // slot rotation makes many window layouts: LRU, as --batch-mtp does
         wk_dfr_on = true;
         wk_dfr_of_slot.assign((size_t) wk_cap, 0);
         std::fprintf(stderr, "strata serve: stage worker: STRATA_WK_PIPED_MTP: deferred windows on (%d slots x %d rows "
-                             "saved, graph limit 64)\n", wk_cap, wk_max_s);
+                             "saved (STRATA_WK_PIPED_MTP_ROWS), graph limit 64)\n", wk_cap, wk_dfr_slot_rows);
     }
 } else if (wk_dfr_asked) {
     std::fprintf(stderr, "strata serve: stage worker: STRATA_WK_PIPED_MTP: needs --batch: off\n");
 }
 if (wk_dfr_on) {
     auto dfr_forget = [&] {   // the hello and a disconnect: nothing held (the saved rows are just not read again)
-        wk_dfr.reset(wk_slot_n, wk_max_s);
+        wk_dfr.reset(wk_slot_n, wk_dfr_slot_rows);
         std::fill(wk_dfr_of_slot.begin(), wk_dfr_of_slot.end(), 0);
     };
     auto dfr_held_error = [&](const char* what, std::string& e) {
