@@ -1,5 +1,5 @@
-// The prompt path's QSA block scores, several queries a hardware thread (src/prefill/esimd_scores_mq.dp.cpp).  Opt-in:
-// STRATA_SCORES_MQ=<queries a thread> (1, 2, 3, 4, 6; + 100 x tiles of 16 blocks a thread, default 4: e.g. 4 or 804).  The same
+// The prompt path's QSA block scores from prepared (de-interleaved) copies of the queries and keys, 1-3 queries a hardware thread
+// (src/prefill/esimd_scores_mq.dp.cpp).  Opt-in: STRATA_SCORES_MQ=1, 2 or 3 (queries a thread; any other value: off).  The same
 // bits as esimd_scores' variant 2 (STRATA_SCORES_ESIMD=2, the B70's production setting).
 #pragma once
 #include <cstdint>

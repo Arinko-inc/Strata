@@ -1,4 +1,4 @@
-// The prompt path's QSA block scores, several queries a hardware thread (Battlemage, ESIMD): STRATA_SCORES_MQ=<queries>.
+// The prompt path's QSA block scores, 1-3 queries a hardware thread (Battlemage, ESIMD): STRATA_SCORES_MQ=<queries> (1, 2 or 3).
 //
 // esimd_scores.dp.cpp gives a thread one query and 16 blocks: per (query, block) it reads the block's key (two 256-byte loads, or
 // eight gathers), de-interleaves it by 4 and writes one score.  The scores grow with the position (every query scores every
@@ -7,7 +7,8 @@
 //   * `prepare` copies the chunk's queries and the completed blocks' keys once per QSA layer into the order the products read them
 //     (component c of lane L: [c][L], 4 x 32 floats a head / a key), so the kernel's loads land in the registers it multiplies;
 //   * a thread holds NQ queries (32 registers each) and walks NT tiles of 16 blocks: one key is read once for NQ queries, a query
-//     once for 16 NT blocks, and a query's 16 scores of a tile leave in one scatter.
+//     once for 16 NT blocks, and a query's 16 scores of a tile leave in one scatter.  (What pays is the prepared order and the
+//     scatter: 1, 2 and 3 queries a thread measure the same, 4 and more spill registers and are slower than the one-query kernel.)
 // The arithmetic is esimd_scores' variant 2, operation for operation (so the warp kernel's, see that file): the same bits.
 // A tile that holds any query's tail block (b == n_bid: `dead`, the +1e9), or lies past `max_blocks` / the prepared keys, or a
 // thread with fewer than NQ queries, takes the per-(query, block) loop of the one-query kernel.
@@ -186,12 +187,14 @@ void launch(sycl::queue& q, const float* pooled, const float* dead, const float*
         });
     });
 }
+
 }  // namespace
 
 int scores_mq_env() {
     static const int v = [] {
         const char* e = std::getenv("STRATA_SCORES_MQ");
-        return e != nullptr && e[0] != 0 ? std::atoi(e) : 0;
+        const int n = e != nullptr && e[0] != 0 ? std::atoi(e) : 0;
+        return n >= 1 && n <= 3 ? n : 0;   // (the queries a thread that are built)
     }();
     return v;
 }
@@ -261,17 +264,13 @@ bool block_scores_mq(const float* pooled, const float* dead, const float* q_idx,
         kt_n = sc.nk;
     }
     const int64_t reach = active_blocks > 0 && active_blocks < max_blocks ? active_blocks : max_blocks;
-    const int nt = mq / 100 > 0 ? mq / 100 : 4;   // STRATA_SCORES_MQ=<100 x tiles of 16 blocks a thread + queries a thread>, e.g. 404; tiles default 4
-    const int nqt = mq % 100;
+    // (measured on the B70, 3,072 queries at 55K tokens, the scores of 4-5 QSA layers: the one-query kernel 105 ms (its gathered
+    // form 55), 1 / 2 / 3 queries a thread 27 / 29 / 29 ms, 4 queries 66 ms and 6 queries 131 ms (the registers spill); 1 or 8 tiles a
+    // thread and a key-major thread (16 keys in registers, the queries walked) were no faster: bench/2026-11-26-b70read)
 #define STRATA_SMQ(Q, T) launch<Q, T>(q, pooled, dead, q_idx, qt, kt, kt_n, steps, ss, nq, max_blocks, scores, reach)
-    if (nqt == 1 && nt == 4) STRATA_SMQ(1, 4);
-    else if (nqt == 2 && nt == 4) STRATA_SMQ(2, 4);
-    else if (nqt == 3 && nt == 4) STRATA_SMQ(3, 4);
-    else if (nqt == 4 && nt == 4) STRATA_SMQ(4, 4);
-    else if (nqt == 4 && nt == 1) STRATA_SMQ(4, 1);
-    else if (nqt == 4 && nt == 8) STRATA_SMQ(4, 8);
-    else if (nqt == 2 && nt == 8) STRATA_SMQ(2, 8);
-    else if (nqt == 6 && nt == 4) STRATA_SMQ(6, 4);
+    if (mq == 1) STRATA_SMQ(1, 4);
+    else if (mq == 2) STRATA_SMQ(2, 4);
+    else if (mq == 3) STRATA_SMQ(3, 4);
     else return false;
 #undef STRATA_SMQ
     return true;

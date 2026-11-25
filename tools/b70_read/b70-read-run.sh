@@ -14,7 +14,7 @@ W=/home/arinko/b/gpu-window
 left=$(( $(sed -n 's/.*until \([0-9]*\).*/\1/p' $W) - $(date +%s) ))
 [ "$left" -gt "${NEED:-240}" ] || { echo "$tag: gpu-window: $left s left"; exit 3; }
 for u in m1118-b70 strata-stage-b70; do [ "$(systemctl is-active $u)" = active ] && { echo "$tag: $u is active"; exit 4; }; done
-pgrep -f "stage-worker $PORT" >/dev/null && { echo "$tag: another worker on $PORT"; exit 4; }
+ss -ltn 2>/dev/null | grep -q "127.0.0.1:$PORT " && { echo "$tag: another worker on $PORT"; exit 4; }   # (not pgrep -f: it matches a shell whose command line names the port)
 set +u; source /opt/intel/oneapi/setvars.sh >/dev/null 2>&1
 export STRATA_WK_LEND_SINGLE=1 STRATA_MMVQ_LARGE_GRF=1 STRATA_MMVQ_ESIMD=1 STRATA_HC_REQ8=1 STRATA_SHEXP_ESIMD=1
 export STRATA_VERIFY_NO_HOST=1 STRATA_VERIFY_DEVICE_PLAN=1 STRATA_STAGER_THREADS=8 ZES_ENABLE_SYSMAN=1 ONEAPI_DEVICE_SELECTOR=level_zero:0

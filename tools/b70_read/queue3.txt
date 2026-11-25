@@ -1,0 +1,5 @@
+# the key-major scores (strata.mq2), after queue2 in the same window
+E=/home/arinko/wt/b70-read/strata.mq2; NEED=90 SEQ="58368:3072:1" $R km64-t $E STRATA_SCORES_MQ=1064 STRATA_PREFILL_TIMING=1
+E=/home/arinko/wt/b70-read/strata.mq2; NEED=90 SEQ="58368:3072:1" $R km256-t $E STRATA_SCORES_MQ=1256 STRATA_PREFILL_TIMING=1
+E=/home/arinko/wt/b70-read/strata.mq2; NEED=90 SEQ="3072:3072:3 58368:3072:1" $R km64-n $E STRATA_SCORES_MQ=1064
+E=/home/arinko/wt/b70-read/strata.mq2; NEED=90 SEQ="58368:3072:1" $R km16-t $E STRATA_SCORES_MQ=1016 STRATA_PREFILL_TIMING=1
