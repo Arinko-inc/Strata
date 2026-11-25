@@ -1,0 +1,7 @@
+STEPS="bench dfr" DFR_ARGS=--no-deferred ~/wt/pmtp-relay/pmtp-relay-run.sh f1-noflag ~/wt/pmtp-relay/strata.f1
+STEPS="bench dfr bench2" ~/wt/pmtp-relay/pmtp-relay-run.sh f1-flag ~/wt/pmtp-relay/strata.f1 STRATA_WK_PIPED_MTP=1 STRATA_REMOTE_TIMING=1
+python3 ~/wt/pmtp-relay/sink_check.py ~/wt/pmtp-relay-logs/sink-f1-flag.log
+STEPS="bench dfr" DFR_ARGS=--no-deferred ~/wt/pmtp-relay/pmtp-relay-run.sh prod-noflag ~/wt/relay-read/strata.r3
+STEPS="dfr" DFR_ARGS="--windows 200" ~/wt/pmtp-relay/pmtp-relay-run.sh f1-flag-long ~/wt/pmtp-relay/strata.f1 STRATA_WK_PIPED_MTP=1 STRATA_REMOTE_TIMING=1
+python3 ~/wt/pmtp-relay/sink_check.py ~/wt/pmtp-relay-logs/sink-f1-flag-long.log
+STEPS="bench dfr" ~/wt/pmtp-relay/pmtp-relay-run.sh f1-flag-fused ~/wt/pmtp-relay/strata.f1 STRATA_WK_PIPED_MTP=1 STRATA_PF_GEMM=1 STRATA_PF_PAD=1 STRATA_PF_FUSED=1 STRATA_PF_FUSED_KQ=1 STRATA_PF_F16=1 STRATA_PF_F16_Q50=1

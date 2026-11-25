@@ -149,14 +149,15 @@ struct Probe {
         std::vector<float> in, out;
     };
     // group gi's window (slots 2 gi, 2 gi + 1), two rows per slot from each slot's cell at[s]
-    Win window(int gi, const int64_t* at) const {
+    // (ra / rb: the rows of the group's first / second slot, 0..2, not both 0)
+    Win window(int gi, const int64_t* at, int ra = 2, int rb = 2) const {
         Win w;
-        w.S = 4;
+        w.S = ra + rb;
         w.in.assign((size_t) (w.S * HB), 0.0f);   // the block layout: S R rows, then bo and inject (zero)
         w.out.assign((size_t) (w.S * HB), 0.0f);
-        for (int t = 0; t < 4; ++t) {
-            const int s = 2 * gi + t / 2;
-            const int64_t c = at[s] + t % 2;   // the cell after the slot's prompt
+        for (int t = 0; t < w.S; ++t) {
+            const int s = 2 * gi + (t < ra ? 0 : 1);
+            const int64_t c = at[s] + (t < ra ? t : t - ra);   // the cell after the slot's prompt
             w.slots[t] = s;
             w.pos[t] = L[s] + c;
             w.tok[t] = wtok[(size_t) (s * cells + c)];
@@ -176,6 +177,7 @@ struct Probe {
         std::vector<uint64_t> win;   // per window, in (round, group) order
         uint64_t all = kFnv0;
         double ms = 0;               // per window, wall (the send to its rows)
+        std::vector<float> rows;     // every window's output R rows (K <= 64), for the size of a difference
     };
     // mode 0: kStageSlotKeepAll; 1: no flag + SlotCommit; 2: kStageSlotDeferred, pipelined
     RunResult run_mode(int mode, bool mixed, int K) {
@@ -207,6 +209,7 @@ struct Probe {
                 if (!run(w, mode == 0 ? kStageSlotKeepAll : mode == 1 ? 0 : kStageSlotDeferred, err)) return r;
                 wall += ms_since(t0);
                 r.win[(size_t) (2 * j + gi)] = fnv(w.out.data(), w.out.size() * 4);
+                if (K <= 64) r.rows.insert(r.rows.end(), w.out.begin(), w.out.begin() + (size_t) (w.S * D));
                 held_tag[gi] = tag;
                 if (mode == 0) {
                     for (int s = 2 * gi; s < 2 * gi + 2; ++s) at[s] += 2;
@@ -306,7 +309,7 @@ int main(int argc, char** argv) {
     for (auto& t : pr.ptok) t = td(rng);
     pr.prow.resize((size_t) (Lmax * pr.D));
     for (float& v : pr.prow) v = nd(rng);
-    pr.cells = 2 * K + 4;
+    pr.cells = std::max(2 * K + 4, 16);   // (the layouts' part walks 9 cells of a slot)
     pr.wrow.resize((size_t) kSlots * (size_t) pr.cells * (size_t) pr.D);
     for (float& v : pr.wrow) v = nd(rng);
     pr.wtok.resize((size_t) kSlots * (size_t) pr.cells);
@@ -330,8 +333,32 @@ int main(int argc, char** argv) {
                 if (first < 0) first = (int) i;
             }
         if (diff == 0 && a.all == b.all) return std::string();
-        return std::to_string(diff) + " of " + std::to_string(a.win.size()) + " windows differ (the first: window " +
+        // how large: the relative L2 of the difference over every window's rows, and over the first that differs
+        std::string size;
+        if (!a.rows.empty() && a.rows.size() == b.rows.size()) {
+            const size_t per = a.rows.size() / a.win.size();
+            auto rel = [&](size_t lo, size_t hi) {
+                double dd = 0, rr = 0;
+                bool nan = false;
+                for (size_t i = lo; i < hi; ++i) {
+                    const double d = (double) a.rows[i] - b.rows[i];
+                    dd += d * d;
+                    rr += (double) a.rows[i] * a.rows[i];
+                    nan = nan || !std::isfinite(a.rows[i]) || !std::isfinite(b.rows[i]);
+                }
+                char buf[64];
+                std::snprintf(buf, sizeof buf, "%.3e%s", rr > 0 ? std::sqrt(dd / rr) : 0.0, nan ? " (non-finite!)" : "");
+                return std::string(buf);
+            };
+            size = "; relative L2 " + rel(0, a.rows.size()) +
+                   (first >= 0 ? ", window " + std::to_string(first) + " alone " +
+                                     rel((size_t) first * per, (size_t) (first + 1) * per) +
+                                     ", the last window " + rel(a.rows.size() - per, a.rows.size())
+                               : "");
+        }
+        return size + "; " + std::to_string(diff) + " of " + std::to_string(a.win.size()) + " windows differ (the first: window " +
                std::to_string(first) + ")" + (a.all != b.all && diff == 0 ? ", the window after the last differs" : "");
+        // (callers print it after their text: it starts with "; ")
     };
     // a failed run leaves the link as the error left it: connect again before the next
     auto run = [&](const char* name, int mode, bool mixed) {
@@ -445,6 +472,30 @@ int main(int argc, char** argv) {
         verdict(pr.connect(e), "a new connection after the refusals " + e);
         const Probe::RunResult dfm3 = run("df-mix", 2, true);
         verdict(dfm3.ok && same(c0m, dfm3).empty(), "df-mix on the new connection == c0-mix " + same(c0m, dfm3));
+    }
+    // every layout the main process's groups make with one draft per slot (2 groups x 8: one or both slots, 1 or 2
+    // rows each), each window deferred and committed whole: the worker then holds every layout's graphs (its VRAM)
+    {
+        std::string e;
+        bool ok = pr.setup(e);
+        int64_t at[kSlots] = {};
+        int n = 0;
+        for (int gi = 0; gi < 2 && ok; ++gi)
+            for (int ra = 0; ra <= 2 && ok; ++ra)
+                for (int rb = 0; rb <= 2 && ok; ++rb) {
+                    if (ra + rb == 0) continue;
+                    Probe::Win w = pr.window(gi, at, ra, rb);
+                    int32_t keep[kSlots] = {};
+                    keep[2 * gi] = ra;
+                    keep[2 * gi + 1] = rb;
+                    ok = pr.run(w, kStageSlotDeferred, e) && pr.link.slot_commit(keep, kSlots, pr.tag, e, true);
+                    at[2 * gi] += ra;
+                    at[2 * gi + 1] += rb;
+                    ++n;
+                }
+        Probe::Win last = pr.window(1, at);
+        ok = ok && pr.run(last, kStageSlotKeepAll, e);
+        verdict(ok && n == 16, "16 window layouts, each deferred and committed whole " + e);
     }
     std::printf("stage_probe_dfr: %s\n", g_bad == 0 ? "all passed" : "FAILED");
     return g_bad == 0 ? 0 : 1;
