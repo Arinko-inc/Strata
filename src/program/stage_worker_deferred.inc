@@ -37,8 +37,15 @@ int wk_dfr_held_max = 0;
 double wk_dfr_run_ms = 0, wk_dfr_commit_ms = 0;
 if (wk_dfr_asked && o.batch <= 0)
     std::fprintf(stderr, "strata serve: stage worker: STRATA_WK_PIPED_MTP needs --batch (the batch slots): off\n");
+const bool wk_dfr_self_commit = [] {   // (STRATA_BATCH_SELF_COMMIT: verify.cpp's g_batch_self_commit reads the same)
+    const char* v = std::getenv("STRATA_BATCH_SELF_COMMIT");
+    return v != nullptr && v[0] != '\0' && v[0] != '0';
+}();
 if (wk_dfr_asked && o.batch > 0) {
-    if (stage_relay && !(wk_overlap && hs.slot_run_reply != nullptr)) {
+    if (wk_dfr_self_commit) {   // (合流 D, Sol P1: a window of one row a slot would keep its rows itself, then the commit again)
+        std::fprintf(stderr, "strata serve: stage worker: STRATA_WK_PIPED_MTP is off: it does not combine with "
+                             "STRATA_BATCH_SELF_COMMIT\n");
+    } else if (stage_relay && !(wk_overlap && hs.slot_run_reply != nullptr)) {
         std::fprintf(stderr, "strata serve: stage worker: STRATA_WK_PIPED_MTP is off: a relay answers the deferred "
                              "windows late, which STRATA_RELAY_SLOT_OVERLAP=0 turns off\n");
     } else {
