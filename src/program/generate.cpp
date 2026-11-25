@@ -106,6 +106,7 @@
 #include "strata/spec/suffix_drafter.hpp"
 #include "strata/spec/spec_start.hpp"
 #include "strata/program/batch_groups.hpp"
+#include "strata/program/pipe_probe.hpp"
 #include "strata/kernels/cvec.hpp"
 #include "strata/core/progress.hpp"
 #include "strata/core/device.hpp"
@@ -6224,16 +6225,39 @@ int main(int argc, char** argv) {
         pm_drafts = std::clamp(std::atoi(std::getenv("STRATA_PIPED_MTP")), 1,
                                std::max(1, std::min(o.spec - 1, (int) strata::kernels::kVerifyMaxT - 1)));
     }
+    // STRATA_PIPE_PROBE_ROWS=R (2..4; a measurement only, Arinko-inc): a remote stage's pipelined groups carry R rows per
+    // active slot - the slot's token, then R-1 copies of the token before it - all kept, and only the first row's answer
+    // is emitted.  It times what one more row per slot costs a round trip; the text it makes is not usable.  Unset: nothing
+    // below changes.  Checked once the worker's hello is in (where the groups are agreed).
+    int probe_r = 0;
+    if (const char* pe = std::getenv("STRATA_PIPE_PROBE_ROWS"); pe != nullptr && pe[0] != '\0' && std::strcmp(pe, "0") != 0) {
+        probe_r = strata::program::pipe_probe::probe_rows(pe);
+        if (probe_r == 0) {
+            std::fprintf(stderr, "strata generate: STRATA_PIPE_PROBE_ROWS=%s: it must be 2, 3 or 4\n", pe);
+            return 1;
+        }
+        if (!remote_main) {   // (a worker or a plain engine that inherited the variable: ignored, said once)
+            std::fprintf(stderr, "strata generate: STRATA_PIPE_PROBE_ROWS is ignored: it is for the main process of a remote "
+                                 "stage (--remote-stage)\n");
+            probe_r = 0;
+        }
+    }
     // The verifiers' window: the solo path's drafts (--spec rows), the plain batch windows (the slots) and, with
     // STRATA_PIPED_MTP, a group's rows: its slots, each its token and its proposals ((slots) * (1 + proposals), one slot
     // per group = at most --spec rows).  A function, not a number: --batch (the slots that fit) and the groups are final
     // only after this point, at the verifiers' init, and the plain value must stay what it was there.
+    // STRATA_PIPE_PROBE_ROWS: a group's window when every one of its slots runs, R rows each (the groups as they are at the
+    // verifiers' init; 0 when the flag is off)
+    auto probe_window_rows = [&]() -> int {
+        return (probe_r > 0 && o.batch_groups > 1 && o.batch > 0)
+            ? std::min<int>(strata::kernels::kVerifyMaxT, (o.batch / o.batch_groups) * probe_r) : 0;
+    };
     auto batch_max_t = [&]() -> int {
         if (batch_mtp && !piped_mtp) return (int) strata::kernels::kVerifyMaxT;
         const int plain = std::max(o.spec, std::min(o.batch, (int) strata::kernels::kVerifyMaxT));
         const int group_rows = (piped_mtp && o.batch_groups > 1 && o.batch > 0)
             ? std::min<int>(strata::kernels::kVerifyMaxT, (o.batch / o.batch_groups) * (1 + pm_drafts)) : 0;
-        return std::max(plain, group_rows);
+        return std::max({plain, group_rows, probe_window_rows()});
     };
     // The most slots, up to n, whose windows hold at most kVerifyMaxT rows each: n itself up to that, more only as
     // pipelined groups on a layer split - the groups as resolved below (a number given, auto, or the default's one
@@ -10271,9 +10295,11 @@ int main(int argc, char** argv) {
             // pipelined slot groups write their rows at hbase = group * rows-per-group, so with more than
             // kVerifyMaxT slots in groups the hand-off holds one row per slot (otherwise kVerifyMaxT, as before)
             // (STRATA_PIPED_MTP: per slot its token and up to pm_drafts proposals)
-            const int hrows = piped_mtp ? std::max<int>(strata::kernels::kVerifyMaxT, (1 + pm_drafts) * o.batch)
+            const int hrows0 = piped_mtp ? std::max<int>(strata::kernels::kVerifyMaxT, (1 + pm_drafts) * o.batch)
                             : !batch_mtp && o.batch_groups > 1 ? std::max<int>(strata::kernels::kVerifyMaxT, o.batch)
                                                                : strata::kernels::kVerifyMaxT;
+            // STRATA_PIPE_PROBE_ROWS: group g's rows start at g * slots-per-group * R, so the hand-off holds R rows per slot
+            const int hrows = probe_r > 0 ? std::max(hrows0, probe_r * o.batch) : hrows0;
             const size_t hb = (size_t) hrows * (size_t) strata::core::Verifier::handoff_floats(g) * sizeof(float);
             std::vector<float*> hand((size_t) n_stages - 1, nullptr), hand_host((size_t) n_stages - 1, nullptr);
             for (size_t hi = 0; hi < hand.size(); ++hi) {
@@ -10434,7 +10460,7 @@ int main(int argc, char** argv) {
             for (int st = 1; st < n_stages; ++st) {
                 bool ok_s = false;
                 if (split_same) {
-                    ok_s = ver_same.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, std::max(o.spec, std::min(o.batch, (int) strata::kernels::kVerifyMaxT)), err);
+                    ok_s = ver_same.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, std::max({o.spec, std::min(o.batch, (int) strata::kernels::kVerifyMaxT), probe_window_rows()}), err);
                 } else {
                     GpuStage& gs = *stages[(size_t) st - 1];
                     const strata::core::OnDevice on(gs.dev);
@@ -13319,6 +13345,26 @@ int main(int argc, char** argv) {
                     }
                     if (o.batch < 2) o.batch_groups = 1;
                     remote_pipe = o.batch > 0 && o.batch_groups > 1;
+                    if (probe_r > 0) {   // STRATA_PIPE_PROBE_ROWS: refused unless every stage takes a full group's window
+                        // the rows one window can carry: this process's verifiers and the worker's hello (the relay's
+                        // spec; the stages behind it hold at most that, a relay refusing a wider next stage)
+                        const int limit = std::min({ver.max_t(), ver_same.max_t(), (int) remote_peer.max_t,
+                                                    (int) strata::kernels::kVerifyMaxT});
+                        const char* why = !remote_pipe ? "it needs the remote pipelined groups (--batch-groups 2 or more, agreed "
+                                                         "with the worker)"
+                                        : strata::program::pipe_probe::startup_error(probe_r, o.batch / o.batch_groups, limit);
+                        if (why != nullptr) {
+                            std::fprintf(stderr, "strata serve: STRATA_PIPE_PROBE_ROWS=%d is refused: %s (%d slot%s per group, "
+                                                 "windows of at most %d rows: this process %d / %d, the worker %d)\n", probe_r,
+                                         why, remote_pipe ? o.batch / o.batch_groups : 0,
+                                         remote_pipe && o.batch / o.batch_groups == 1 ? "" : "s", limit, ver.max_t(),
+                                         ver_same.max_t(), (int) remote_peer.max_t);
+                            return 1;
+                        }
+                        std::fprintf(stderr, "strata serve: STRATA_PIPE_PROBE_ROWS=%d: a MEASUREMENT - each active slot carries %d "
+                                             "rows in a window and only the first row's answer is emitted; the text is not "
+                                             "usable\n", probe_r, probe_r);
+                    }
                     std::printf("INFO batch_slots=%d batch_groups=%d batch_pad=0\n", o.batch, o.batch_groups);
                 }
             } else {
@@ -15637,10 +15683,16 @@ int main(int argc, char** argv) {
                 // the last stage: the group's picks
                 const int32_t* outb = vk.batch_out();
                 if (pmtp && !pmtp_verdict(G, vk, outb)) return false;
-                for (int t = 0; t < G.S && !pmtp; ++t) {
+                // (STRATA_PIPE_PROBE_ROWS: a slot's `nr` rows are together; its answer is its first row's, and the loop
+                // goes on from the slot's next rows.  nr is 1 for every row without the flag)
+                for (int t = 0, nr = 1; t < G.S && !pmtp; t += nr) {
+                    nr = 1;
+                    if (probe_r > 0)
+                        while (t + nr < G.S && G.rows[t + nr] == G.rows[t]) ++nr;
                     const int sb = remote_pipe ? G.rows[t] : gi * GS + t;   // (remote_pipe: active slots only, 2.2.3)
                     BSlot& sl = bs[(size_t) sb];
                     if (!sl.active) continue;
+                    if (nr > 1) sl.tainted = true;   // its state holds the filler rows: not a conversation to reuse
                     if (vk.nonfinite_in(t)) {   // #879: the slot ends, nothing emitted
                         std::fprintf(stderr, "strata batch: non-finite logits (#879) in slot %d at position %lld: it "
                                              "ends (BDONE nonfinite) and the next request reads its prompt from token 0\n",
@@ -15660,8 +15712,12 @@ int main(int argc, char** argv) {
                     ++pipe_rows;
                     const bool eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) y) != o.eos_ids.end();
                     const char* fin = eos ? "stop" : sl.stop ? "cancel" : sl.produced >= sl.max_new ? "length"
-                                    : sl.p + 2 > o.max_context ? "length" : nullptr;
-                    sl.ids.push_back(sl.x);
+                                    : sl.p + nr + 1 > o.max_context ? "length" : nullptr;
+                    {   // (the token before sl.x is what the probe's extra rows carry; read before sl.x is pushed)
+                        const int32_t filler = sl.ids.empty() ? sl.x : sl.ids.back();
+                        sl.ids.push_back(sl.x);
+                        for (int j = 1; j < nr; ++j) sl.ids.push_back(filler);
+                    }
                     if (fin != nullptr) {
                         const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
                         std::printf("BDONE %d %lld %s %.1f\n", sb, (long long) sl.produced, fin, ms);
@@ -15672,7 +15728,7 @@ int main(int argc, char** argv) {
                         sl.cached = o.prompt_cache > 0 && !sl.img && !sl.tainted;
                     } else {
                         sl.x = y;
-                        sl.p += 1;
+                        sl.p += nr;
                     }
                 }
                 std::fflush(stdout);
@@ -15772,6 +15828,29 @@ int main(int argc, char** argv) {
                             }
                         }
                         if (G.S == 0) { G.inflight = false; continue; }   // every slot of the group went idle
+                    } else if (remote_pipe && probe_r > 0) {   // STRATA_PIPE_PROBE_ROWS: R rows per active slot (a measurement)
+                        namespace pp = strata::program::pipe_probe;
+                        pp::Slot ps[strata::kernels::kVerifyMaxT];
+                        for (int t = 0; t < GS && t < (int) strata::kernels::kVerifyMaxT; ++t) {
+                            const BSlot& sl = bs[(size_t) (pick * GS + t)];
+                            ps[t].active = sl.active;
+                            ps[t].x = sl.x;
+                            ps[t].prev = sl.ids.empty() ? sl.x : sl.ids.back();
+                            ps[t].p = sl.p;
+                        }
+                        pp::Group pgrp;
+                        pp::build_probe_group(probe_r, std::min(std::min(ver.max_t(), ver_same.max_t()), (int) remote_peer.max_t),
+                                              o.max_context, ps, std::min(GS, (int) strata::kernels::kVerifyMaxT),
+                                              pick * GS, pgrp);
+                        G.hbase = pick * GS * probe_r;
+                        G.S = pgrp.S;
+                        G.active = pgrp.active;
+                        for (int t = 0; t < pgrp.S; ++t) {
+                            G.rows[t] = pgrp.slot[t];
+                            G.tok[t] = pgrp.tok[t];
+                            G.pos[t] = pgrp.pos[t];
+                        }
+                        if (G.S == 0) { G.inflight = false; continue; }
                     } else if (remote_pipe) {   // remote-batch stage 2: the group's active slots only, no pad row (the
                         // worker refuses a window over a slot it holds nothing of), so an idle slot keeps its state
                         G.hbase = pick * GS;
