@@ -523,11 +523,11 @@ class ServerPath(FakeEngineCase):
         self.engine.keep_heads.turn_id = 256                  # ByteTokenizer's <|im_start|>
         self.engine.keep_heads.root_min = 1
 
-    def ask(self, system, user, max_tokens=64):
+    def ask(self, system, user, max_tokens=64, **extra):
         import json
         import urllib.request
         body = {"messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
-                "max_tokens": max_tokens, "reasoning_effort": "none"}
+                "max_tokens": max_tokens, "reasoning_effort": "none", **extra}
         req = urllib.request.Request(self.base + "/v1/chat/completions", data=json.dumps(body).encode(),
                                      headers={"Content-Type": "application/json"})
         with urllib.request.urlopen(req, timeout=60) as r:
@@ -623,6 +623,94 @@ class ServerPath(FakeEngineCase):
         self.assertEqual([c.split()[:2] for c in self.commands()[n:]], [["BGEN", str(slot)]])
         self.assertEqual(self.engine.slot_held[slot], before)
         self.assertEqual(self.engine.keep_heads.metas[slot], meta)
+
+    def only_free(self, slot, fn):
+        """Run fn() with every other slot marked busy (not alone: a plain BGEN into `slot`)."""
+        for b in range(4):
+            self.engine.slot_busy[b] = b != slot
+        try:
+            return fn()
+        finally:
+            for b in range(4):
+                self.engine.slot_busy[b] = False
+
+    def read_to_stop(self, ids, max_new=64):
+        """As Service: read the generator, close it at the stop token."""
+        import threading
+        g = self.engine.generate(ids, max_new, {}, threading.Event())
+        got = []
+        for t in g:
+            if t is None:
+                continue
+            got.append(t)
+            if t in self.svc.stop_ids:
+                g.close()
+                break
+        return got
+
+    def test_28d_on_a_slot_of_the_other_projection_is_not_forgotten(self):
+        """The engine skips a slot whose control-vector setting differs (generate.cpp ~16655, `sl.cvec != want_cvec`)
+        but keeps it: decide does not count such a slot, so check_reuse never forgets it (review 2026-11-25 #2, P2)."""
+        self.start_kh()
+        self.engine.info["cvec"] = "speed.gguf"                  # an engine with a control vector loaded
+        self.ask(self.SYSTEM + "S1 ", "LONGREPLY please")        # projection on (absent)
+        self.wait_idle()
+        slot = int(self.commands()[0].split()[1])
+        before = list(self.engine.slot_held[slot])
+        self.assertTrue(before)
+        self.ask(self.SYSTEM + "S1 ", "another question, LONGREPLY", experimental_speed_projection=False)
+        self.wait_idle()
+        self.assertEqual(self.engine.slot_held[slot], before)
+        self.assertTrue(self.engine.keep_heads.metas[slot].cvec)
+
+    def test_28e_on_but_slot_cache_0_an_admission_does_not_restore_the_record(self):
+        """INFO slot_cache=0: no slot is a cache, so the record is not given back after an admission that did not
+        continue - neither after a drained BADM nor after max_tokens 1 (review 2026-11-25 #2, P3)."""
+        self.start_kh()
+        self.ask(self.SYSTEM + "S1 ", "LONGREPLY please")
+        self.wait_idle()
+        slot = int(self.commands()[0].split()[1])
+        held = list(self.engine.slot_held[slot])
+        self.assertTrue(held)
+        self.engine.info["slot_cache"] = 0
+        got = self.only_free(slot, lambda: self.read_to_stop(list(b"a prompt whose answer is already here: ok, done.")))
+        self.assertEqual(len(got), 1)
+        self.assertEqual(self.engine.slot_held[slot], [])
+        self.engine.slot_held[slot] = list(held)
+        self.only_free(slot, lambda: self.read_to_stop(list(b"another short prompt"), max_new=1))
+        self.assertEqual(self.engine.slot_held[slot], [])
+        self.assertIn(f"BGEN {slot}", "\n".join(self.commands()[-2:]))
+
+    def test_28f_on_the_drained_badm_is_judged_by_its_own_done(self):
+        """A consumer that left during the read: the `finally` drains this admission's DONE (nonfinite) and BADM 0,
+        and another slot's BDONE can rewrite the shared self.last in between.  The record stays empty because the
+        request's own DONE said nonfinite (review 2026-11-25 #2, P3)."""
+        self.start_kh()
+        self.ask(self.SYSTEM + "S1 ", "LONGREPLY please")
+        self.wait_idle()
+        slot = int(self.commands()[0].split()[1])
+        self.assertTrue(self.engine.slot_held[slot])
+        eng = self.engine
+        real_control, real_drain = eng._control, eng._drain_control
+
+        def control(*a, **kw):                                   # a heartbeat first: the consumer leaves at it
+            yield None
+            yield from real_control(*a, **kw)
+
+        def drain(*a, **kw):                                     # another slot's BDONE lands right after
+            line = real_drain(*a, **kw)
+            eng._apply_bdone("BDONE 3 5 stop 1.0".split())
+            return line
+
+        def go():
+            import threading
+            g = eng.generate(list(b"NFADMIT a prompt the engine fails"), 64, {}, threading.Event())
+            self.assertIsNone(next(g))
+            g.close()
+        with mock.patch.object(eng, "_control", control), mock.patch.object(eng, "_drain_control", drain):
+            self.only_free(slot, go)
+        self.assertEqual(eng.last.get("finish"), "stop")          # (the shared figures were rewritten)
+        self.assertEqual(eng.slot_held[slot], [])
 
     def test_29_on_max_tokens_1_does_not_forget_a_held_head(self):
         self.start_kh()

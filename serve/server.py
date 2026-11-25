@@ -1648,6 +1648,7 @@ class StrataEngine:
         drain - its end line was read already (by the request's own EngineDied), and waiting for another one held
         a request that had failed for the whole 300 s (#1012), or read the lines of the engine that replaced it."""
         end = time.monotonic() + timeout
+        self._drained_done = None                    # (keep heads: this request's own DONE, not the shared self.last)
         while time.monotonic() < end:
             if born is not None and (self.gen != born or not self.alive()):
                 return None
@@ -1659,6 +1660,7 @@ class StrataEngine:
                 return None
             if line.startswith("DONE"):
                 self._parse_done(line)
+                self._drained_done = line
             if line.startswith(until) or line.startswith("ERR"):
                 return line
         return None
@@ -2133,7 +2135,7 @@ class StrataEngine:
                         else:
                             again = kh.held_after_admission(prev_held, cont, self._yielded is not None,
                                                             bool(getattr(self, "_adm_failed", False)), self._ctl_erred)
-                            if again is not None:
+                            if again is not None and kh.applies(self.info or {}, getattr(self, "slot_gs", 0)):
                                 self.slot_held[slot] = again
                     if not cont and self._yielded is not None and self._yielded[0] == slot and not cancel.is_set():
                         continue                            # gave way: again once the shorter request is in
@@ -2250,7 +2252,8 @@ class StrataEngine:
                         phase = "slot"
                     if kh is not None and slot is not None:   # keep heads: as after BADM on the normal path
                         again = kh.after_drained_badm(slot, line, prev_held, sampling or {}, embeddings, asked,
-                                                      (self.last or {}).get("finish") if isinstance(self.last, dict) else None)
+                                                      getattr(self, "_drained_done", None),
+                                                      kh.applies(self.info or {}, getattr(self, "slot_gs", 0)))
                         if again is not None:
                             self.slot_held[slot] = again
             except EngineDied:

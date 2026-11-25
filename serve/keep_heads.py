@@ -56,6 +56,8 @@ class SlotMeta:
     pin: int = 0         # the pin=N it carried (0: none) - the engine took a pinned checkpoint there
     ckpt: bool = True    # False: it had ckpt=0 (no turn and no pin checkpoint; the root still)
     img: bool = False    # it had pictures: the engine never keeps such a slot as a cache (generate.cpp 19732, 15175)
+    cvec: bool = True    # its experimental_speed_projection (request_cvec): with a control vector loaded, the engine
+                         # resumes a prompt only from a slot of the same setting (generate.cpp ~16655, sl.cvec)
 
 
 @dataclass
@@ -93,6 +95,19 @@ def request_pin(sampling: dict) -> int:
         if isinstance(pn, int) and not isinstance(pn, bool) and pn > 0:
             return pn
     return 0
+
+
+def request_cvec(sampling: dict) -> bool:
+    """The request's projection setting as StrataEngine.projection_key sends it: sampling["experimental_speed_projection"]
+    when it is a bool, else True (the engine's cvec=1 when absent)."""
+    on = sampling.get("experimental_speed_projection") if isinstance(sampling, dict) else None
+    return on if isinstance(on, bool) else True
+
+
+def cvec_loaded(info: dict) -> bool:
+    """Whether the engine runs with a control vector (INFO cvec=..., as Service's history reads it): only then does
+    the projection setting split the slots (the engine's want_cvec is true for every request otherwise)."""
+    return str((info or {}).get("cvec", 0)) not in ("0", "", "None")
 
 
 def request_ckpt(sampling: dict) -> bool:
@@ -215,8 +230,12 @@ class KeepHeads:
             return None
         head = head_of(prompt, request_pin(sampling), request_ckpt(sampling), self.turn_id, self.root_min)
         served, best = 0, None
+        split = cvec_loaded(info)
+        want = request_cvec(sampling)
         for b in range(len(slot_held)):
             if slot_busy[b] or not len(slot_held[b]):
+                continue
+            if split and self.meta(b).cvec != want:      # the engine skips it for this request (and keeps it)
                 continue
             n = served_by(prompt, slot_held[b], self.meta(b), self.turn_id, self.root_min)
             if n > served:
@@ -246,7 +265,8 @@ class KeepHeads:
     def note_admitted(self, slot: int, sampling: dict, embeddings) -> None:
         """An admission continued in `slot` (BADM <slot> 1): remember its pin, ckpt and pictures (SlotMeta)."""
         if 0 <= slot < len(self.metas):
-            self.metas[slot] = SlotMeta(pin=request_pin(sampling), ckpt=request_ckpt(sampling), img=bool(embeddings))
+            self.metas[slot] = SlotMeta(pin=request_pin(sampling), ckpt=request_ckpt(sampling), img=bool(embeddings),
+                                        cvec=request_cvec(sampling))
 
     def held_after_admission(self, prev_held, cont: bool, yielded: bool, failed: bool, erred: bool):
         """What slot_held should be after an admission: `prev_held` (what it held before the BGEN) when the admission
@@ -256,19 +276,23 @@ class KeepHeads:
             return None
         return list(prev_held or [])
 
-    def after_drained_badm(self, slot: int, line, prev_held, sampling: dict, embeddings, asked: bool, finish):
+    def after_drained_badm(self, slot: int, line, prev_held, sampling: dict, embeddings, asked: bool, done,
+                           restore: bool = True):
         """An admission whose consumer left before its BADM was read (an answer that ended at its first token):
         generate_batched's `finally` drained the control lines up to `line`.  The same as the normal path does after
         BADM: `BADM <slot> 1` -> note_admitted, `BADM <slot> 0` -> held_after_admission.  The drain does not see a
-        YIELDED line, so `asked` (a BYIELD was sent for this read) counts as yielded; a DONE that said "nonfinite"
-        (`finish`, from the drained DONE) keeps the record empty.  Returns what slot_held should be (None: leave it)."""
+        YIELDED line, so `asked` (a BYIELD was sent for this read) counts as yielded; `done` is the DONE line the drain
+        read for THIS request (not the shared self.last, which another slot's BDONE can rewrite): one that said
+        "nonfinite", or none at all, keeps the record empty.  `restore` False (not applies(): no slot is a cache)
+        never gives the record back.  Returns what slot_held should be (None: leave it)."""
         f = line.split() if isinstance(line, str) else []
         if f[:1] != ["BADM"] or len(f) < 3:
             return None                                  # an ERR, or the engine ended: nothing is known
         if f[2] == "1":
             self.note_admitted(slot, sampling, embeddings)
             return None
-        if finish == "nonfinite":
+        d = done.split() if isinstance(done, str) else []
+        if not restore or len(d) < 6 or d[5] == "nonfinite":
             return None
         return self.held_after_admission(prev_held, False, bool(asked), f[3:4] == ["failed"], False)
 
