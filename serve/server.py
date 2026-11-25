@@ -1247,6 +1247,10 @@ class StrataEngine:
         self.wlock = threading.Lock()                   # stdin writes from several request threads
         self.pump = threading.Thread(target=self._pump, daemon=True)
         self.pump.start()
+        from serve.warm_heads import WarmHeads          # Arinko-inc: 再起動後の頭の温め(serve/warm_heads.py)
+        if "warm_heads" not in self.__dict__:           # restart をまたいで残す(slot_cv と同じ)
+            self.warm_heads = WarmHeads(self.log_path, self.TURN_ID)
+        self.warm_heads.on_ready(self)
 
     def _pump(self):
         proc, lines = self.proc, self.lines             # this process's: a restart replaces both (#344)
@@ -5825,6 +5829,10 @@ class Service:
                                                     "prompt_tokens": len(ids)}
             self._terminal_event_locked(request_id, "queued")
         queued_counted = True
+        wh = getattr(self.engine, "warm_heads", None)   # Arinko-inc: serve/warm_heads.py (STRATA_WARM_HEADS=1)
+        if wh is not None:
+            wh.arriving(ids)                            # 温めている頭と違う頭の要求が来たら、温めを止める
+        warm_reused = None
         try:
             # --batch: the engine runs several requests at once (StrataEngine.generate_batched orders them)
             turn = contextlib.ExitStack()
@@ -6126,6 +6134,7 @@ class Service:
                     with self.status_lock:
                         if st.get("busy") and not timed_out:
                             last = request_stats(segments)          # only this request's own DONEs count
+                            warm_reused = last.get("reused")
                             started = st.get("started", time.time())
                             cvec = (getattr(self.engine, "info", {}) or {}).get("cvec", 0)
                             loaded = str(cvec) not in ("0", "", "None")
@@ -6201,6 +6210,8 @@ class Service:
                                 self.status.update(busy=False)
                                 self.status.pop("tail", None)
                                 self.status.pop("tool", None)
+                    if wh is not None:                  # (status_lock の外: note は I/O をしないが、鍵の計算に数 ms)
+                        wh.note(ids, warm_reused, images=bool(emb), finish=finish)
         except QueueCancelled:
             finish = "cancel"
             yield "done", {"finish": "cancel", "completion_tokens": 0, "reused": 0, "timings": None,
