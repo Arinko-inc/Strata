@@ -530,9 +530,18 @@ class WarmHeads:
         applies = bool(kh is not None and kh.applies(engine.info or {}, getattr(engine, "slot_gs", 0)))
         max_new = 2 if applies else 1
         ctx = int(getattr(engine, "max_context", 0) or 0)
-        if len(w) + max_new + CTX_SLACK > ctx:
+        # エンジンは受付で prompt + max_new + 8 > 文脈 を断る。BGEN は GEN 1 に直してから調べる(generate.cpp の BGEN の
+        # 受付)ので、--batch では max_new 1 の命令(いつも BGEN)は 1 で数える。max_new 2 は keep-heads が枠へ回すとき
+        # BGEN、回さないとき GEN 2
+        if len(w) + 1 + CTX_SLACK > ctx:
             self._say(f"skipped: the {h.n}-token head does not fit the engine's context ({ctx})")
             return "skipped"
+        if max_new == 2 and len(w) + 2 + CTX_SLACK > ctx:
+            with engine.slot_cv:
+                d = kh.decide(w, {}, None, engine.slot_held, engine.slot_busy, engine.info or {},
+                              getattr(engine, "slot_gs", 0))
+            if d is None or not d.to_slot:
+                max_new = 1                             # GEN 2 は収まらない: BGEN 1(枠には写らず、主の履歴に残る)
         idle_s = 0.0
         while True:
             if not self._wait_idle(engine, gen, idle_s):
@@ -576,11 +585,14 @@ class WarmHeads:
                 held[0] = False
                 turn.release()
 
-        def started():                                  # エンジンに命令を送った直後(制御の行を持っている)
-            with self._lock:
+        def may_send() -> bool:                         # GEN / BGEN を送る直前(generate_batched)。arriving() と同じ鍵:
+            with self._lock:                            # 取り消し済みなら送らない(QueueCancelled で番を譲る)
+                if cancel.is_set():
+                    return False
                 act.started = True
-            give_back()
-        cancel._strata_queue_started = started         # type: ignore[attr-defined]
+                return True
+        cancel._strata_send_gate = may_send            # type: ignore[attr-defined]
+        cancel._strata_queue_started = give_back       # type: ignore[attr-defined]   # 送った直後
         g = None
         try:
             with self._lock:

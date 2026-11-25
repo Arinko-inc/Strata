@@ -1939,6 +1939,9 @@ class StrataEngine:
                     deadline = getattr(cancel, "_strata_queue_deadline", None)
                     if deadline is not None and time.monotonic() >= deadline:
                         raise QueueWaitExpired("the inference queue wait deadline expired; retry later")
+                    gate = getattr(cancel, "_strata_send_gate", None)   # Arinko-inc: serve/warm_heads.py
+                    if gate is not None and not gate():
+                        raise QueueCancelled("cancelled before it was sent")
                     self._send(f"{head} {','.join(str(int(t)) for t in prompt)}")
                     if deadline is not None:
                         cancel._strata_queue_deadline = None
@@ -2068,6 +2071,9 @@ class StrataEngine:
                     deadline = getattr(cancel, "_strata_queue_deadline", None)
                     if deadline is not None and time.monotonic() >= deadline:
                         raise QueueWaitExpired("the inference queue wait deadline expired; retry later")
+                    gate = getattr(cancel, "_strata_send_gate", None)   # Arinko-inc: serve/warm_heads.py
+                    if gate is not None and not gate():
+                        raise QueueCancelled("cancelled before it was sent")
                     self.slot_live[slot] = live
                     self._last_done = None                  # (#879: this admission's DONE decides below)
                     self._send(f"{head} {','.join(str(int(t)) for t in prompt)}")

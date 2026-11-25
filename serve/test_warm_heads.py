@@ -292,6 +292,9 @@ class Stub:
         return True
 
     def generate(self, ids, max_new, sampling, cancel):
+        gate = getattr(cancel, "_strata_send_gate", None)
+        if gate is not None and not gate():
+            raise RuntimeError("cancelled before it was sent")
         self.sent.append((len(ids), max_new))
         started = getattr(cancel, "_strata_queue_started", None)
         if started is not None:
@@ -838,6 +841,43 @@ class ServerPath(FakeEngineCase):
         first = self.commands()[0].split()
         self.assertNotEqual(int(first[2]), n + 1, self.commands())     # 最初にエンジンに入ったのは要求
         self.assertLess(out["took"], 2.0)
+
+    def test_15_p2_a_warm_up_cancelled_just_before_its_send_is_not_sent(self):
+        """[P2] 登録のあと、命令を送る直前までに要求が来て取り消したら、GEN / BGEN も STOP も送らず、TRIES も数えない。"""
+        ids = self.prompt_ids(self.SYSTEM)
+        n = len(ids) - 30
+        self.start_wh()
+        self.wait_for("nothing to warm up")
+        wh = self.engine.warm_heads
+        fired = threading.Event()
+        real_tc = StrataEngine._take_control
+
+        def tc(engine, cancel, plen, *a, **kw):
+            ok = yield from real_tc(engine, cancel, plen, *a, **kw)
+            if ok and getattr(cancel, "_strata_request_id", None) is None and not fired.is_set():
+                fired.set()                              # 温めが制御の行を取った直後、送る前に同じ頭の要求が来る
+                wh.arriving(ids)
+            return ok
+        with mock.patch.object(StrataEngine, "_take_control", tc):
+            self.warm_again(ids, n)
+            self.wait_for("stopped")
+        wh.leaving()
+        self.assertTrue(fired.is_set())
+        self.assertIn("before the read started", " ".join(wh.log_lines))
+        self.assertEqual(self.commands(), [])
+        self.assertEqual(wh._attempts, 0)
+        self.assertEqual(self.ask(self.OTHER), "ok, done.")
+
+    def test_16_p3_a_head_that_fits_a_bgen_admission_is_read(self):
+        """[P3] BGEN はエンジンが GEN 1 に直してから prompt + 1 + 8 <= 文脈 を調べる。その境界の頭を飛ばさない。"""
+        self.start_wh()
+        self.wait_for("nothing to warm up")
+        ctx = self.engine.max_context
+        n = ctx - 1 - 1 - 8                              # len(頭 + [TURN]) + 1 + 8 == 文脈
+        self.warm_again(ids_of(5, n + 1), n)
+        self.wait_for("read in")
+        self.assertEqual(self.calls, [(n + 1, 2)])
+        self.assertTrue(self.commands()[0].startswith("BGEN"))
 
 
 if __name__ == "__main__":
