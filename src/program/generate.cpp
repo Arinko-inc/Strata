@@ -6191,17 +6191,24 @@ int main(int argc, char** argv) {
         { const char* mp = std::getenv("STRATA_PIPED_MTP"); bin.mtp_piped = mp != nullptr && mp[0] != '\0' && mp[0] != '0'; }
         return strata::program::batch_groups::resolve(bin);
     };
+    // L1 (Arinko-inc): 遠隔の段の主機で STRATA_PIPED_MTP が付いているとき(--batch-mtp と両方そろったときだけ下書きが乗る)。
+    // 付いていなければ下の 3 か所の判定は今のまま(遠隔の主機は split_same で --batch-mtp を断る)
+    const bool remote_pm = [&] {
+        const char* pe = std::getenv("STRATA_PIPED_MTP");
+        return remote_main && pe != nullptr && pe[0] != '\0' && pe[0] != '0';
+    }();
     const char* batch_mtp_env = std::getenv("STRATA_BATCH_MTP");
     bool batch_mtp = o.batch_mtp || (batch_mtp_env != nullptr && batch_mtp_env[0] != '\0' && batch_mtp_env[0] != '0');
     if (batch_mtp) {
         // (--pipeline-windows is already off with --batch slots)
         const char* why = o.batch < 2 ? "it needs --batch 2 or more" : o.mtp.empty() ? "it needs --mtp"
-                        : o.spec < 2 ? "it needs --spec T (T >= 2)" : split_same
+                        : o.spec < 2 ? "it needs --spec T (T >= 2)" : split_same && !remote_pm
                         ? "it needs each stage of a layer split on its own GPU"
                         : !o.serve ? "it needs --serve" : nullptr;
         // the groups it would run with (the default gives way to it: one group; a number or auto given pipelines;
         // STRATA_PIPED_MTP with one slot per group: the pipelined groups draft)
-        if (why == nullptr && !stages.empty() && batch_groups_for(true).groups > 1 && !batch_groups_for(true).mtp_piped)
+        if (why == nullptr && (!stages.empty() || remote_pm) && batch_groups_for(true).groups > 1 &&
+            !batch_groups_for(true).mtp_piped)
             why = batch_groups_for(true).mtp_dropped
                 ? "a layer split with --batch pipelines the slots in groups by default and the pipelined groups run no slot "
                   "drafts (4 streams on 2 GPUs: 25-30% faster than the serial MTP windows); --batch-groups 1 or "
@@ -6210,7 +6217,7 @@ int main(int argc, char** argv) {
                 : "it does not combine with --batch-groups (pipelined slot groups) yet";
         // (a layer split with helper-GPU expert caches has not been run with slot drafters.  --remote-expert-opt alone does
         // not count: its object is only made with a helper cache on CUDA0 (`remote_opt` below), so without one it does nothing)
-        if (why == nullptr && !stages.empty() && remote_caches)
+        if (why == nullptr && (!stages.empty() || remote_pm) && remote_caches)
             why = "it is not run with helper expert caches on a layer split";
         if (why != nullptr) {
             std::fprintf(stderr, "strata generate: WARNING: --batch-mtp is off: %s\n", why);
@@ -6220,7 +6227,7 @@ int main(int argc, char** argv) {
     // STRATA_PIPED_MTP (opt-in): --batch-mtp's proposals in the pipelined groups of a layer split, one slot per group;
     // each stage commits a group's window once the last stage has judged its proposals
     // (Verifier::batch_launch_rows / batch_commit_rows)
-    bool piped_mtp = batch_mtp && !stages.empty() && batch_groups_for(true).mtp_piped;   // (final once the slots that fit are known, below)
+    bool piped_mtp = batch_mtp && (!stages.empty() || remote_pm) && batch_groups_for(true).mtp_piped;   // (final once the slots that fit are known, below)
     // STRATA_PIPED_MTP=N: up to N proposals per slot and window (at most --spec - 1); the first always, each further
     // one while the draft layer is at least --spec-min-p sure of it, as the solo path extends its windows
     int pm_drafts = 0;
@@ -6430,6 +6437,9 @@ int main(int argc, char** argv) {
         if (why != nullptr) {
             std::fprintf(stderr, "strata generate: WARNING: STRATA_PIPED_MTP is off: %s\n", why);
             piped_mtp = false;
+            // L1: 遠隔の主機の --batch-mtp は組の下書きのためだけにある(直列の窓の MTP は遠隔では動かしていない)。
+            // 下書きが乗らないなら --batch-mtp も切り、下書き器の VRAM と枠の経路を今のまま(無し)にする
+            if (remote_main) batch_mtp = false;
         } else {
             std::fprintf(stderr, "strata generate: STRATA_PIPED_MTP: %d pipelined group%s of %d slot%s draft up to %d MTP "
                                  "proposal%s per slot each window\n", o.batch_groups, o.batch_groups == 1 ? "" : "s",
@@ -10022,6 +10032,9 @@ int main(int argc, char** argv) {
         // head (`ver_same`); and where a group's rows go: stage 0's out of rb_out0, the worker's back into rb_rx (both
         // the host side of the hand-offs, rb_hbf floats a row), the group's rows [hbase, hbase + S) of each
         bool remote_pipe = false;
+        // L1 (Arinko-inc): 遠隔の主機の組の下書き(--batch-mtp + STRATA_PIPED_MTP)が、相手の hello を見たうえで通ったか。
+        // 遠隔でない主機では常に真(局所の段分けの STRATA_PIPED_MTP は今のまま)。偽なら pmtp は偽で、組の窓は今と同じ KeepAll
+        bool pmtp_remote_ok = true;
         float* rb_out0 = nullptr;
         float* rb_rx = nullptr;
         int64_t rb_hbf = 0;
@@ -10465,7 +10478,7 @@ int main(int argc, char** argv) {
             for (int st = 1; st < n_stages; ++st) {
                 bool ok_s = false;
                 if (split_same) {
-                    ok_s = ver_same.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, std::max({o.spec, std::min(o.batch, (int) strata::kernels::kVerifyMaxT), probe_window_rows()}), err);
+                    ok_s = ver_same.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, batch_max_t(), err);   // (L1: 旗なしでは今の std::max({spec, min(batch, 8), probe_window_rows()}) と同じ値)
                 } else {
                     GpuStage& gs = *stages[(size_t) st - 1];
                     const strata::core::OnDevice on(gs.dev);
@@ -10675,7 +10688,9 @@ int main(int argc, char** argv) {
                     return 1;
                 }
                 // STRATA_PIPED_MTP: the rows a group's commit replays after the verdict, one hand-off row each
-                if (piped_mtp && bslot_ss.size() > 1 &&
+                // (L1: 遠隔の主機は局所の段が 1 つ(段 0 = vk)だけなので bslot_ss.size() は 1。段 0 の窓の確定を判定のあとへ回す
+                // 退避の領域をここで作る。head だけの ver_same には付けない)
+                if (piped_mtp && (bslot_ss.size() > 1 || remote_main) &&
                     !vk.init_deferred_commit(std::max<int>(strata::kernels::kVerifyMaxT, (1 + pm_drafts) * o.batch), err)) {
                     std::fprintf(stderr, "strata serve: STRATA_PIPED_MTP, stage %zu: %s\n", k + 1, err.c_str());
                     return 1;
@@ -13371,7 +13386,8 @@ int main(int argc, char** argv) {
                                          : "the worker runs the windows one by one: the groups overlap this process with "
                                            "the workers only");
                             // the pipelined groups' upstream opt-ins that a remote stage does not run (2.2.3)
-                            for (const char* v : {"STRATA_PIPED_MTP", "STRATA_PIPED_CONCURRENT", "STRATA_PIPED_READ_PIECE"})
+                            // (STRATA_PIPED_MTP: decided just below, L1)
+                            for (const char* v : {"STRATA_PIPED_CONCURRENT", "STRATA_PIPED_READ_PIECE"})
                                 if (const char* x = std::getenv(v); x != nullptr && x[0] != '\0' && x[0] != '0')
                                     std::fprintf(stderr, "strata serve: remote stage: %s is off over the link (the "
                                                          "remote groups read a prompt between serial windows)\n", v);
@@ -13379,6 +13395,36 @@ int main(int argc, char** argv) {
                     }
                     if (o.batch < 2) o.batch_groups = 1;
                     remote_pipe = o.batch > 0 && o.batch_groups > 1;
+                    if (remote_pm) {   // L1: STRATA_PIPED_MTP over the link - the worker's hello and the groups are final here
+                        namespace rpm = strata::program::remote_piped_mtp;
+                        rpm::Input pin;
+                        pin.remote_main = true;
+                        pin.remote_pipe = remote_pipe;
+                        pin.batch_mtp = batch_mtp;
+                        pin.pm_drafts = std::clamp(std::atoi(std::getenv("STRATA_PIPED_MTP")), 1,
+                                                   std::max(1, std::min(o.spec - 1, (int) strata::kernels::kVerifyMaxT - 1)));
+                        pin.batch = o.batch;
+                        pin.groups = o.batch_groups;
+                        pin.peer_batch_flags = remote_peer.batch_flags;
+                        // the rows one window can hold: the narrowest of this process's two verifiers and the worker's hello
+                        pin.peer_max_t = std::min({(int) remote_peer.max_t, ver.max_t(), ver_same.max_t()});
+                        { const char* sc = std::getenv("STRATA_BATCH_SELF_COMMIT"); pin.self_commit = sc != nullptr && sc[0] != '\0' && sc[0] != '0'; }
+                        pin.probe_rows = probe_r;
+                        const rpm::Result pr = rpm::decide(pin);
+                        if (pr.on) {
+                            pm_drafts = pr.drafts;
+                            std::fprintf(stderr, "strata serve: remote stage: STRATA_PIPED_MTP: the %d pipelined groups of %d slot%s "
+                                                 "draft up to %d proposal%s per slot (the worker keeps each window until its "
+                                                 "SlotCommit: kStageSlotDeferred)\n", o.batch_groups, o.batch / o.batch_groups,
+                                         o.batch / o.batch_groups == 1 ? "" : "s", pm_drafts, pm_drafts == 1 ? "" : "s");
+                        } else {
+                            pmtp_remote_ok = false;
+                            piped_mtp = false;
+                            batch_mtp = false;   // (it is only here for these drafts: see the --batch-mtp gate)
+                            std::fprintf(stderr, "strata serve: remote stage: STRATA_PIPED_MTP is off over the link: %s\n",
+                                         pr.why != nullptr ? pr.why : "(no reason)");
+                        }
+                    }
                     if (probe_r > 0) {   // STRATA_PIPE_PROBE_ROWS: refused unless every stage takes a full group's window
                         // the rows one window can carry: this process's verifiers and the worker's hello (the relay's
                         // spec; the stages behind it hold at most that, a relay refusing a wider next stage)
@@ -15037,6 +15083,13 @@ int main(int argc, char** argv) {
                     remote_link.close();
                     return false;
                 }
+                // L1: the drafts run on windows the worker keeps until their SlotCommit
+                if (remote_pipe && piped_mtp && pmtp_remote_ok && (remote_peer.batch_flags & strata::net::kStageBatchDeferred) == 0) {
+                    e = "remote stage: the worker's hello was refused: it does not keep deferred windows "
+                        "(kStageBatchDeferred), which STRATA_PIPED_MTP needs (start the main process again)";
+                    remote_link.close();
+                    return false;
+                }
                 // remote-batch-vision 4.3-8: the slots were agreed with a worker that keeps a position table per slot
                 if (o.vision && slot_positions_on &&
                     (remote_peer.batch_flags & strata::net::kStageBatchSlotPositions) == 0) {
@@ -15168,8 +15221,12 @@ int main(int argc, char** argv) {
             int first[strata::kernels::kVerifyMaxT] = {}, active[strata::kernels::kVerifyMaxT] = {};
             static size_t next_slot = 0;
             // Each MTP slot uses two rows; rotate slots when more than four are active.
+            // L1: 遠隔の主機で下書きが乗っているとき、読込の横の直列の窓も相手の窓の上限(中継・末端の --spec 4)を超えない。
+            // 超えると相手が断って主機が終わる(4 枠 x 2 行 = 8 行)。旗なし(batch_mtp が偽)・局所では今の kVerifyMaxT のまま
+            const int step_rows_cap = remote_main && batch_mtp
+                ? std::min({(int) strata::kernels::kVerifyMaxT, ver.max_t(), (int) remote_peer.max_t}) : (int) strata::kernels::kVerifyMaxT;
             int A = 0;
-            for (size_t offset = 0; offset < bs.size() && S + (batch_mtp ? 2 : 1) <= strata::kernels::kVerifyMaxT; ++offset) {
+            for (size_t offset = 0; offset < bs.size() && S + (batch_mtp ? 2 : 1) <= step_rows_cap; ++offset) {
                 const int b = (int) ((next_slot + offset) % bs.size());
                 if (bs[(size_t) b].active) {
                     first[A] = S;
@@ -15303,6 +15360,7 @@ int main(int argc, char** argv) {
                         return false;
                     }
                     sl.draft_ready = true;
+                    sl.n_drafts = 1;   // L1: この窓が作った下書きは 1 個(組の窓へ戻ったとき、前の組の n_drafts を引きずらない)
                 }
             }
             std::fflush(stdout);
@@ -15379,13 +15437,21 @@ int main(int argc, char** argv) {
         // their commit replays
         const int pmtp_rows_per_slot = 1 + pm_drafts;              // the slot's token + its proposals
         const int pmtp_rows_per_group = GS * pmtp_rows_per_slot;    // the group's slots
-        const bool pmtp = piped && piped_mtp && ver.deferred_commit_on() &&
+        // (L1: 遠隔の主機は相手の hello を見て decide が通ったとき(pmtp_remote_ok)だけ。局所では常に真)
+        const bool pmtp = piped && piped_mtp && pmtp_remote_ok && ver.deferred_commit_on() &&
                           pmtp_rows_per_group <= batch_max_t();
+        // L1: 遠隔の組の窓に載せられる行の数(自分の verifier 2 つと相手の hello の一番狭いもの。上限 kVerifyMaxT)
+        const int pmtp_cap = remote_pipe ? std::min({(int) strata::kernels::kVerifyMaxT, ver.max_t(), ver_same.max_t(),
+                                                     (int) remote_peer.max_t})
+                                         : (int) strata::kernels::kVerifyMaxT;
         if (piped && batch_mtp && !pmtp)   // #1413: said, not silent
             std::fprintf(stderr,
                          "strata generate: WARNING: --batch-groups %d runs the pipelined path, which builds one row per slot: "
                          "--batch-mtp's per-slot MTP drafts do not run there (their drafters still hold VRAM, about 0.9 GB per "
                          "slot). Drop --batch-mtp, or use --batch-groups 1.\n", o.batch_groups);
+        // L1: 遠隔の主機の --batch-mtp は組の下書きのためだけにある。下書きが乗らないなら読込の横の直列の窓も MTP をやめる
+        // (直列の窓は下書きの入った枠しか回せず、組の窓が下書きを作らないと "a live slot has no draft" で終わる)
+        if (remote_main && batch_mtp && !pmtp) batch_mtp = false;
         if (GS > strata::kernels::kVerifyMaxT && !batch_mtp) {   // (slots_in_windows keeps it so: a group's window is
             // PGroup's rows, and the serial windows reach only the first kVerifyMaxT slots)
             std::fprintf(stderr, "strata generate: --batch %d in %d group%s: more than %d rows per window\n",
@@ -15406,6 +15472,7 @@ int main(int argc, char** argv) {
             // hand-off rows [hbase, hbase + S)
             int rows[strata::kernels::kVerifyMaxT] = {};
             int hbase = 0;
+            int64_t tag = 0;                ///< L1: 遠隔の組の窓の札(SlotRun の tag。判定のあとの SlotCommit が名指す)
         };
         std::vector<PGroup> pg((size_t) (piped ? o.batch_groups : 0));
         std::vector<int> stage_group((size_t) n_pipe, -1);
@@ -15457,6 +15524,7 @@ int main(int argc, char** argv) {
             std::vector<Clock::time_point> launch0, sent, head0;
             double s0_ms = 0, link_ms = 0, head_ms = 0, out_sum = 0, busy_ms = 0, ov_ms = 0;
             int64_t n = 0, sends = 0;
+            int64_t acc = 0, tok = 0, rows = 0;   // L1: proposals kept / checked, and the rows sent, since the last line
             int out_max = 0;
             Clock::time_point tick{};
             bool busy = false, ov = false;   // the state at the last pump turn's start (it holds until the next)
@@ -15535,6 +15603,7 @@ int main(int argc, char** argv) {
             struct Blk { int b = 0, f = 0, n = 0, keep = 1; };
             std::vector<Blk> blks;
             std::vector<int> keep(bs.size(), 1);
+            const int64_t acc_before = bt_accepted, tok_before = bt_tokens;   // (L1: the 64-window line's own counts)
             for (int t = 0; t < G.S;) {
                 const int b = G.rows[t];
                 const int f = t;
@@ -15554,11 +15623,30 @@ int main(int argc, char** argv) {
                 bt_tokens += blk.n - 1;   // (proposals checked)
                 blks.push_back(blk);
             }
-            for (int k = 0; k < n_pipe; ++k)
+            // (L1: 遠隔の組は自分の層を持つ段 0 だけに確定を積む。head だけの段(ver_same)は確定する層を持たない)
+            for (int k = 0; k < (remote_pipe ? 1 : n_pipe); ++k)
                 if (!stage_verifier(k).batch_commit_rows(G.rows, G.S, G.hbase, keep.data(), G.tok, G.pos, err)) {
                     std::printf("ERR %s\n", err.c_str());
                     return false;
                 }
+            if (remote_pipe) {
+                // L1: 相手の段へ、この窓(札 G.tag)で枠ごとに受理した行の数を送る(一方向。相手は窓の札で退避した行から確定する)。
+                // 組に無い枠は 0。SlotRun は別の組の窓が出ていても送れる(送信の錠だけ。返事は読み手スレッドが読む)
+                int32_t keep32[strata::net::kStageSlotMax] = {};
+                for (const Blk& blk : blks) {
+                    if (blk.b >= remote_slots_n) {
+                        std::string m = "remote stage: a draft window kept rows of slot " + std::to_string(blk.b) +
+                                        ", past the " + std::to_string(remote_slots_n) + " slots the link agreed";
+                        return rpipe_fail(m);
+                    }
+                    keep32[blk.b] = (int32_t) blk.keep;
+                }
+                if (!remote_link.slot_commit(keep32, remote_slots_n, G.tag, err, true)) return rpipe_fail(err);
+                if (rpt.on) {
+                    rpt.acc += bt_accepted - acc_before;
+                    rpt.tok += bt_tokens - tok_before;
+                }
+            }
             // #879: a row with non-finite logits: the slot that owns it ends, nothing of it is emitted
             for (int t = 0; t < G.S; ++t)
                 if (vk.nonfinite_in(t)) {
@@ -15702,7 +15790,10 @@ int main(int argc, char** argv) {
                     // link while a window is out (2.2.8: pipe_drain before any other message)
                     int32_t s32[strata::kernels::kVerifyMaxT] = {};
                     for (int t = 0; t < G.S; ++t) s32[t] = (int32_t) G.rows[t];
-                    if (!rpipe->send(gi, G.S, s32, G.tok, G.pos, strata::net::kStageSlotKeepAll, ++remote_slot_tag,
+                    // L1: 下書きの組は確定を判定のあとへ回す窓(kStageSlotDeferred)で送り、札を覚える。SlotCommit が名指す
+                    G.tag = ++remote_slot_tag;
+                    if (!rpipe->send(gi, G.S, s32, G.tok, G.pos,
+                                     pmtp ? strata::net::kStageSlotDeferred : strata::net::kStageSlotKeepAll, G.tag,
                                      rb_out0 + (size_t) G.hbase * (size_t) rb_hbf, (size_t) G.S * (size_t) rb_hbf,
                                      rb_rx + (size_t) G.hbase * (size_t) rb_hbf, (size_t) G.S * (size_t) rb_hbf, err))
                         return rpipe_fail(err);
@@ -15711,6 +15802,7 @@ int main(int argc, char** argv) {
                         const Clock::time_point now = Clock::now();
                         rpt.s0_ms += rpt_ms(rpt.launch0[(size_t) gi], now);
                         rpt.sent[(size_t) gi] = now;
+                        rpt.rows += G.S;
                         const int out = rpipe->outstanding();
                         rpt.out_sum += out;
                         rpt.out_max = std::max(rpt.out_max, out);
@@ -15788,9 +15880,15 @@ int main(int argc, char** argv) {
                                              "window was out %.0f%% of its time\n", o.batch_groups, GS, rpt.s0_ms / 64,
                                      rpt.link_ms / 64, rpt.head_ms / 64, rpt.out_sum / (double) std::max<int64_t>(rpt.sends, 1),
                                      rpt.out_max, 100.0 * rpt.ov_ms / std::max(rpt.busy_ms, 1e-9));
+                        // L1: 下書きの組だけ、上の行(段階 0 の計測と並べて読む)に続けて 1 行足す。旗なしでは出ない
+                        if (pmtp)
+                            std::fprintf(stderr, "strata remote: those 64 windows carried %.2f rows each (deferred windows); "
+                                                 "MTP proposals kept %lld of %lld\n", (double) rpt.rows / 64.0,
+                                         (long long) rpt.acc, (long long) rpt.tok);
                         rpt.s0_ms = rpt.link_ms = rpt.head_ms = rpt.out_sum = rpt.busy_ms = rpt.ov_ms = 0;
                         rpt.sends = 0;
                         rpt.out_max = 0;
+                        rpt.acc = rpt.tok = rpt.rows = 0;
                     }
                 }
             }
@@ -15846,6 +15944,14 @@ int main(int argc, char** argv) {
                         G.hbase = pmtp_rows_per_group * pick;
                         G.S = 0;
                         G.active = 0;
+                        // L1: 遠隔の組は、動いている枠の数で窓の行の上限(pmtp_cap)に収まる下書きの数に切る(全枠が同じ数)。
+                        // 局所の組は今のまま(各段が kVerifyMaxT 行を受ける)
+                        int pm_fit = pm_drafts;
+                        if (remote_pipe) {
+                            int act = 0;
+                            for (int t = 0; t < GS; ++t) act += bs[(size_t) (pick * GS + t)].active ? 1 : 0;
+                            pm_fit = strata::program::remote_piped_mtp::drafts_that_fit(act, pm_drafts, pmtp_cap);
+                        }
                         for (int t = 0; t < GS; ++t) {
                             const int b = pick * GS + t;
                             const BSlot& sl = bs[(size_t) b];
@@ -15858,6 +15964,7 @@ int main(int argc, char** argv) {
                             int nd = sl.draft_ready && !sl.stop ? sl.n_drafts : 0;
                             nd = (int) std::min<int64_t>(nd, std::min<int64_t>(sl.max_new - sl.produced - 1,
                                                                                 o.max_context - sl.p - 2));
+                            if (remote_pipe) nd = std::min(nd, pm_fit);
                             for (int j = 0; j < nd; ++j) {
                                 G.rows[G.S] = b;
                                 G.tok[G.S] = sl.draft[(size_t) j];
@@ -15933,8 +16040,10 @@ int main(int argc, char** argv) {
                 strata::core::progress().busy.store(true);
                 if (batch_telemetry_enabled) stage_in_flight.launch(k, Clock::now());
                 if (rpt.on) (k == 0 ? rpt.launch0 : rpt.head0)[(size_t) pick] = Clock::now();
-                if (!(pmtp ? stage_verifier(k).batch_launch_rows(G.rows, G.S, G.hbase, G.tok, G.pos, err)
-                           : remote_pipe ? stage_verifier(k).batch_launch_slots(G.rows, G.S, G.hbase, G.tok, G.pos, err)
+                // (L1: 遠隔の組の head だけの段(ver_same, k == 1)は確定する層を持たないので、下書きの組でも batch_launch_slots)
+                if (!((pmtp && !(remote_pipe && k == 1))
+                          ? stage_verifier(k).batch_launch_rows(G.rows, G.S, G.hbase, G.tok, G.pos, err)
+                          : remote_pipe ? stage_verifier(k).batch_launch_slots(G.rows, G.S, G.hbase, G.tok, G.pos, err)
                            : stage_verifier(k).batch_launch(pick * GS, G.S, G.tok, G.pos, err))) {
                     if (remote_pipe) return rpipe_fail(err);
                     std::printf("ERR %s\n", err.c_str());
