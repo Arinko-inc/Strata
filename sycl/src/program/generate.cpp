@@ -74,6 +74,7 @@ namespace strata::prefill { void set_nonresident_share(double share); }   // SYC
 #include "strata/core/verify.hpp"
 #include "strata/net/stage_link.hpp"     // remote stage (PR #1748): the SYCL worker's link
 #include "strata/net/stage_ckpt_store.hpp"   // its part of the main process's conversation checkpoints
+#include "strata/net/stage_deferred.hpp"     // L1: the worker's deferred windows (stage_worker_deferred.inc)
 #include "strata/core/logpos_ids.hpp"    // STRATA_LOGPOS_SPLIT_AT (measurement, off by default)
 #include "strata/core/mtp.hpp"
 #include "strata/prefill/prefill.hpp"
@@ -9856,6 +9857,10 @@ int main(int argc, char **argv) try {
                     return true;
                 };
             }
+            // L1 (Arinko-inc, strata-mesh IMPL-PLAN-2026-11-26-batch-drafts.md 3.5): the deferred windows
+            // (STRATA_WK_PIPED_MTP=1), 担当 S's file.  At this block's level, after the handlers above are set: what
+            // it declares outlives the block as the state above does.  Without the flag it sets nothing.
+#include "stage_worker_deferred.inc"
             // ==== end REMOTE-BATCH WORKER (C) ====
             strata::net::StageBuffers bufs;
             bufs.run_in = wk_in;

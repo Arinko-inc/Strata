@@ -57,6 +57,22 @@ inline constexpr uint32_t kStageBatchOverlap = 1u << 1;
 /// batch slot: a SlotSave copies the session's position table into the slot's with its state, and the slot's windows
 /// rotate by it (--vision with --batch; a relay sets it only when its next worker has it)
 inline constexpr uint32_t kStageBatchSlotPositions = 1u << 2;
+// ---- L1 (Arinko-inc, strata-mesh IMPL-PLAN-2026-11-26-batch-drafts.md 3.2): deferred windows.  Optional bits of
+// protocol 8 (its number stays 8): a side sends one only to a peer whose hello has kStageBatchDeferred, so old and new
+// sides mix without a refusal, and with none of them sent the bytes on the wire are protocol 8's as before.
+/// SlotRun's flags, bit 1: a deferred window.  The worker runs it, saves the rows its commit replays (its saved-rows
+/// region: the window's first row's slot) and keeps it uncommitted until a SlotCommit with kStageCommitDeferred names
+/// its tag; other deferred windows, on other slots, may run meanwhile.  A relay answers it late, as a kStageSlotKeepAll
+/// window (StageHandlers::slot_run_reply).  Never together with kStageSlotKeepAll.
+inline constexpr int64_t kStageSlotDeferred = 2;
+/// SlotCommit's header b, bit 0: this commit is for the deferred window whose tag is c (b = 0: the last window sent
+/// without a flag, as before).  It does not wait for the late replies before it (that window's reply is out: the main
+/// process decided from it).
+inline constexpr int64_t kStageCommitDeferred = 1;
+/// StageHello::batch_flags bit 3: this side takes kStageSlotDeferred windows and their commits by tag
+/// (StageHandlers::slot_commit_deferred is set; serve_stage clears the bit when it is not).  A relay sets it only when
+/// its next worker's hello has it too.
+inline constexpr uint32_t kStageBatchDeferred = 1u << 3;
 
 // (rows[n * w]: n rows of w floats in the link's row format, StageRows)
 enum class StageMsg : uint32_t {
@@ -81,12 +97,13 @@ enum class StageMsg : uint32_t {
     // ---- protocol 8: batch slots (--batch on every stage).  The worker keeps a session per slot for its layers; the
     // main process decides what each slot holds.  Replies keep the order of the messages (a SlotRun may be sent before
     // the previous one's reply is read: the replies come back in the order sent, each with its tag).
-    SlotRun = 16,     // a = S rows, b = flags (kStageSlotKeepAll), c = tag; payload: int32 slot[S] (row t is slot slot[t],
+    SlotRun = 16,     // a = S rows, b = flags (kStageSlotKeepAll or kStageSlotDeferred), c = tag; payload: int32 slot[S] (row t is slot slot[t],
                       // a slot's rows contiguous), int32 tokens[S], int64 pos[S], rows[S * handoff_floats]
     SlotRunOk = 17,   // a = the worker's time (us), c = the SlotRun's tag; payload: rows[S * handoff_floats]
     SlotCommit = 18,  // a = m (1 <= m <= the slots the link agreed; the main process sends that count, a relay passes m
-                      // on; slots from m on are not in the window), c = the tag of the window it commits (the last
-                      // SlotRun, sent without kStageSlotKeepAll); payload: int32 keep[m] (keep[s]: the rows of slot s
+                      // on; slots from m on are not in the window), b = 0 or kStageCommitDeferred, c = the tag of the
+                      // window it commits (b = 0: the last SlotRun, sent without a flag; kStageCommitDeferred: the
+                      // deferred window with that tag); payload: int32 keep[m] (keep[s]: the rows of slot s
                       // the window keeps, 0: not in it).  No reply: a failure comes back on the next SlotRun's,
                       // SlotSave's or SlotLoad's (a Reset does not drop it)
     SlotSave = 19,    // a = slot, b = L (the worker's session must be at L): the session's running state and its K/V
@@ -128,7 +145,7 @@ struct StageHello {
     /// answers; 0: none).  No side refuses for it: the link uses the fewer of the two hellos' (strata-mesh
     /// IMPL-PLAN-remote-batch.md section 3.7)
     int32_t batch_slots = 0;
-    uint32_t batch_flags = 0;     ///< kStageBatchKeepAll / kStageBatchOverlap / kStageBatchSlotPositions
+    uint32_t batch_flags = 0;     ///< kStageBatchKeepAll / kStageBatchOverlap / kStageBatchSlotPositions / kStageBatchDeferred
     char token[64] = {};          ///< the shared secret (STRATA_STAGE_TOKEN); the worker refuses a wrong one
 };
 #pragma pack(pop)
@@ -252,7 +269,8 @@ public:
 
     // ---- protocol 8: batch slots (strata-mesh IMPL-PLAN-remote-batch.md section 3)
     /// One batch window over S rows (row t: slot slots[t], token tokens[t] at pos[t]): send S rows of in_floats / S
-    /// floats each, receive S rows back - slot_run_send and slot_run_recv in one.  `flags`: kStageSlotKeepAll or 0.
+    /// floats each, receive S rows back - slot_run_send and slot_run_recv in one.  `flags`: kStageSlotKeepAll,
+    /// kStageSlotDeferred (only to a worker whose hello has kStageBatchDeferred: the caller checks it) or 0.
     bool slot_run(int S, const int32_t* slots, const int32_t* tokens, const int64_t* pos, int64_t flags, int64_t tag,
                   const float* rows_in, size_t in_floats, float* rows_out, size_t out_floats, std::string& err);
     /// The window out, its reply not read: the replies come back in the order the windows were sent (stage 2 sends the
@@ -262,7 +280,9 @@ public:
     /// The oldest window's reply: S rows into rows_out.  Its tag must be `tag` (else the link is out of step: failed).
     bool slot_run_recv(int64_t tag, int S, float* rows_out, size_t out_floats, std::string& err);
     /// The rows each slot keeps of window `tag` (keep[s], s < n; 0: not in it); n: the slots the link agreed.  One way.
-    bool slot_commit(const int32_t* keep, int n, int64_t tag, std::string& err);
+    /// `deferred` (L1): the window was sent with kStageSlotDeferred - the SlotCommit carries kStageCommitDeferred and the
+    /// worker commits the window `tag` names (else the last window sent without a flag, as before).
+    bool slot_commit(const int32_t* keep, int n, int64_t tag, std::string& err, bool deferred = false);
     /// The worker's session (at L) into slot `slot`: its running state and its K/V cells [0, L).
     bool slot_save(int slot, int64_t L, std::string& err);
     /// Slot `slot`'s cells [0, L) back into the worker's session, with the slot's own running state (ckpt_id 0) or that
@@ -426,12 +446,20 @@ struct StageHandlers {
     /// n <= the slots it agreed, and pads keep[] with zeros to its own capacity).  A failure is reported on the next slot
     /// message's reply.
     std::function<bool(const int32_t* keep, int n, std::string& err)> slot_commit;
+    /// optional (L1, strata-mesh IMPL-PLAN-2026-11-26-batch-drafts.md 3.2): the commit of the deferred window `tag`
+    /// (a SlotCommit with kStageCommitDeferred; keep[] as slot_commit's).  Set: this worker takes kStageSlotDeferred
+    /// windows (slot_run gets the flag, and a relay answers them late as kStageSlotKeepAll ones); unset: such a window is
+    /// "bad slot window", such a commit "bad slot commit", and serve_stage clears kStageBatchDeferred from the hello.
+    /// Called without waiting for the late replies (the window's own reply is out); a failure is reported as
+    /// slot_commit's is.
+    std::function<bool(const int32_t* keep, int n, int64_t tag, std::string& err)> slot_commit_deferred;
     /// The session (serve_stage has checked it is at L) into `slot`.
     std::function<bool(int slot, int64_t L, std::string& err)> slot_save;
     /// `slot` (and checkpoint part `ckpt_id`, 0: none) into the session; a part not held: an error starting with
     /// kStageCkptMissing.
     std::function<bool(int slot, int64_t L, int64_t ckpt_id, std::string& err)> slot_load;
-    /// optional (a relay worker, protocol 8 stage 2): with it, a SlotRun with kStageSlotKeepAll is answered late - slot_run
+    /// optional (a relay worker, protocol 8 stage 2): with it, a SlotRun with kStageSlotKeepAll (or, L1, with
+    /// kStageSlotDeferred, which keeps its rows uncommitted until its commit instead) is answered late - slot_run
     /// runs this worker's layers, sends the window on (slot_run_send) and keeps its rows, and returns without the next
     /// worker's rows; serve_stage lets the reply before it go out, then sends this window's reply on the replying thread,
     /// where slot_run_reply fills rows_out (S rows) from the next worker.  Replies go out in the order the windows came;

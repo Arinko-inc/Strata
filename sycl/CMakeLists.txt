@@ -251,6 +251,7 @@ target_link_libraries(strata_kernels PUBLIC strata_core)
 
 strata_resolve(_engine src/core/layer.cpp src/core/session.cpp src/core/expert_source.cpp src/core/remote_experts.cpp
                        src/core/expert_cache.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp
+                       src/core/verify_deferred.cpp   # L1 (Arinko-inc): this tree's own copy (a worker's deferred windows)
                        src/core/mtp.cpp src/core/conversation_snapshot.cpp src/core/conversation_state.cpp
                        src/core/conversation_memory.cpp   # 0.1.31: the conversation snapshots (#216)
                        src/core/arch_defaults.cpp src/core/vmm.cpp   # vmm.cpp is the port's stub: no driver VMM on Level Zero
@@ -291,6 +292,18 @@ target_include_directories(stage_link_batch_test PRIVATE ${STRATA_ROOT}/include)
 target_link_libraries(stage_link_batch_test PRIVATE Threads::Threads)
 add_test(NAME stage_link_batch_test COMMAND stage_link_batch_test)
 set_tests_properties(stage_link_batch_test PROPERTIES TIMEOUT 60)
+# L1 (Arinko-inc): the deferred windows over the link and the worker's table of them, the same tests as the top-level
+# build's (no GPU)
+strata_resolve(_stage_link_deferred_test src/net/stage_link_deferred_test.cpp src/net/stage_link.cpp)
+add_executable(stage_link_deferred_test ${_stage_link_deferred_test})
+target_include_directories(stage_link_deferred_test PRIVATE ${STRATA_ROOT}/include)
+target_link_libraries(stage_link_deferred_test PRIVATE Threads::Threads)
+add_test(NAME stage_link_deferred_test COMMAND stage_link_deferred_test)
+set_tests_properties(stage_link_deferred_test PROPERTIES TIMEOUT 60)
+strata_resolve(_stage_deferred_test src/net/stage_deferred_test.cpp)
+add_executable(stage_deferred_test ${_stage_deferred_test})
+target_include_directories(stage_deferred_test PRIVATE ${STRATA_ROOT}/include)
+add_test(NAME stage_deferred_test COMMAND stage_deferred_test)
 # a stand-in main process for one running worker (its image positions, its hashes): port-only, not a ctest
 strata_resolve(_stage_probe src/net/stage_probe.cpp src/net/stage_link.cpp)
 add_executable(stage_probe ${_stage_probe})

@@ -1222,8 +1222,9 @@ bool StageClient::slot_send_(int S, const int32_t* slots, const int32_t* tokens,
         err = "remote stage: a batch window without its slots, tokens, positions or rows";
         return false;
     }
-    if ((flags & ~kStageSlotKeepAll) != 0) {
-        err = "remote stage: a batch window's flags " + std::to_string(flags) + " (protocol 8 knows bit 0 only)";
+    if (flags != 0 && flags != kStageSlotKeepAll && flags != kStageSlotDeferred) {
+        err = "remote stage: a batch window's flags " + std::to_string(flags) +
+              " (protocol 8 knows bit 0, and bit 1 alone for a worker whose hello has kStageBatchDeferred)";
         return false;
     }
     // slot[S], token[S], pos[S] in one piece, then the rows in the link's format (send_rows: fp32 as they are)
@@ -1320,7 +1321,7 @@ bool StageClient::slot_run_recv(int64_t tag, int S, float* rows_out, size_t out_
     return slot_recv_(tag, S, rows_out, out_floats, err);
 }
 
-bool StageClient::slot_commit(const int32_t* keep, int n, int64_t tag, std::string& err) {
+bool StageClient::slot_commit(const int32_t* keep, int n, int64_t tag, std::string& err, bool deferred) {
     std::lock_guard<std::mutex> lk(send_mu_);
     if (!connected()) { err = "remote stage: not connected"; return false; }
     if (n < 1 || n > kStageSlotMax || keep == nullptr) {
@@ -1331,6 +1332,7 @@ bool StageClient::slot_commit(const int32_t* keep, int n, int64_t tag, std::stri
     StageHeader h;
     h.type = (uint32_t) StageMsg::SlotCommit;
     h.a = n;
+    h.b = deferred ? kStageCommitDeferred : 0;   // (L1: 0 is every SlotCommit before it)
     h.c = tag;
     h.bytes = (uint64_t) n * sizeof(int32_t);
     if (!send_msg(S(fd_), h, keep, (size_t) h.bytes, nullptr, 0, err)) { break_(); return false; }
@@ -1860,7 +1862,10 @@ int serve_stage(const std::string& bind_addr, int port, const std::string& token
                         const int64_t S = in.h.a;
                         const int64_t max_s =
                             (int64_t) (buf.run_floats / (size_t) std::max<int64_t>(buf.handoff_floats, 1));
-                        const bool fits = S >= 1 && S <= max_s && (in.h.b & ~kStageSlotKeepAll) == 0;
+                        // flags: none, kStageSlotKeepAll, or (L1) kStageSlotDeferred alone to a worker that takes it
+                        const bool flags_ok = in.h.b == 0 || in.h.b == kStageSlotKeepAll ||
+                                              (in.h.b == kStageSlotDeferred && (bool) h.slot_commit_deferred);
+                        const bool fits = S >= 1 && S <= max_s && flags_ok;
                         const size_t rows_bytes =
                             fits ? stage_rows_bytes(fmt, (size_t) S, (size_t) buf.handoff_floats) : 0;
                         if (!fits || in.h.bytes != (uint64_t) S * 16 + rows_bytes) {
@@ -1880,7 +1885,10 @@ int serve_stage(const std::string& bind_addr, int port, const std::string& token
                         }
                     } else if (type == StageMsg::SlotCommit) {
                         const int64_t m = in.h.a;   // (bounded first)
-                        if (m < 1 || m > kStageSlotMax || in.h.bytes != (uint64_t) m * 4) {
+                        // b: 0, or (L1) kStageCommitDeferred to a worker that takes it
+                        const bool b_ok = in.h.b == 0 ||
+                                          (in.h.b == kStageCommitDeferred && (bool) h.slot_commit_deferred);
+                        if (m < 1 || m > kStageSlotMax || in.h.bytes != (uint64_t) m * 4 || !b_ok) {
                             in.bad = "bad slot commit";
                             if (!drain(fd, in.h.bytes, in.err)) in.closed = true;
                         } else {
@@ -2123,8 +2131,10 @@ int serve_stage(const std::string& bind_addr, int port, const std::string& token
                 continue;
             }
             // protocol 8 stage 2: a late window's reply goes out before any other message is served (a SlotRun
-            // decides for itself: a late one lets it run on)
-            if (reply_is_slot && reply_out.valid() && type != StageMsg::SlotRun && !replies_out()) {
+            // decides for itself: a late one lets it run on; L1: so does a deferred window's SlotCommit, whose window's
+            // reply is out - the main process decided from it)
+            const bool deferred_commit = type == StageMsg::SlotCommit && in.h.b == kStageCommitDeferred;
+            if (reply_is_slot && reply_out.valid() && type != StageMsg::SlotRun && !deferred_commit && !replies_out()) {
                 release();
                 break;
             }
@@ -2159,6 +2169,8 @@ int serve_stage(const std::string& bind_addr, int port, const std::string& token
                     mine.batch_slots = 0;
                     mine.batch_flags = 0;
                 }
+                // L1: the deferred windows only with their commit's handler
+                if (!h.slot_commit_deferred) mine.batch_flags &= ~kStageBatchDeferred;
                 // (after the protocol check: an older peer's hello has its build text here)
                 if (const std::string r = ckpt_max_refusal(in.hello); !r.empty()) {
                     (void) reply_error(r);
@@ -2369,8 +2381,10 @@ int serve_stage(const std::string& bind_addr, int port, const std::string& token
             case StageMsg::SlotRun: {
                 const int S = (int) in.h.a;
                 // protocol 8 stage 2 (strata-mesh IMPL-PLAN-remote-batch-stage2.md 2.3.2): a relay answers a window
-                // with kStageSlotKeepAll late - its own layers now, the next worker's rows on the reply thread
-                const bool late = has_slots && h.slot_run_reply && (in.h.b & kStageSlotKeepAll) != 0;
+                // with kStageSlotKeepAll late - its own layers now, the next worker's rows on the reply thread.  L1: a
+                // kStageSlotDeferred window too (the reader let it in only when slot_commit_deferred is set)
+                const bool late =
+                    has_slots && h.slot_run_reply && (in.h.b & (kStageSlotKeepAll | kStageSlotDeferred)) != 0;
                 if (late) {
                     // a prompt chunk's reply reads the next worker's link on its thread: out first.  The window
                     // before this one's is not waited for yet (its thread may still wait on the next worker)
@@ -2447,6 +2461,16 @@ int serve_stage(const std::string& bind_addr, int port, const std::string& token
             case StageMsg::SlotCommit: {
                 // one way: a failure is the next slot message's error (a later commit is not applied over it)
                 std::string e;
+                if (deferred_commit) {
+                    // L1: the deferred window `c` names, at once - not behind the late replies (a relay's handler sends
+                    // it on over its next link's sending side; the replying thread reads only that link's other side).
+                    // The reader let it in only when slot_commit_deferred is set.
+                    if (!has_slots) slot_err = join_err(slot_err, kNoSlots);
+                    else if (slot_err.empty() && !h.slot_commit_deferred(in.keep32.data(), (int) in.h.a, in.h.c, e))
+                        slot_err = e.empty() ? std::string("the batch commit failed") : e;
+                    ++stats.slot_commits;
+                    break;
+                }
                 if (!replies_out()) { keep = false; break; }
                 if (!has_slots) slot_err = join_err(slot_err, kNoSlots);
                 else if (slot_err.empty() && !h.slot_commit(in.keep32.data(), (int) in.h.a, e))
