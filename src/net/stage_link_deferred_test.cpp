@@ -517,6 +517,75 @@ int main() {
         c.close();
     }
 
+    // ---- 8. (合流 D) slot_run_tag: each SlotRun's tag, right before its slot_run; the bytes on the wire as before
+    {
+        StageHandlers h = base;
+        h.slot_commit_deferred = [&](const int32_t* keep, int n, int64_t tag, std::string&) {
+            log.add("dcommit:" + std::to_string(tag) + ":" + keep_text(keep, n));
+            return true;
+        };
+        h.slot_run_tag = [&](int64_t tag) { log.add("tag:" + std::to_string(tag)); };
+        h.hello = [](const StageHello&, StageHello& m, std::string&) {   // (its saved rows a slot: 2)
+            m = hello_of();
+            m.batch_slots = 4;
+            m.batch_flags = with_deferred_rows(kStageBatchKeepAll | kStageBatchDeferred, 2);
+            return true;
+        };
+        Worker wk;
+        check(wk.start(h, buf), "8. a worker with slot_run_tag listens on loopback");
+        StageClient c;
+        StageHello peer;
+        std::string e;
+        check(c.connect(wk.where, mine, peer, e) && (peer.batch_flags & kStageBatchDeferred) != 0 &&
+                  stage_deferred_rows(peer.batch_flags) == 2,
+              "8. its hello says 2 rows a slot (bits 8..11) with kStageBatchDeferred");
+        log.clear();
+        Win a = make({0, 1}, 1.0f), b = make({2}, 2.0f), k = make({3}, 3.0f);
+        const uint64_t out0 = c.stats().bytes_out;
+        bool ok = window(c, a, kStageSlotDeferred, 41, e) && window(c, b, 0, 42, e);
+        const int32_t kb[3] = {0, 0, 1}, ka[2] = {1, 1};
+        ok = ok && c.slot_commit(kb, 3, 42, e) && c.slot_commit(ka, 2, 41, e, true) && window(c, k, kStageSlotKeepAll, 43, e);
+        const std::vector<std::string> got = log.all();
+        const std::vector<std::string> want = {"tag:41", "run:2:0", "tag:42", "run:0:2", "commit:0,0,1", "dcommit:41:1,1",
+                                               "tag:43", "run:1:3"};
+        check(ok && got == want, "8. slot_run_tag gets each window's tag before its slot_run (deferred, plain, KeepAll)");
+        if (got != want) {
+            std::string t;
+            for (const std::string& x : got) t += " " + x;
+            std::printf("    (%s; the log:%s)\n", e.c_str(), t.c_str());
+        }
+        // the same messages to a worker without the hook: the same bytes out (the hook changes nothing on the wire)
+        const uint64_t sent_with = c.stats().bytes_out - out0;
+        c.close();
+        StageHandlers h2 = base;
+        h2.slot_commit_deferred = h.slot_commit_deferred;
+        Worker wk2;
+        check(wk2.start(h2, buf), "8. the same worker without slot_run_tag listens on loopback");
+        StageClient c2;
+        check(c2.connect(wk2.where, mine, peer, e), "8. (the main process connects)");
+        log.clear();
+        const uint64_t out1 = c2.stats().bytes_out;
+        ok = window(c2, a, kStageSlotDeferred, 41, e) && window(c2, b, 0, 42, e) && c2.slot_commit(kb, 3, 42, e) &&
+             c2.slot_commit(ka, 2, 41, e, true) && window(c2, k, kStageSlotKeepAll, 43, e);
+        const std::vector<std::string> want2 = {"run:2:0", "run:0:2", "commit:0,0,1", "dcommit:41:1,1", "run:1:3"};
+        check(ok && log.all() == want2 && c2.stats().bytes_out - out1 == sent_with,
+              "8. without slot_run_tag: the same handlers in the same order, the same bytes out");
+        c2.close();
+        // a worker without slot_commit_deferred: serve_stage clears the rows with the bit
+        StageHandlers h3 = base;
+        h3.hello = h.hello;
+        Worker wk3;
+        check(wk3.start(h3, buf), "8. a worker without slot_commit_deferred listens on loopback");
+        StageClient c3;
+        check(c3.connect(wk3.where, mine, peer, e) && peer.batch_flags == kStageBatchKeepAll,
+              "8. ... its hello keeps neither kStageBatchDeferred nor the rows");
+        c3.close();
+        check(stage_deferred_rows(with_deferred_rows(kStageBatchDeferred, 20)) == 15 &&
+                  stage_deferred_rows(with_deferred_rows(kStageBatchDeferredRowsMask, 0)) == 0 &&
+                  (with_deferred_rows(kStageBatchKeepAll, 3) & 0xffu) == kStageBatchKeepAll,
+              "8. with_deferred_rows: clamped to 4 bits, the other bits kept");
+    }
+
     std::printf(g_fail == 0 ? "all passed (0 failed)\n" : "%d FAILED\n", g_fail);
     return g_fail == 0 ? 0 : 1;
 }
