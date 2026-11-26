@@ -144,14 +144,18 @@ bool Verifier::capture_deferred(const int* rows, int S, int hbase, std::string& 
     const auto key = bkey(rows, S, hbase);
     // Graphs of layouts whose window graph (exec_bm_, keyed with hbase 0: run_slot_rows) the LRU limit evicted: drop
     // them, once, before making a new one (the window graph's own eviction waits for the queue; so does this).  A
-    // layout still held by a window is the most recently used: not evicted unless 64 others came since.
+    // layout held by a window whose commit has not run (dc_pending_; 合流 D, Sol P2) is never evicted.
     {
         std::vector<std::vector<int>> stale;
         auto window_key = [](std::vector<int> k) { k[0] = 0; return k; };
+        auto held = [&](const std::vector<int>& k) {   // (the key without its doorbell variant)
+            return dc_pending_.count(std::vector<int>(k.begin(), k.end() - 1)) != 0;
+        };
         for (const auto& kv : save_bm_)
-            if (kv.first != key && exec_bm_.find(window_key(kv.first)) == exec_bm_.end()) stale.push_back(kv.first);
+            if (kv.first != key && !held(kv.first) && exec_bm_.find(window_key(kv.first)) == exec_bm_.end())
+                stale.push_back(kv.first);
         for (const auto& kv : dcommit_bm_)
-            if (kv.first != key && exec_bm_.find(window_key(kv.first)) == exec_bm_.end() &&
+            if (kv.first != key && !held(kv.first) && exec_bm_.find(window_key(kv.first)) == exec_bm_.end() &&
                 std::find(stale.begin(), stale.end(), kv.first) == stale.end())
                 stale.push_back(kv.first);
         if (!stale.empty()) {
@@ -348,6 +352,7 @@ bool Verifier::run_slot_rows_deferred(const int* rows, int S, int save_base, con
         err = std::string("verify: deferred save launch: ") + dpct::get_error_string_dummy(le);
         return false;
     }
+    dc_pending_.insert(batch_key(rows, S, save_base));   // (its graphs stay until its commit)
     return true;
 }
 catch (sycl::exception const& exc) {
@@ -387,6 +392,7 @@ bool Verifier::batch_commit_rows(const int* rows, int S, int hbase, const int* k
         err = std::string("verify: deferred commit launch: ") + dpct::get_error_string_dummy(le);
         return false;
     }
+    dc_pending_.erase(batch_key(rows, S, hbase));
     if (ple_stage())   // the host's side of the commit (the hash's last two tokens), the accepted rows only
         for (int t = 0; t < S;) {
             const int first = t;
@@ -413,6 +419,7 @@ void Verifier::free_deferred() {
             if (kv.second) delete (kv.second);
         save_bm_.clear();
         dcommit_bm_.clear();
+        dc_pending_.clear();
         if (dc_arena_) sycl::free(dc_arena_, dpct::get_in_order_queue());
         if (h_commitd_) sycl::free(h_commitd_, dpct::get_in_order_queue());
     } catch (...) {

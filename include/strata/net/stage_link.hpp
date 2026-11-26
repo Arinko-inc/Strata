@@ -73,6 +73,18 @@ inline constexpr int64_t kStageCommitDeferred = 1;
 /// (StageHandlers::slot_commit_deferred is set; serve_stage clears the bit when it is not).  A relay sets it only when
 /// its next worker's hello has it too.
 inline constexpr uint32_t kStageBatchDeferred = 1u << 3;
+/// StageHello::batch_flags bits 8..11 (合流 D), with kStageBatchDeferred: the most rows one slot may have in a deferred
+/// window there (the worker's saved rows a slot, STRATA_WK_PIPED_MTP_ROWS; a relay: the fewer of its own and its next
+/// worker's).  0: not said (a main process then assumes the workers' default).  Cleared with kStageBatchDeferred.
+inline constexpr uint32_t kStageBatchDeferredRowsShift = 8;
+inline constexpr uint32_t kStageBatchDeferredRowsMask = 0xfu << kStageBatchDeferredRowsShift;
+inline constexpr int stage_deferred_rows(uint32_t batch_flags) {
+    return (int) ((batch_flags & kStageBatchDeferredRowsMask) >> kStageBatchDeferredRowsShift);
+}
+inline constexpr uint32_t with_deferred_rows(uint32_t batch_flags, int rows) {
+    return (batch_flags & ~kStageBatchDeferredRowsMask) |
+           (((uint32_t) (rows < 0 ? 0 : rows > 15 ? 15 : rows) << kStageBatchDeferredRowsShift) & kStageBatchDeferredRowsMask);
+}
 
 // (rows[n * w]: n rows of w floats in the link's row format, StageRows)
 enum class StageMsg : uint32_t {
@@ -453,6 +465,9 @@ struct StageHandlers {
     /// Called without waiting for the late replies (the window's own reply is out); a failure is reported as
     /// slot_commit's is.
     std::function<bool(const int32_t* keep, int n, int64_t tag, std::string& err)> slot_commit_deferred;
+    /// optional (L1, 合流 D): told each SlotRun's tag (its header c) right before slot_run is called for it, on the same
+    /// thread (a deferred window is kept by that tag, and its SlotCommit names it).  Unset: nothing changes
+    std::function<void(int64_t tag)> slot_run_tag;
     /// The session (serve_stage has checked it is at L) into `slot`.
     std::function<bool(int slot, int64_t L, std::string& err)> slot_save;
     /// `slot` (and checkpoint part `ckpt_id`, 0: none) into the session; a part not held: an error starting with

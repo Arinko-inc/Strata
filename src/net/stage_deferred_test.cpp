@@ -125,6 +125,17 @@ int main() {
         check(!r2.add(tail, e) && r2.empty() && e.find("past the last") != std::string::npos,
               "rows 2: saved rows from slot 3's region past the end (6 + 3 > 8) refused");
     }
+    // find (合流 D): the held window by tag, without taking it
+    {
+        sn::DeferredWindows f;
+        f.reset(4, 2);
+        sn::DeferredWindow x = win(51, {0, 0}), y = win(52, {2});
+        check(f.add(x, e) && f.add(y, e), "find: two windows held");
+        const sn::DeferredWindow* fx = f.find(51);
+        check(fx != nullptr && fx->tag == 51 && fx->S == 2 && f.find(52) != nullptr && f.find(53) == nullptr &&
+                  f.size() == 2,
+              "find: by tag, nullptr for a tag not held, nothing taken");
+    }
     // take: by tag, any order
     {
         sn::DeferredWindow o;

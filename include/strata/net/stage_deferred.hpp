@@ -74,6 +74,8 @@ public:
     bool add(DeferredWindow& w, std::string& err);
     /// The held window `tag` into `out`, no longer held.  False + err when no held window has that tag.
     bool take(int64_t tag, DeferredWindow& out, std::string& err);
+    /// the held window `tag` (still held), or nullptr (合流 D: a commit checks keep[] against it before taking it)
+    const DeferredWindow* find(int64_t tag) const;
     /// whether a held window has a row on `slot`
     bool slot_held(int slot) const;
     bool empty() const;
@@ -159,6 +161,11 @@ inline bool DeferredWindows::take(int64_t tag, DeferredWindow& out, std::string&
         }
     err = "stage worker: bad slot commit: no deferred window has tag " + std::to_string((long long) tag);
     return false;
+}
+inline const DeferredWindow* DeferredWindows::find(int64_t tag) const {
+    for (const DeferredWindow& h : held_)
+        if (h.tag == tag) return &h;
+    return nullptr;
 }
 inline bool DeferredWindows::slot_held(int slot) const {
     for (const DeferredWindow& h : held_)

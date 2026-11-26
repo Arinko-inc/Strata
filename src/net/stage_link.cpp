@@ -2170,7 +2170,7 @@ int serve_stage(const std::string& bind_addr, int port, const std::string& token
                     mine.batch_flags = 0;
                 }
                 // L1: the deferred windows only with their commit's handler
-                if (!h.slot_commit_deferred) mine.batch_flags &= ~kStageBatchDeferred;
+                if (!h.slot_commit_deferred) mine.batch_flags &= ~(kStageBatchDeferred | kStageBatchDeferredRowsMask);
                 // (after the protocol check: an older peer's hello has its build text here)
                 if (const std::string r = ckpt_max_refusal(in.hello); !r.empty()) {
                     (void) reply_error(r);
@@ -2395,7 +2395,10 @@ int serve_stage(const std::string& bind_addr, int port, const std::string& token
                     bool ok = false;
                     if (!pending_err.empty() || !pos_err.empty() || !slot_err.empty())
                         e = join_err(take_pending(), take_slot_err());
-                    else ok = h.slot_run(S, in.slots32.data(), in.tok32.data(), in.pos64.data(), in.h.b, e);
+                    else {
+                        if (h.slot_run_tag) h.slot_run_tag(in.h.c);   // (L1)
+                        ok = h.slot_run(S, in.slots32.data(), in.tok32.data(), in.pos64.data(), in.h.b, e);
+                    }
                     if (!ok) {   // (nothing went on: answered now, after the reply before it - reply_error waits)
                         keep = reply_error(e.empty() ? std::string("the batch window failed") : e);
                         break;
@@ -2439,7 +2442,10 @@ int serve_stage(const std::string& bind_addr, int port, const std::string& token
                 if (!has_slots) e = kNoSlots;
                 else if (!pending_err.empty() || !pos_err.empty() || !slot_err.empty())
                     e = join_err(take_pending(), take_slot_err());
-                else ok = h.slot_run(S, in.slots32.data(), in.tok32.data(), in.pos64.data(), in.h.b, e);
+                else {
+                    if (h.slot_run_tag) h.slot_run_tag(in.h.c);   // (L1)
+                    ok = h.slot_run(S, in.slots32.data(), in.tok32.data(), in.pos64.data(), in.h.b, e);
+                }
                 if (!ok) {
                     keep = reply_error(e.empty() ? std::string("the batch window failed") : e);
                     break;

@@ -13408,10 +13408,13 @@ int main(int argc, char** argv) {
                         pin.peer_batch_flags = remote_peer.batch_flags;
                         // the rows one window can hold: the narrowest of this process's two verifiers and the worker's hello
                         pin.peer_max_t = std::min({(int) remote_peer.max_t, ver.max_t(), ver_same.max_t()});
-                        // the workers' saved rows a slot (合流 D): the hello does not carry it - the workers' default (2),
+                        // the rows a slot the workers take in a deferred window (合流 D): the relay's hello says the fewer
+                        // of its own and its next worker's (bits 8..11); a hello without them: the workers' default (2),
                         // or STRATA_WK_PIPED_MTP_ROWS set here as on the workers
-                        pin.peer_slot_rows = strata::net::wk_piped_mtp_rows(std::getenv("STRATA_WK_PIPED_MTP_ROWS"),
-                                                                            (int) strata::net::kDeferredMaxRows);
+                        pin.peer_slot_rows = strata::net::stage_deferred_rows(remote_peer.batch_flags);
+                        if (pin.peer_slot_rows <= 0)
+                            pin.peer_slot_rows = strata::net::wk_piped_mtp_rows(std::getenv("STRATA_WK_PIPED_MTP_ROWS"),
+                                                                                (int) strata::net::kDeferredMaxRows);
                         { const char* sc = std::getenv("STRATA_BATCH_SELF_COMMIT"); pin.self_commit = sc != nullptr && sc[0] != '\0' && sc[0] != '0'; }
                         pin.probe_rows = probe_r;
                         rpm::Result pr = rpm::decide(pin);
@@ -15298,7 +15301,9 @@ int main(int argc, char** argv) {
             if (!drive.d.usage.empty() && !ajob && !in_prompt_read && (++ba_window % o.adapt_every) == 0 && pending.empty())
                 adapt_run.th = std::thread([&] { adapt_run.ok = adapt(); });
             // Accept the proposal only when the target picked it and there is room to emit both tokens.
-            std::vector<int> keep(bs.size(), 0);
+            // (合流 D, Sol P1: commit_slot_prefixes reads one entry per slot the verifier carved - and a remote stage's
+            // commit sends them on - which may be more than the slots agreed with the worker (bs): zeros past those)
+            std::vector<int> keep(std::max(bs.size(), (size_t) std::max(ver.n_slots(), 0)), 0);
             for (int a = 0; a < A; ++a) {
                 const int b = active[a], i = first[a];
                 const BSlot& sl = bs[(size_t) b];
