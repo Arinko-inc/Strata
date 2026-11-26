@@ -249,6 +249,7 @@ std::string hx(uint64_t v) {
     return b;
 }
 bool contains(const std::string& s, const char* t) { return s.find(t) != std::string::npos; }
+bool contains(const std::string& s, const std::string& t) { return s.find(t) != std::string::npos; }
 
 }  // namespace
 
@@ -426,8 +427,9 @@ int main(int argc, char** argv) {
         e.clear();
         took = pr.link.slot_save(3, 0, e);
         verdict(!took && pr.link.connected(), "a slot save while a deferred window is held is refused (" + e + ")");
-        // (4) group 1's deferred window runs meanwhile, then a commit that names no held window (slot 0 alone keeps
-        // rows: group 0's window needs slot 1 too - it is dropped uncommitted, the next window brings the error)
+        // (4) group 1's deferred window runs meanwhile, then group 0's commit with a keep[] that does not fit its
+        // window (slot 0 alone keeps rows: the window needs slot 1 too).  合流 D: nothing is committed and group 0's
+        // window stays held; the next window brings the error, and group 1's commit sent after it is skipped
         e.clear();
         ok = pr.run(g1, kStageSlotDeferred, e);
         const int64_t g1_tag = pr.tag;
@@ -442,29 +444,43 @@ int main(int argc, char** argv) {
         Probe::Win g1b = pr.window(1, at);
         std::string e3;
         took = pr.run(g1b, kStageSlotDeferred, e3);
-        verdict(sent && !took && contains(e3, "bad slot commit") && pr.link.connected(),
-                "a deferred commit that keeps rows on one of its window's two slots: the next window's error (" + e3 + ")");
+        verdict(sent && !took && contains(e3, "bad slot commit") && contains(e3, "nothing committed") &&
+                    pr.link.connected(),
+                "a deferred commit whose keep[] does not fit its window: nothing committed, the next window's error (" +
+                    e3 + ")");
         // (5) the link goes on: group 1's commit above was skipped with the error (serve_stage reports one at a time),
         // so its window is still held - commit it again, then its next window runs
         e.clear();
         ok = pr.link.slot_commit(k1, kSlots, g1_tag, e, true) && pr.run(g1b, kStageSlotDeferred, e);
         const int64_t g1b_tag = pr.tag;
         verdict(ok, "... and the link goes on: group 1's commit, then its next deferred window " + e);
-        // (6) a commit on slots no window holds (group 0's was dropped)
+        // (6) a commit naming a tag no window was held under: the next window's error.  Group 1's commit sent after it
+        // is skipped (its window stays held), and group 0's window - kept through (4) - is still there
         const int32_t k0[kSlots] = {2, 2, 0, 0};
+        const int64_t never = g1b_tag + 1000003;   // (no window was ever sent with it)
         e.clear();
         e2.clear();
-        ok = pr.link.slot_commit(k0, kSlots, g0_tag, e, true) && pr.link.slot_commit(k1, kSlots, g1b_tag, e2, true);
+        ok = pr.link.slot_commit(k0, kSlots, never, e, true) && pr.link.slot_commit(k1, kSlots, g1b_tag, e2, true);
         at[2] = at[3] = 4;
         Probe::Win g1c = pr.window(1, at);
         e3.clear();
         took = pr.run(g1c, kStageSlotKeepAll, e3);
-        verdict(ok && !took && contains(e3, "no deferred window holds it") && pr.link.connected(),
-                "a deferred commit on slots no window holds: the next window's error (" + e3 + ")");
-        // (7) a reset with a window held (group 1's second window, whose commit was skipped with the error above)
+        verdict(ok && !took && contains(e3, "no deferred window has tag " + std::to_string((long long) never)) &&
+                    pr.link.connected(),
+                "a deferred commit with a tag no window holds: the next window's error (" + e3 + ")");
+        // (7) a reset with both windows held (group 0's since (4), group 1's second since its commit was skipped)
         e.clear();
         took = pr.link.reset({}, e);
-        verdict(!took && contains(e, "deferred batch windows wait"), "a reset while a deferred window is held is refused (" + e + ")");
+        verdict(!took && contains(e, "while 2 deferred batch windows wait"),
+                "a reset while deferred windows are held is refused (" + e + ")");
+        // (8) group 0's window, refused in (4) with a keep[] that did not fit, commits by its own tag now; then
+        // group 1's: a reset goes through, nothing held
+        e.clear();
+        ok = pr.link.slot_commit(k0, kSlots, g0_tag, e, true) && pr.link.slot_commit(k1, kSlots, g1b_tag, e, true);
+        e2.clear();
+        took = ok && pr.link.reset({}, e2);
+        verdict(took, "group 0's window (kept through the refused commit) and group 1's commit by their tags, then a "
+                      "reset goes through (" + e + e2 + ")");
     }
     // a new connection drops what was held, and the runs give the same rows again
     {

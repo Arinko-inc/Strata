@@ -31,6 +31,7 @@ strata::net::DeferredWindows wk_dfr;   // per connection: the windows held uncom
 bool wk_dfr_on = false;                // the saved rows are allocated: this worker can keep deferred windows
 bool wk_dfr_link = false;              // this link's hello said kStageBatchDeferred
 int64_t wk_dfr_cur_tag = 0;            // the tag of the SlotRun being served (StageHandlers::slot_run_tag)
+int wk_dfr_link_rows = 0;              // the rows a slot this link's hello said (a relay: kept by its next worker too)
 int64_t wk_dfr_windows = 0, wk_dfr_commits = 0, wk_dfr_rows = 0, wk_dfr_kept = 0, wk_dfr_held_sum = 0;
 int wk_dfr_held_max = 0;
 double wk_dfr_run_ms = 0, wk_dfr_commit_ms = 0;
@@ -75,6 +76,7 @@ if (wk_dfr_on) {
         wk_dfr.reset(0, 0);
         wk_dfr_link = false;
         wk_dfr_cur_tag = 0;
+        wk_dfr_link_rows = 0;
     };
     hs.slot_run_tag = [&](int64_t tag) { wk_dfr_cur_tag = tag; };
     // what a message that needs every window committed gets while some are held
@@ -99,6 +101,7 @@ if (wk_dfr_on) {
             const int next_rows = stage_relay ? strata::net::stage_deferred_rows(next_batch_flags) : 0;
             if (next_rows > 0) rows = std::min(rows, next_rows);
             mine.batch_flags = strata::net::with_deferred_rows(mine.batch_flags | strata::net::kStageBatchDeferred, rows);
+            wk_dfr_link_rows = rows;
             wk_dfr.reset(wk_slot_n, wk_dfr_slot_rows);
         }
         std::fprintf(stderr, "strata stage worker: deferred batch windows: %s\n",
@@ -120,6 +123,13 @@ if (wk_dfr_on) {
         if (stage_relay && wk_dfr_link && (next_batch_flags & strata::net::kStageBatchDeferred) == 0) {
             e = "relay: the next worker no longer keeps deferred batch windows (kStageBatchDeferred), which this link "
                 "agreed (start the main process again)";
+            return false;
+        }
+        // (合流 D, Sol P2: ... nor fewer rows a slot than this link's hello said)
+        const int next_rows = stage_relay ? strata::net::stage_deferred_rows(next_batch_flags) : 0;
+        if (stage_relay && wk_dfr_link && next_rows > 0 && next_rows < wk_dfr_link_rows) {
+            e = "relay: the next worker takes " + std::to_string(next_rows) + " rows a slot in a deferred window, fewer "
+                "than the " + std::to_string(wk_dfr_link_rows) + " this link agreed (start the main process again)";
             return false;
         }
         return true;
