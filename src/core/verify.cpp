@@ -4040,6 +4040,13 @@ bool Verifier::init_deferred_commit(int rows, std::string& err) {
         p += (floats[i] * 4 + 255) & ~255ull;
     }
     if (!mapped((size_t) (nS * CB * 4 + 16), (void**) &h_commitd_, (void**) &m_commitd_)) {
+        // (合流 D, Sol P3: a worker goes on without its deferred windows - the saved rows go back now)
+        (void) cudaFree(dc_arena_);
+        (void) cudaGetLastError();
+        dc_arena_ = nullptr;
+        commitd_ = nullptr;
+        dc_qkv_ = dc_h_ = dc_gate_ = dc_beta_ = dc_idx_ = dc_hist_ = nullptr;
+        h_commitd_ = m_commitd_ = nullptr;
         err = "verify: the deferred commit staging failed";
         return false;
     }

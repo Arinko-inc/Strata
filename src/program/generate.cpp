@@ -6418,6 +6418,16 @@ int main(int argc, char** argv) {
 
     // STRATA_PIPED_MTP is decided again now that the slots that fit and the groups are final.  Recommend, never force: when
     // it cannot run it is said and left off, and --batch-mtp goes on as it would without it.
+    // 合流 D (Sol P2): a remote main process asks for up to STRATA_PIPED_MTP proposals; a group's window holds what fits
+    // (its slots x (1 + proposals) <= kVerifyMaxT), cut here rather than turned off (the worker's hello cuts further)
+    if (piped_mtp && remote_main && o.batch_groups > 0 && o.batch >= o.batch_groups && pm_drafts > 0) {
+        const int gs = o.batch / o.batch_groups, fit = (int) strata::kernels::kVerifyMaxT / std::max(gs, 1) - 1;
+        if (fit >= 1 && pm_drafts > fit) {
+            std::fprintf(stderr, "strata generate: STRATA_PIPED_MTP: %d proposals a slot cut to %d (a group of %d slots "
+                                 "in %d rows)\n", pm_drafts, fit, gs, (int) strata::kernels::kVerifyMaxT);
+            pm_drafts = fit;
+        }
+    }
     if (piped_mtp) {
         const char* why = nullptr;
         char buf[160];
@@ -15103,6 +15113,18 @@ int main(int argc, char** argv) {
                     remote_link.close();
                     return false;
                 }
+                // 合流 D (Sol P2): ... and still takes a slot's token and its proposals in one deferred window (the rows a slot
+                // its hello says, bits 8..11; a hello without them says nothing, as at the start)
+                if (remote_pipe && piped_mtp && pmtp_remote_ok) {
+                    const int rows_now = strata::net::stage_deferred_rows(remote_peer.batch_flags);
+                    if (rows_now > 0 && rows_now < 1 + pm_drafts) {
+                        e = "remote stage: the worker's hello was refused: it takes " + std::to_string(rows_now) +
+                            " rows a slot in a deferred window, and STRATA_PIPED_MTP runs " + std::to_string(1 + pm_drafts) +
+                            " (start the main process again)";
+                        remote_link.close();
+                        return false;
+                    }
+                }
                 // remote-batch-vision 4.3-8: the slots were agreed with a worker that keeps a position table per slot
                 if (o.vision && slot_positions_on &&
                     (remote_peer.batch_flags & strata::net::kStageBatchSlotPositions) == 0) {
@@ -15232,6 +15254,9 @@ int main(int argc, char** argv) {
             int32_t tok[strata::kernels::kVerifyMaxT] = {}, outb[strata::kernels::kVerifyMaxT] = {};
             int64_t pos[strata::kernels::kVerifyMaxT] = {};
             int first[strata::kernels::kVerifyMaxT] = {}, active[strata::kernels::kVerifyMaxT] = {};
+            // (合流 D, Sol P1: each slot's rows - 2 with --batch-mtp, 1 for a slot whose proposal's cell p + 1 is past the
+            // context; such a slot ends with this window's token, as without --batch-mtp)
+            int nrow[strata::kernels::kVerifyMaxT] = {};
             static size_t next_slot = 0;
             // Each MTP slot uses two rows; rotate slots when more than four are active.
             // L1: 遠隔の主機で下書きが乗っているとき、読込の横の直列の窓も相手の窓の上限(中継・末端の --spec 4)を超えない。
@@ -15242,13 +15267,15 @@ int main(int argc, char** argv) {
             for (size_t offset = 0; offset < bs.size() && S + (batch_mtp ? 2 : 1) <= step_rows_cap; ++offset) {
                 const int b = (int) ((next_slot + offset) % bs.size());
                 if (bs[(size_t) b].active) {
+                    const bool two = batch_mtp && bs[(size_t) b].p + 2 <= o.max_context;
                     first[A] = S;
+                    nrow[A] = two ? 2 : 1;
                     active[A++] = b;
                     rows[S] = b;
                     tok[S] = bs[(size_t) b].x;
                     pos[S] = bs[(size_t) b].p;
                     ++S;
-                    if (batch_mtp) {
+                    if (two) {
                         rows[S] = b;
                         if (!bs[(size_t) b].draft_ready) {
                             err = "batch MTP: a live slot has no draft";
@@ -15308,7 +15335,7 @@ int main(int argc, char** argv) {
                 const int b = active[a], i = first[a];
                 const BSlot& sl = bs[(size_t) b];
                 const bool eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outb[i]) != o.eos_ids.end();
-                keep[b] = batch_mtp && outb[i] == tok[i + 1] && !eos && !sl.stop &&
+                keep[b] = nrow[a] == 2 && outb[i] == tok[i + 1] && !eos && !sl.stop &&
                           sl.produced + 2 <= sl.max_new && sl.p + 3 <= o.max_context ? 2 : 1;
             }
             if (!(batch_mtp ? ver.commit_slot_prefixes(keep.data(), err) : ver.commit_slots(err))) {
@@ -15328,7 +15355,7 @@ int main(int argc, char** argv) {
                 const int b = active[t];
                 BSlot& sl = bs[(size_t) b];
                 bool nf = false;   // #879: a row of this slot held non-finite logits: the slot ends, nothing emitted
-                for (int r = first[t]; r < first[t] + (batch_mtp ? 2 : 1); ++r) nf = nf || ver.nonfinite_in(r);
+                for (int r = first[t]; r < first[t] + nrow[t]; ++r) nf = nf || ver.nonfinite_in(r);
                 if (nf) {
                     std::fprintf(stderr, "strata batch: non-finite logits (#879) in slot %d at position %lld: it ends "
                                          "(BDONE nonfinite) and the next request reads its prompt from token 0\n", b,
@@ -15359,7 +15386,7 @@ int main(int argc, char** argv) {
                     sl.x = y;
                     sl.p += 1;
                 }
-                if (batch_mtp && sl.active) {
+                if (batch_mtp && sl.active && nrow[t] == 2) {   // (a one-row slot ended above: p + 2 > max_context)
                     // The slot's two residual rows (the final residuals of the last stage: ver.final_R_all() follows the
                     // chain, so with a layer split they are on the last stage's GPU, where the drafters are).  The copy is
                     // queued on the drafter's own stream after the window's host sync, so the draft graph reads it.
