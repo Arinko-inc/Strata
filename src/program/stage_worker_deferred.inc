@@ -17,12 +17,12 @@
 // The saved rows are n_slots * STRATA_WK_PIPED_MTP_ROWS (default 2: a slot's token and one draft; 合流 D, for the
 // relay's VRAM): a deferred window with more rows on one slot is refused (an error for that window; the link goes on).
 //
-// Which held window a deferred SlotCommit commits: hs.slot_run is not given the SlotRun's tag (StageHandlers' signature
-// has no tag), so this worker cannot match the commit's tag against the window's.  It finds the window from keep[]
-// instead: the held windows are on separate slots (DeferredWindows::add), and a commit keeps 1.. rows on each of its
-// window's slots and 0 on every other (DeferredWindows::keep_ok checks both), so the slots that keep rows name exactly
-// one held window.  The table's own tags are this worker's numbers (wk_dfr_seq).  A relay sends the window on with its
-// own tag (wk_next_tag) and names that tag in the commit it sends on, as the protocol says.
+// Which held window a deferred SlotCommit commits: the one held under its tag (合流 D, Sol P1).  serve_stage tells
+// this worker each SlotRun's tag (StageHandlers::slot_run_tag) right before its slot_run, and a deferred window is held
+// under it; a commit finds its window by tag, checks keep[] against it (DeferredWindows::keep_ok: each of the window's
+// slots 1.. its rows, every other slot 0) and only then takes it - a tag not held, or a keep[] that does not fit the
+// window, commits nothing.  A relay sends the window on with its own tag (wk_next_tag) and names that tag in the commit
+// it sends on, as the protocol says.
 static_assert(strata::net::kDeferredMaxRows == strata::kernels::kVerifyMaxT, "a deferred window's rows: kVerifyMaxT");
 const bool wk_dfr_asked = strata::net::wk_piped_mtp_on(std::getenv("STRATA_WK_PIPED_MTP"));
 // the saved rows of one slot (the most rows one slot may have in a deferred window)
@@ -30,8 +30,7 @@ const int wk_dfr_slot_rows = strata::net::wk_piped_mtp_rows(std::getenv("STRATA_
 strata::net::DeferredWindows wk_dfr;   // per connection: the windows held uncommitted
 bool wk_dfr_on = false;                // the saved rows are allocated: this worker can keep deferred windows
 bool wk_dfr_link = false;              // this link's hello said kStageBatchDeferred
-int64_t wk_dfr_seq = 0;                // the table's tags (this worker's own numbers)
-std::vector<int64_t> wk_dfr_slot_tag((size_t) std::max(o.batch, 0), 0);   // per slot: its held window's, 0: none
+int64_t wk_dfr_cur_tag = 0;            // the tag of the SlotRun being served (StageHandlers::slot_run_tag)
 int64_t wk_dfr_windows = 0, wk_dfr_commits = 0, wk_dfr_rows = 0, wk_dfr_kept = 0, wk_dfr_held_sum = 0;
 int wk_dfr_held_max = 0;
 double wk_dfr_run_ms = 0, wk_dfr_commit_ms = 0;
@@ -75,9 +74,9 @@ if (wk_dfr_on) {
                                  "the link's slots)\n", wk_dfr.size());
         wk_dfr.reset(0, 0);
         wk_dfr_link = false;
-        wk_dfr_seq = 0;
-        std::fill(wk_dfr_slot_tag.begin(), wk_dfr_slot_tag.end(), 0);
+        wk_dfr_cur_tag = 0;
     };
+    hs.slot_run_tag = [&](int64_t tag) { wk_dfr_cur_tag = tag; };
     // what a message that needs every window committed gets while some are held
     auto dfr_held = [&](const char* what, std::string& e) -> bool {
         if (wk_dfr.empty()) return false;
@@ -95,7 +94,11 @@ if (wk_dfr_on) {
         const bool next_has = !stage_relay || (next_batch_flags & strata::net::kStageBatchDeferred) != 0;
         wk_dfr_link = wk_slot_n > 0 && wk_slot_n <= ver.n_slots() && next_has;
         if (wk_dfr_link) {
-            mine.batch_flags |= strata::net::kStageBatchDeferred;
+            // the rows a slot it takes (合流 D): its own saved rows; a relay: no more than its next worker's
+            int rows = wk_dfr_slot_rows;
+            const int next_rows = stage_relay ? strata::net::stage_deferred_rows(next_batch_flags) : 0;
+            if (next_rows > 0) rows = std::min(rows, next_rows);
+            mine.batch_flags = strata::net::with_deferred_rows(mine.batch_flags | strata::net::kStageBatchDeferred, rows);
             wk_dfr.reset(wk_slot_n, wk_dfr_slot_rows);
         }
         std::fprintf(stderr, "strata stage worker: deferred batch windows: %s\n",
@@ -209,7 +212,7 @@ if (wk_dfr_on) {
             e = "relay: the next worker: " + e;
             return false;
         }
-        w.tag = ++wk_dfr_seq;
+        w.tag = wk_dfr_cur_tag;   // (the SlotRun's: its commit names it)
         if (stage_relay) w.next_tag = wk_next_tag + 1;   // (the tag it goes on with, below: the commit names it there)
         if (!wk_dfr.add(w, e)) return false;   // (sets w.save_base)
         // from here a failure lets the window go: nothing of it is committed, and nothing went on
@@ -255,7 +258,6 @@ if (wk_dfr_on) {
             std::lock_guard<std::mutex> lk(wk_late_mu);
             wk_late_q.push_back(std::move(lw));
         }
-        for (int t = 0; t < S; ++t) wk_dfr_slot_tag[(size_t) w.rows[t]] = w.tag;
         ++wk_dfr_windows;
         wk_dfr_rows += S;
         wk_dfr_held_sum += wk_dfr.size();
@@ -279,30 +281,19 @@ if (wk_dfr_on) {
                 std::to_string(wk_slot_n);
             return false;
         }
-        int64_t held_tag = 0;
-        for (int s = 0; s < m && held_tag == 0; ++s)
-            if (keep[s] != 0) {
-                held_tag = wk_dfr_slot_tag[(size_t) s];
-                if (held_tag == 0) {
-                    e = "stage worker: bad slot commit (deferred, tag " + std::to_string((long long) tag) + "): slot " +
-                        std::to_string(s) + " keeps " + std::to_string((int) keep[s]) +
-                        " rows, and no deferred window holds it";
-                    return false;
-                }
-            }
-        if (held_tag == 0) {
-            e = "stage worker: bad slot commit (deferred, tag " + std::to_string((long long) tag) +
-                "): no slot keeps a row";
+        // the window held under this commit's tag, keep[] checked against it before it is taken (Sol P1)
+        const strata::net::DeferredWindow* held = wk_dfr.find(tag);
+        if (held == nullptr) {
+            e = "stage worker: bad slot commit: no deferred window has tag " + std::to_string((long long) tag);
+            return false;
+        }
+        std::vector<int> k;
+        if (!strata::net::DeferredWindows::keep_ok(*held, keep, m, ver.n_slots(), k, e)) {
+            e += " (tag " + std::to_string((long long) tag) + ": nothing committed)";
             return false;
         }
         strata::net::DeferredWindow w;
-        if (!wk_dfr.take(held_tag, w, e)) return false;
-        for (int t = 0; t < w.S; ++t) wk_dfr_slot_tag[(size_t) w.rows[t]] = 0;
-        std::vector<int> k;
-        if (!strata::net::DeferredWindows::keep_ok(w, keep, m, ver.n_slots(), k, e)) {
-            e += " (tag " + std::to_string((long long) tag) + ": the window is dropped uncommitted)";
-            return false;
-        }
+        if (!wk_dfr.take(tag, w, e)) return false;
         if (stage_relay) {   // the next worker commits meanwhile (one way; nothing is read from it here)
             const NextWorkerWait wait("stage worker: the next worker's batch commit");
             if (!next_link.slot_commit(keep, m, w.next_tag, e, true)) {

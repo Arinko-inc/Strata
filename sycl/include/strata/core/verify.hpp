@@ -34,6 +34,7 @@
 #include <atomic>
 #include <chrono>
 #include <map>
+#include <set>
 #include <cstdint>
 #include <chrono>
 #include <string>
@@ -184,6 +185,9 @@ public:
     /// init_slots.  Only this stage's layers' rows.
     bool init_deferred_commit(int rows, std::string& err);
     bool deferred_commit_on() const { return dc_rows_ > 0; }
+    /// 合流 D: the windows whose saves ran and whose commits have not are gone (a hello or a disconnect): their
+    /// layouts' deferred graphs may be evicted again
+    void deferred_forget() { dc_pending_.clear(); }
     /// run_slot_rows over `rows` (hand-off rows [0, S)) without its commit graph, then the save graph (the window's rows
     /// the commit replays -> saved rows [save_base, save_base + S)) queued behind it, not waited for.  The rows are in
     /// the hand-off when this returns.
@@ -362,6 +366,9 @@ private:
     void* dc_arena_ = nullptr;
     int32_t *h_commitd_ = nullptr, *m_commitd_ = nullptr, *commitd_ = nullptr;
     std::map<std::vector<int>, dpct::experimental::command_graph_exec_ptr> save_bm_, dcommit_bm_;
+    /// 合流 D (Sol P2): the layouts (batch_key, no doorbell variant) of windows saved and not committed yet - their
+    /// graphs are never evicted (a held window's commit needs its graph)
+    std::set<std::vector<int>> dc_pending_;
     bool capture_deferred(const int* rows, int S, int hbase, std::string& err);
     void free_deferred();   ///< ~Verifier: the above (best-effort, as the rest there)
     strata::kernels::SamplerParams sampling_ = [] {
